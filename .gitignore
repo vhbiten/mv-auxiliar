@@ -1,0 +1,20 @@
+# Dados de execução — NUNCA versionar (contêm nomes de pacientes / dados do hospital)
+/dados/
+/logs/
+
+# Binários e pacote de distribuição (gerados pelo build)
+/deploy/
+*.exe
+*.7z
+*.zip
+
+# Artefatos de compilação
+bin/
+obj/
+*.pdb
+
+# Capturas de tráfego (podem conter credenciais/sessão)
+*.har
+
+# Probes de diagnóstico ao vivo (dependem do servidor real e de credenciais)
+/test/
