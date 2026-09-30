@@ -13,8 +13,25 @@ bin/
 obj/
 *.pdb
 
+# Configuração local da máquina (contém o IP interno do servidor MV)
+config.txt
+
+# Chave de licença da instalação, em claro
+licenca.txt
+
+# Documentação do fornecedor e exemplos de ordem de compra
+/docs/referencias/
+
+# Notas internas: contêm IP do servidor MV, logins e capturas de tráfego
+/docs/protocolo-pedido-caf.md
+/docs/auditoria-ui-*.json
+
 # Capturas de tráfego (podem conter credenciais/sessão)
 *.har
 
 # Probes de diagnóstico ao vivo (dependem do servidor real e de credenciais)
 /test/
+
+# Snapshots de tela e ferramentas locais (pesados, não fazem parte do fonte)
+/snapshots/
+/tools/

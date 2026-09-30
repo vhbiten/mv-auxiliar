@@ -23,6 +23,19 @@ namespace SoulmvKit.Core
             return true;
         }
 
+        // Busca livre sobre um TEXTO qualquer (ex.: "código + nome do produto" no
+        // pré-pedido): mesmas regras — todos os termos precisam bater, sem acentos.
+        public static bool CorrespondeTexto(string campo, string busca)
+        {
+            if (busca == null) return true;
+            busca = busca.Trim();
+            if (busca.Length == 0) return true;
+            string[] termos = busca.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var t in termos)
+                if (!Contem(campo, t)) return false;
+            return true;
+        }
+
         private static bool TermoBate(Solicitacao s, string termo)
         {
             return Contem(s.Numero.ToString(), termo)

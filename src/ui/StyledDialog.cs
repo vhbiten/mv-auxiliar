@@ -19,7 +19,7 @@ namespace SoulmvKit.UI
         private readonly float _sc;          // fator de DPI (96 = 1.0)
         private Rectangle _rcTitulo, _rcMsg, _rcDisco;
 
-        private StyledDialog(string titulo, string mensagem, StatusKind kind, string textoBotao)
+        private StyledDialog(string titulo, string mensagem, StatusKind kind, string textoBotao, string textoSecundario)
         {
             _titulo = titulo; _mensagem = mensagem; _kind = kind;
 
@@ -56,6 +56,18 @@ namespace SoulmvKit.UI
             this.AcceptButton = btn;
             this.CancelButton = btn;
 
+            if (textoSecundario != null)
+            {
+                var btn2 = new PrimaryButton();
+                btn2.Ghost = true;
+                btn2.Text = textoSecundario;
+                btn2.Size = new Size(S(130), S(38));
+                btn2.Location = new Point(btn.Left - S(10) - btn2.Width, btn.Top);
+                btn2.Click += new EventHandler(delegate { this.DialogResult = DialogResult.Cancel; this.Close(); });
+                this.Controls.Add(btn2);
+                this.CancelButton = btn2;   // Esc = não fazer nada
+            }
+
             this.ClientSize = new Size(W, btn.Bottom + S(22));
         }
 
@@ -64,8 +76,15 @@ namespace SoulmvKit.UI
         // Aviso modal (uma opção só). Bloqueia até o usuário confirmar.
         public static void Aviso(IWin32Window dono, string titulo, string mensagem, string textoBotao)
         {
-            using (var d = new StyledDialog(titulo, mensagem, StatusKind.Warning, textoBotao))
+            using (var d = new StyledDialog(titulo, mensagem, StatusKind.Warning, textoBotao, null))
                 d.ShowDialog(dono);
+        }
+
+        // Pergunta modal com duas opções; true somente se o usuário escolher a primária.
+        public static bool Confirmar(IWin32Window dono, string titulo, string mensagem, string textoSim, string textoNao)
+        {
+            using (var d = new StyledDialog(titulo, mensagem, StatusKind.Warning, textoSim, textoNao))
+                return d.ShowDialog(dono) == DialogResult.OK;
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -106,17 +125,15 @@ namespace SoulmvKit.UI
             Color strong; string glyph;
             Palette(out strong, out glyph);
 
-            // barra de acento no topo + moldura
+            // barra de acento no topo (recuada: o DWM arredonda os cantos no Win11)
+            // + moldura recuada 1px para não ser decepada pelo recorte redondo
             using (var br = new SolidBrush(strong))
-                g.FillRectangle(br, 0, 0, this.Width, S(4));
+                g.FillRectangle(br, S(10), 0, this.Width - S(20), S(3));
             using (var pen = new Pen(Theme.Border))
-                g.DrawRectangle(pen, 0, 0, this.Width - 1, this.Height - 1);
+                g.DrawRectangle(pen, 1, 1, this.Width - 3, this.Height - 3);
 
-            // ícone em disco (igual ao StatusBanner)
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var br = new SolidBrush(strong))
-                g.FillEllipse(br, _rcDisco);
-            TextRenderer.DrawText(g, glyph, Theme.BodyBold, _rcDisco, Color.White,
+            // glifo na cor do estado (sem disco — igual ao StatusBanner)
+            TextRenderer.DrawText(g, glyph, Theme.H1, _rcDisco, strong,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
             TextRenderer.DrawText(g, _titulo, Theme.H2, _rcTitulo, Theme.TextDark,

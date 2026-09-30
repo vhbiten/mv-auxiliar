@@ -13,7 +13,7 @@ namespace SoulmvKit.UI
     // confirmar produção (IRREVERSÍVEL) -> comprovante + etiqueta.
     // A criação do kit é controlada: o código foi endurecido contra duplo-clique,
     // re-entrância e troca de tela durante a gravação.
-    public class ProduzirView : UserControl
+    public class ProduzirView : UserControl, IComandosDeTela
     {
         private readonly MainWindow _host;
         private StyledComboBox cmbKit;
@@ -26,9 +26,8 @@ namespace SoulmvKit.UI
         private PrimaryButton btnTestarLas;
         private Label lblProduzido;
         private StatusBanner banner;
-        private DataGridView grid;
+        private GridPro grid;
         private Label lblVazio;
-        private Label lblResumo;
 
         private const int Estoque = 5;       // sempre Farmácia Central
         private const int MaxKits = 20;      // teto de segurança (era 999)
@@ -41,6 +40,20 @@ namespace SoulmvKit.UI
         // para bloquear troca de módulo / logout / fechar a janela nesse intervalo.
         private static bool _producaoEmAndamento;
         public static bool ProducaoEmAndamento { get { return _producaoEmAndamento; } }
+
+        // Há um form de produção ABERTO no servidor (da pré-visualização até confirmar/cancelar):
+        // enquanto isso, o monitor de solicitações não abre outro form na mesma sessão — o
+        // "Confirmar produção" depende desse task continuar válido.
+        private static bool _previewAberto;
+        public static bool OcupadoNoMv { get { return _producaoEmAndamento || _previewAberto; } }
+
+        // A lista de kits vem do MV (LOV_FORMULA), mas só UMA vez por sessão: entrar no módulo
+        // não pode custar uma conversa com o servidor toda vez. A lista de SampleData é o
+        // ponto de partida (a tela já abre utilizável) e o plano B — kit novo cadastrado no MV
+        // aparece sozinho, e servidor fora do ar não deixa o farmacêutico sem opções.
+        // A sessão guardada junto é o que faz um novo login reler a lista.
+        private static System.Collections.Generic.List<KitOption> _kitsMv;
+        private static SoulmvKit.Core.Session _kitsSessao;
 
         // valores TRAVADOS no momento da pré-visualização (o diálogo de confirmação
         // mostra exatamente o que foi preparado no servidor, nunca os controles ao vivo).
@@ -58,8 +71,13 @@ namespace SoulmvKit.UI
             root.Dock = DockStyle.Fill;
             root.BackColor = Theme.ContentBg;
             root.ColumnCount = 1;
+            // Coluna única Percent: sem isso a coluna cresce até o preferido dos cartões
+            // e o conteúdo pode estourar o viewport à direita.
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             root.RowCount = 4;
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 152)); // cartão de entrada
+            // AutoSize, não altura fixa: com pixels fixos o cartão cabia num DPI e era
+            // cortado embaixo em outro, porque a fonte cresce mais que a linha.
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // cartão de entrada
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // cartão de pré-visualização
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // banner de status
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));     // ações
@@ -73,6 +91,22 @@ namespace SoulmvKit.UI
 
             banner.SetState(StatusKind.Info,
                 "A pré-visualização mostra o que será produzido, nada é gravado até você confirmar a produção.");
+
+            // Depois de a tela existir: alinha a lista de kits com o MV, em segundo plano.
+            this.Load += new EventHandler(delegate { AtualizarListaDeKits(); });
+        }
+
+        // ---------- atalhos globais (F5 / Ctrl+F) roteados pela MainWindow ----------
+        public void ComandoAtualizar()
+        {
+            // F5 refaz a pré-visualização pelo mesmo caminho do botão; as travas de
+            // gravação/preview em andamento já desabilitam o botão nesses momentos.
+            if (btnPreview.Enabled) OnPreview(btnPreview, EventArgs.Empty);
+        }
+
+        public void ComandoFocarBusca()
+        {
+            // Esta tela não tem campo de busca.
         }
 
         // ---------- Etapa 1: cartão de entrada ----------
@@ -80,34 +114,36 @@ namespace SoulmvKit.UI
         {
             var card = new Card();
             card.Dock = DockStyle.Fill;
-            card.Margin = new Padding(0, 0, 0, 16);
-            card.Padding = new Padding(20, 16, 20, 18);
+            card.AutoSize = true;
+            card.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            card.Margin = new Padding(0, 0, 0, Theme.S(16));
+            card.Padding = new Padding(Theme.S(20), Theme.S(16), Theme.S(20), Theme.S(18));
 
             var tl = new TableLayoutPanel();
             tl.Dock = DockStyle.Fill;
+            tl.AutoSize = true;
+            tl.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             tl.BackColor = Theme.CardBg;
             tl.ColumnCount = 3;
             tl.RowCount = 3;
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 236));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(116)));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(236)));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-            var titulo = CardTitle("1.  Escolha o kit e a quantidade");
-            titulo.Margin = new Padding(0, 0, 0, 12);
-            tl.Controls.Add(titulo, 0, 0);
-            tl.SetColumnSpan(titulo, 2);
 
             // Botão de teste da impressora (LAS) — valida a etiqueta SEM produzir kit.
+            // ESCONDIDO a pedido (29/08/2026): o botão e o fluxo inteiro (OnTestarLas)
+            // continuam no código — para reativar, basta Visible = true.
             btnTestarLas = new PrimaryButton();
             btnTestarLas.Text = "Testar impressora (LAS)";
             btnTestarLas.Ghost = true;
             btnTestarLas.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            btnTestarLas.Size = new Size(200, 30);
+            btnTestarLas.Size = new Size(Theme.S(200), Theme.S(30));
             btnTestarLas.Font = Theme.Small;
             btnTestarLas.Click += new EventHandler(OnTestarLas);
+            btnTestarLas.Visible = false;
             tl.Controls.Add(btnTestarLas, 2, 0);
 
             tl.Controls.Add(MicroLabel("KIT A PRODUZIR"), 0, 1);
@@ -115,8 +151,9 @@ namespace SoulmvKit.UI
 
             cmbKit = new StyledComboBox();
             cmbKit.Anchor = AnchorStyles.Left | AnchorStyles.Right;   // preenche a largura, centraliza na vertical
-            cmbKit.Margin = new Padding(0, 0, 14, 0);
+            cmbKit.Margin = new Padding(0, 0, Theme.S(14), 0);
             cmbKit.DataSource = SampleData.Kits();
+            cmbKit.KeyDown += new KeyEventHandler(OnEntradaKeyDown);
             tl.Controls.Add(cmbKit, 0, 2);
 
             numQtd = new NumericUpDown();
@@ -127,22 +164,84 @@ namespace SoulmvKit.UI
             numQtd.Maximum = MaxKits;
             numQtd.Value = 1;
             numQtd.Dock = DockStyle.Fill;
+            numQtd.KeyDown += new KeyEventHandler(OnEntradaKeyDown);
             _numHost = new FieldHost();
             _numHost.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-            _numHost.Height = 34;
-            _numHost.Margin = new Padding(0, 0, 14, 0);
+            _numHost.Height = Theme.S(34);
+            _numHost.Margin = new Padding(0, 0, Theme.S(14), 0);
             _numHost.Controls.Add(numQtd);
             tl.Controls.Add(_numHost, 1, 2);
 
             btnPreview = new PrimaryButton();
             btnPreview.Text = "Gerar pré-visualização";
             btnPreview.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-            btnPreview.Height = 40;
+            btnPreview.Height = Theme.S(40);
             btnPreview.Click += new EventHandler(OnPreview);
             tl.Controls.Add(btnPreview, 2, 2);
 
+            // O teclado percorre o fluxo na ordem do gesto (kit -> quantidade -> gerar);
+            // o teste de impressora é ação rara e fica por último.
+            cmbKit.TabIndex = 0;
+            _numHost.TabIndex = 1;
+            btnPreview.TabIndex = 2;
+            btnTestarLas.TabIndex = 9;
+
             card.Controls.Add(tl);
             return card;
+        }
+
+        // Busca a lista de kits no MV e troca a do combo. Silencioso de propósito: é
+        // enriquecimento, e falhar aqui não pode atrapalhar quem entrou para produzir com a
+        // lista que já está na tela.
+        private async void AtualizarListaDeKits()
+        {
+            if (_host.Session == null) return;             // preview de tela / captura: sem MV
+
+            bool tenho = false;
+            try
+            {
+                // Já lida nesta sessão: aplica de memória, sem falar com o servidor.
+                if (_kitsMv != null && _kitsSessao == _host.Session) { AplicarKits(_kitsMv); return; }
+                if (OcupadoNoMv) return;                   // form de produção vivo: não abrir outro
+
+                // Espera curta: se o MV está ocupado, a lista fixa serve e a leitura fica
+                // para a próxima visita ao módulo.
+                tenho = await MvGate.EntrarAsync("produzir-lista-kits", 5000);
+                if (!tenho || IsDisposed || Disposing) return;
+
+                var lista = await MorphisClient.ListarKitsAsync(_host.Session, Estoque);
+                if (IsDisposed || Disposing || lista == null || lista.Count == 0) return;
+                _kitsMv = lista; _kitsSessao = _host.Session;
+                AplicarKits(lista);
+            }
+            catch (Exception ex)
+            {
+                // Inclui sessão expirada: a lista fixa continua valendo e quem trata a
+                // expiração é a primeira ação de verdade do usuário, com aviso na tela.
+                Logger.Log("Produção de kits: lista do MV indisponível, seguindo com a lista fixa (" + ex.Message + ").");
+            }
+            finally { if (tenho) MvGate.Sair(); }
+        }
+
+        // Troca o conteúdo do combo preservando o kit que já estava escolhido.
+        private void AplicarKits(System.Collections.Generic.List<KitOption> lista)
+        {
+            if (cmbKit == null || !cmbKit.Enabled) return;   // travado durante preview/produção
+            var atual = cmbKit.SelectedItem as KitOption;
+            cmbKit.DataSource = lista;
+            if (atual == null) return;
+            foreach (KitOption k in lista)
+                if (k.CdProduto == atual.CdProduto) { cmbKit.SelectedItem = k; return; }
+        }
+
+        // Enter no kit/quantidade dispara a pré-visualização (o gesto natural do fluxo,
+        // sem precisar tabular até o botão nem pegar o mouse).
+        private void OnEntradaKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            if (cmbKit.DroppedDown) return;   // com a lista aberta, Enter só confirma o item
+            e.Handled = true; e.SuppressKeyPress = true;
+            if (btnPreview.Enabled) OnPreview(btnPreview, EventArgs.Empty);
         }
 
         // ---------- Etapa 2: cartão de pré-visualização (grade ou vazio) ----------
@@ -150,8 +249,8 @@ namespace SoulmvKit.UI
         {
             var card = new Card();
             card.Dock = DockStyle.Fill;
-            card.Margin = new Padding(0, 0, 0, 14);
-            card.Padding = new Padding(18, 14, 18, 16);
+            card.Margin = new Padding(0, 0, 0, Theme.S(14));
+            card.Padding = new Padding(Theme.S(18), Theme.S(14), Theme.S(18), Theme.S(16));
 
             var tl = new TableLayoutPanel();
             tl.Dock = DockStyle.Fill;
@@ -162,20 +261,6 @@ namespace SoulmvKit.UI
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-            var titulo = CardTitle("2.  Confira a pré-visualização");
-            titulo.Margin = new Padding(0, 0, 0, 10);
-            tl.Controls.Add(titulo, 0, 0);
-
-            lblResumo = new Label();
-            lblResumo.AutoSize = true;
-            lblResumo.Font = Theme.BodyBold;
-            lblResumo.ForeColor = Theme.TextSoft;
-            lblResumo.BackColor = Theme.CardBg;
-            lblResumo.Anchor = AnchorStyles.Right;
-            lblResumo.Margin = new Padding(0, 2, 0, 0);
-            lblResumo.Text = "";
-            tl.Controls.Add(lblResumo, 1, 0);
 
             var host = new Panel();
             host.Dock = DockStyle.Fill;
@@ -206,7 +291,7 @@ namespace SoulmvKit.UI
         {
             banner = new StatusBanner();
             banner.Dock = DockStyle.Top;
-            banner.Margin = new Padding(0, 0, 0, 12);
+            banner.Margin = new Padding(0, 0, 0, Theme.S(12));
             return banner;
         }
 
@@ -226,30 +311,30 @@ namespace SoulmvKit.UI
             btnConfirmar.BaseColor = Theme.Success;
             btnConfirmar.HoverColor = Theme.SuccessHover;
             btnConfirmar.PressColor = Theme.Success;
-            btnConfirmar.Size = new Size(220, 44);
-            btnConfirmar.Margin = new Padding(0, 0, 12, 0);
+            btnConfirmar.Size = new Size(Theme.S(220), Theme.S(44));
+            btnConfirmar.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnConfirmar.Visible = false;
             btnConfirmar.Click += new EventHandler(OnConfirmar);
 
             btnCancelar = new PrimaryButton();
             btnCancelar.Text = "Cancelar";
             btnCancelar.Ghost = true;
-            btnCancelar.Size = new Size(140, 44);
-            btnCancelar.Margin = new Padding(0, 0, 12, 0);
+            btnCancelar.Size = new Size(Theme.S(140), Theme.S(44));
+            btnCancelar.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnCancelar.Visible = false;
             btnCancelar.Click += new EventHandler(OnCancelar);
 
             btnEtiqueta = new PrimaryButton();
             btnEtiqueta.Text = "Imprimir etiqueta";
             btnEtiqueta.Ghost = true;
-            btnEtiqueta.Size = new Size(200, 44);
-            btnEtiqueta.Margin = new Padding(0, 0, 12, 0);
+            btnEtiqueta.Size = new Size(Theme.S(200), Theme.S(44));
+            btnEtiqueta.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnEtiqueta.Visible = false;
             btnEtiqueta.Click += new EventHandler(OnEtiqueta);
 
             lblProduzido = new Label();
             lblProduzido.AutoSize = false;
-            lblProduzido.Size = new Size(180, 44);
+            lblProduzido.Size = new Size(Theme.S(180), Theme.S(44));
             lblProduzido.TextAlign = ContentAlignment.MiddleLeft;
             lblProduzido.Font = Theme.BodyBold;
             lblProduzido.ForeColor = Theme.Success;
@@ -265,52 +350,30 @@ namespace SoulmvKit.UI
         }
 
         // ---------- helpers de UI ----------
-        private Label CardTitle(string t)
-        {
-            var l = new Label();
-            l.Text = t; l.Font = Theme.H3; l.ForeColor = Theme.TextDark;
-            l.BackColor = Theme.CardBg; l.AutoSize = true;
-            return l;
-        }
-
         private Label MicroLabel(string t)
         {
             var l = new Label();
             l.Text = t; l.Font = Theme.Caption; l.ForeColor = Theme.TextSoft;
             l.BackColor = Theme.CardBg; l.AutoSize = true;
-            l.Margin = new Padding(2, 0, 0, 5);
+            l.Margin = new Padding(2, 0, 0, Theme.S(5));
             return l;
         }
 
-        private DataGridView NovaGrid()
+        private GridPro NovaGrid()
         {
-            var g = new DataGridView();
-            g.Dock = DockStyle.Fill; g.BackgroundColor = Color.White; g.BorderStyle = BorderStyle.None;
-            g.RowHeadersVisible = false; g.AllowUserToAddRows = false; g.AllowUserToResizeRows = false;
-            g.AllowUserToResizeColumns = false; g.ReadOnly = true;
-            g.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            g.MultiSelect = false; g.AllowUserToOrderColumns = false;
-            g.EnableHeadersVisualStyles = false; g.GridColor = Theme.BorderSoft; g.Font = Theme.Body;
-            g.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
-            g.ColumnHeadersDefaultCellStyle.BackColor = Theme.Primary;
-            g.ColumnHeadersDefaultCellStyle.ForeColor = Color.White;
-            g.ColumnHeadersDefaultCellStyle.Font = Theme.BodyBold;
-            g.ColumnHeadersDefaultCellStyle.Padding = new Padding(8, 0, 0, 0);
-            g.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleLeft;
-            g.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
-            g.ColumnHeadersHeight = 36; g.RowTemplate.Height = 32;
-            g.DefaultCellStyle.Padding = new Padding(8, 0, 6, 0);
-            g.DefaultCellStyle.SelectionBackColor = Theme.Light;
-            g.DefaultCellStyle.SelectionForeColor = Theme.TextDark;
-            g.DefaultCellStyle.ForeColor = Theme.TextDark;
+            // Grade padrão do app (double buffer, cabeçalho claro, seleção discreta,
+            // hover estável, sem foco pontilhado); aqui só o que é desta tela.
+            var g = new GridPro();
+            g.Dock = DockStyle.Fill;
+            g.AllowUserToResizeColumns = false;
+            g.AllowUserToOrderColumns = false;
+            // zebra de leitura (linhas alternadas); a seleção herda SelBg do padrão
             g.AlternatingRowsDefaultCellStyle.BackColor = Theme.GridZebra;
-            g.AlternatingRowsDefaultCellStyle.SelectionBackColor = Theme.Light;
-            g.AlternatingRowsDefaultCellStyle.SelectionForeColor = Theme.TextDark;
 
             g.Columns.Add(Col("prod", "Produto", 300, true, DataGridViewContentAlignment.MiddleLeft));
-            g.Columns.Add(Col("qtd", "Qtd", 60, false, DataGridViewContentAlignment.MiddleRight));
-            g.Columns.Add(Col("lote", "Lote", 130, false, DataGridViewContentAlignment.MiddleLeft));
-            g.Columns.Add(Col("saldo", "Saldo", 80, false, DataGridViewContentAlignment.MiddleRight));
+            g.Columns.Add(Col("qtd", "Qtd", 60, false, DataGridViewContentAlignment.MiddleCenter));
+            g.Columns.Add(Col("lote", "Lote", 130, false, DataGridViewContentAlignment.MiddleCenter));
+            g.Columns.Add(Col("saldo", "Saldo", 80, false, DataGridViewContentAlignment.MiddleCenter));
             g.Columns.Add(Col("ok", "Situação", 96, false, DataGridViewContentAlignment.MiddleCenter));
 
             g.CellPainting += new DataGridViewCellPaintingEventHandler(Grid_CellPainting);
@@ -320,33 +383,50 @@ namespace SoulmvKit.UI
         private DataGridViewTextBoxColumn Col(string name, string header, int w, bool fill, DataGridViewContentAlignment align)
         {
             var c = new DataGridViewTextBoxColumn();
-            c.Name = name; c.HeaderText = header; c.Width = w;
+            c.Name = name; c.HeaderText = header; c.Width = Theme.S(w);
             c.SortMode = DataGridViewColumnSortMode.NotSortable;
             c.DefaultCellStyle.Alignment = align;
+            // Cabeçalho acompanha a célula: coluna centralizada com título à esquerda
+            // continuava parecendo torta.
+            if (align == DataGridViewContentAlignment.MiddleCenter)
+                c.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter;
             if (fill) c.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
             return c;
         }
 
         // Pinta a coluna "Situação" como pílula colorida (OK verde / FALTA vermelho).
+        // A pílula é a única exceção aos cantos retos do app: continua em cápsula.
         private void Grid_CellPainting(object sender, DataGridViewCellPaintingEventArgs e)
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
             if (grid.Columns[e.ColumnIndex].Name != "ok") return;
 
-            e.PaintBackground(e.CellBounds, true);
+            // Fundo: como este e.Handled tira a célula do pintor padrão (o GridPro o
+            // respeita), o hover da linha é reproduzido aqui — senão a faixa sob o
+            // mouse ficaria "furada" na coluna da pílula.
+            bool selecionada = (e.State & DataGridViewElementStates.Selected) != 0;
+            if (!selecionada && e.RowIndex == grid.LinhaHover)
+            {
+                using (var hb = new SolidBrush(Theme.HoverBg))
+                    e.Graphics.FillRectangle(hb, e.CellBounds);
+            }
+            else e.PaintBackground(e.CellBounds, true);
+            e.Paint(e.ClipBounds, DataGridViewPaintParts.Border);   // mantém a linha 1px
+
             string val = e.Value == null ? "" : e.Value.ToString();
             bool ok = val == "OK";
             Color cor = ok ? Theme.Success : Theme.Error;
 
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            int w = 58, h = 21;
+            int w = Theme.S(58), h = Theme.S(21);
             var pill = new Rectangle(
                 e.CellBounds.X + (e.CellBounds.Width - w) / 2,
                 e.CellBounds.Y + (e.CellBounds.Height - h) / 2, w, h);
-            using (var path = Theme.RoundedRect(pill, 10))
+            using (var path = Theme.RoundedRect(pill, h / 2))
             using (var br = new SolidBrush(cor))
                 g.FillPath(br, path);
+            g.SmoothingMode = SmoothingMode.None;
             TextRenderer.DrawText(g, val, Theme.Caption, pill, Color.White,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             e.Handled = true;
@@ -364,7 +444,7 @@ namespace SoulmvKit.UI
             btnConfirmar.Visible = false; btnConfirmar.Enabled = true;
             btnCancelar.Visible = false;
             btnEtiqueta.Visible = false; lblProduzido.Visible = false;
-            grid.Rows.Clear(); grid.Visible = false; lblVazio.Visible = true; lblResumo.Text = "";
+            grid.Rows.Clear(); grid.Visible = false; lblVazio.Visible = true;
 
             // Trava as entradas DURANTE a leitura (evita trocar o kit no meio do await
             // e a tabela/diálogo ficarem com um kit diferente do escolhido).
@@ -372,13 +452,26 @@ namespace SoulmvKit.UI
             btnPreview.Enabled = false; btnPreview.Text = "Gerando...";
             banner.SetState(StatusKind.Busy, "Lendo a fórmula e os lotes no servidor...");
 
+            bool tenho = false;
             try
             {
+                // Portão único do MV: o monitor de solicitações varre em segundo plano e o
+                // servidor não aceita duas conversas na mesma sessão.
+                tenho = await MvGate.EntrarAsync("produzir-preview", 60000);
+                if (IsDisposed || Disposing) return;
+                if (!tenho)
+                {
+                    cmbKit.Enabled = true; numQtd.Enabled = true;
+                    banner.SetState(StatusKind.Warning, "O servidor está respondendo outra consulta. Tente de novo em instantes.");
+                    return;
+                }
+
                 int numKits = (int)numQtd.Value;
                 _previewKitNome = kit.DsProduto;      // TRAVA o que será confirmado depois
                 _previewKitCd = kit.CdProduto;
                 _previewQtd = numKits;
 
+                _previewAberto = true;   // form de produção vivo no servidor a partir daqui
                 _client = new MorphisClient(_host.Session);
                 await _client.WorkspaceInitAsync();
                 await _client.CallFormAsync("M_PRODUZIR_KIT", "MV.12.01.01.06.01.#");
@@ -391,17 +484,23 @@ namespace SoulmvKit.UI
                     string lote = p.Lote != null ? p.Lote.CdLote : "(sem lote)";
                     string saldo = p.Lote != null ? p.Lote.SaldoAtual.ToString() : "-";
                     int r = grid.Rows.Add(p.Produto.DsProduto, p.Quantidade, lote, saldo, p.Suficiente ? "OK" : "FALTA");
-                    if (!p.Suficiente) { grid.Rows[r].DefaultCellStyle.ForeColor = Theme.Error; faltas++; }
+                    if (!p.Suficiente)
+                    {
+                        // sem saldo: o texto fica vermelho TAMBÉM com a linha selecionada
+                        // (é justamente a linha que o farmacêutico clica para inspecionar)
+                        grid.Rows[r].DefaultCellStyle.ForeColor = Theme.Error;
+                        grid.Rows[r].DefaultCellStyle.SelectionForeColor = Theme.Error;
+                        faltas++;
+                    }
                 }
 
                 bool temItens = preview.Count > 0;
                 grid.Visible = temItens; lblVazio.Visible = !temItens;
-                grid.ClearSelection();   // não destacar a 1ª linha automaticamente
+                grid.LimparSelecao();   // não destacar a 1ª linha automaticamente
 
                 string kitsTxt = _previewQtd == 1 ? "1 kit" : _previewQtd + " kits";
                 if (temItens && faltas == 0)
                 {
-                    lblResumo.Text = kitsTxt + "  ·  " + preview.Count + " itens  ·  todos com saldo";
                     btnConfirmar.Visible = true; btnConfirmar.Enabled = true;
                     btnCancelar.Visible = true; btnCancelar.Enabled = true;
                     // entradas continuam travadas: só muda gerando outro preview
@@ -411,7 +510,6 @@ namespace SoulmvKit.UI
                 else if (temItens)
                 {
                     cmbKit.Enabled = true; numQtd.Enabled = true;   // libera p/ ajustar e tentar de novo
-                    lblResumo.Text = faltas + " sem saldo p/ " + kitsTxt;
                     banner.SetState(StatusKind.Error,
                         "Saldo insuficiente de " + faltas + (faltas == 1 ? " item" : " itens") + ". (Nada foi gravado.)");
                 }
@@ -424,18 +522,22 @@ namespace SoulmvKit.UI
             catch (SessaoExpiradaException)
             {
                 // nada foi gravado no preview: pode voltar direto para o login
+                _previewAberto = false;
                 if (!IsDisposed && !Disposing) _host.SessaoExpirou();
                 return;
             }
             catch (Exception ex)
             {
+                _previewAberto = false;   // não ficou form pendente: libera o monitor
                 if (IsDisposed || Disposing) return;
                 cmbKit.Enabled = true; numQtd.Enabled = true;   // preview falhou: deixa editar e tentar de novo
                 banner.SetState(StatusKind.Error, "Erro ao gerar a pré-visualização: " + ex.Message);
             }
             finally
             {
-                if (!IsDisposed && !Disposing) { btnPreview.Enabled = true; btnPreview.Text = "Gerar pré-visualização"; }
+                if (tenho) MvGate.Sair();
+                if (IsDisposed || Disposing) _previewAberto = false;   // trocou de módulo: o form foi abandonado
+                else { btnPreview.Enabled = true; btnPreview.Text = "Gerar pré-visualização"; }
             }
         }
 
@@ -451,12 +553,15 @@ namespace SoulmvKit.UI
             string aviso = _previewQtd > 1
                 ? "\n\nSerão " + _previewQtd + " produções SEPARADAS, gerando " + barras + "."
                 : "";
-            var resp = MessageBox.Show(this,
+            // Modal do próprio app. O caminho seguro continua protegido: "Voltar" é o
+            // CancelButton (Esc/fechar não produzem) e o botão de confirmar desta tela
+            // já foi desabilitado acima (clique/Enter em fila não dispara de novo).
+            bool sim = StyledDialog.Confirmar(this.FindForm(), "Confirmar produção",
                 "Isto vai CRIAR e BAIXAR o estoque dos itens:\n\n   " + _previewKitNome + "   ×" + _previewQtd
                 + aviso + "\n\nEsta ação NÃO pode ser desfeita. Confirmar a produção?",
-                "Confirmar produção", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                "Sim, produzir", "Voltar");
 
-            if (resp != DialogResult.Yes) { btnConfirmar.Enabled = true; return; }
+            if (!sim) { btnConfirmar.Enabled = true; return; }
 
             _finalizado = true;                 // trava por preview (anti-duplo-clique)
             _producaoEmAndamento = true;        // trava global (shell bloqueia navegação)
@@ -464,8 +569,22 @@ namespace SoulmvKit.UI
             btnCancelar.Enabled = false;        // não dá mais para cancelar durante a gravação
             btnConfirmar.Text = "Produzindo...";
 
+            bool tenho = false;
             try
             {
+                // Gravação irreversível: exige exclusividade no MV (o monitor de solicitações
+                // não pode estar conversando na mesma sessão).
+                tenho = await MvGate.EntrarAsync("produzir-confirmar", 60000);
+                if (IsDisposed || Disposing) return;
+                if (!tenho)
+                {
+                    _finalizado = false; _producaoEmAndamento = false;
+                    btnConfirmar.Enabled = true; btnConfirmar.Text = "Confirmar produção";
+                    btnCancelar.Enabled = true;
+                    banner.SetState(StatusKind.Warning, "O servidor está respondendo outra consulta — NADA foi produzido. Tente confirmar de novo em instantes.");
+                    return;
+                }
+
                 if (_previewQtd == 1)
                 {
                     // 1 kit: usa a sessão já montada na pré-visualização (mantém a etiqueta).
@@ -542,7 +661,9 @@ namespace SoulmvKit.UI
             }
             finally
             {
+                if (tenho) MvGate.Sair();
                 _producaoEmAndamento = false;   // libera a navegação
+                _previewAberto = false;         // o form de produção não está mais pendente
             }
         }
 
@@ -555,7 +676,7 @@ namespace SoulmvKit.UI
             {
                 if (!IsDisposed && !Disposing)
                     banner.SetState(StatusKind.Warning,
-                        "O kit foi produzido, mas não consegui abrir o comprovante no navegador: " + ex.Message + "  URL: " + url);
+                        "O kit foi produzido, mas não foi possível abrir o comprovante no navegador: " + ex.Message + "  URL: " + url);
             }
         }
 
@@ -564,9 +685,11 @@ namespace SoulmvKit.UI
         {
             _finalizado = false;
             _client = null;                 // abandona a sessão de form (nada foi gravado)
+            _previewAberto = false;         // libera o monitor de solicitações
             btnConfirmar.Visible = false; btnCancelar.Visible = false;
             btnEtiqueta.Visible = false; lblProduzido.Visible = false;
-            grid.Rows.Clear(); grid.Visible = false; lblVazio.Visible = true; lblResumo.Text = "";
+            grid.Rows.Clear(); grid.LimparSelecao();
+            grid.Visible = false; lblVazio.Visible = true;
             cmbKit.Enabled = true; numQtd.Enabled = true;
             banner.SetState(StatusKind.Info,
                 "Pré-visualização cancelada. Nada foi gravado.");
@@ -582,13 +705,13 @@ namespace SoulmvKit.UI
                 string msg = await LasClient.ImprimirTesteAsync();
                 if (IsDisposed || Disposing) return;
                 bool ok = msg.StartsWith("Etiqueta de TESTE");
-                banner.SetState(ok ? StatusKind.Success : StatusKind.Warning, msg + "  (Detalhes salvos em logs/app.log, ao lado do programa.)");
+                banner.SetState(ok ? StatusKind.Success : StatusKind.Warning, msg + "  (Detalhes salvos em logs\\app.log, na pasta do programa.)");
             }
             catch (Exception ex)
             {
                 if (!IsDisposed && !Disposing)
                     banner.SetState(StatusKind.Error,
-                        "O teste de impressão falhou: " + ex.Message + "  (Detalhes salvos em logs/app.log, ao lado do programa — me envie esse arquivo.)");
+                        "O teste de impressão falhou: " + ex.Message + "  (Detalhes salvos em logs\\app.log, na pasta do programa — envie esse arquivo ao suporte do Auxiliar.)");
             }
             finally { if (!IsDisposed && !Disposing) btnTestarLas.Enabled = true; }
         }
@@ -610,7 +733,19 @@ namespace SoulmvKit.UI
                 }
                 else if (_client != null)
                 {
-                    var etq = await _client.ObterEtiquetaZplAsync();   // 1 kit: gera agora
+                    // Gerar o ZPL é mais uma conversa com o MV: passa pelo portão único.
+                    if (!await MvGate.EntrarAsync("produzir-etiqueta", 60000))
+                    {
+                        if (!IsDisposed && !Disposing)
+                        {
+                            btnEtiqueta.Enabled = true;
+                            banner.SetState(StatusKind.Warning, "O servidor está respondendo outra consulta. Tente a etiqueta de novo em instantes.");
+                        }
+                        return;
+                    }
+                    EtiquetaZpl etq;
+                    try { etq = await _client.ObterEtiquetaZplAsync(); }   // 1 kit: gera agora
+                    finally { MvGate.Sair(); }
                     if (IsDisposed || Disposing) return;
                     if (etq != null) zpls.Add(etq);
                 }
@@ -627,7 +762,7 @@ namespace SoulmvKit.UI
                 {
                     banner.SetState(StatusKind.Warning,
                         "Kit(s) e comprovante(s) estão OK. Só falta a(s) etiqueta(s): " + LasClient.ExplicarFalha()
-                        + " Depois, reimprima em “Consultar kits”. (Detalhes em logs/app.log.)");
+                        + " Depois, reimprima em “Consultar kits”. (Detalhes em logs\\app.log.)");
                     return;
                 }
 
@@ -645,7 +780,7 @@ namespace SoulmvKit.UI
             {
                 if (!IsDisposed && !Disposing)
                     banner.SetState(StatusKind.Warning,
-                        "Não consegui imprimir a(s) etiqueta(s): " + ex.Message + ". O(s) kit(s) e comprovante(s) já estão OK.");
+                        "Não foi possível imprimir a(s) etiqueta(s): " + ex.Message + ". O(s) kit(s) e comprovante(s) já estão OK.");
             }
             finally { if (!IsDisposed && !Disposing) btnEtiqueta.Enabled = true; }
         }

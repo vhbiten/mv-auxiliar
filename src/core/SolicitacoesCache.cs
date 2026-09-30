@@ -6,14 +6,15 @@ using System.Text;
 
 namespace SoulmvKit.Core
 {
-    // Cache em disco do último resultado de solicitações (por combinação de filtros), em
-    // dados\solicitacoes-cache.txt. Permite reabrir a aba instantaneamente e sobrevive a
-    // reinício do app. Formato: 1ª linha = cabeçalho (filtro, quando, maiorNúmero);
+    // Cache em disco do último resultado de solicitações (por estoque e combinação de
+    // filtros), em dados\solicitacoes-cache[-N].txt (N = estoque; o 5/Farmácia mantém o
+    // nome legado). Permite reabrir a aba instantaneamente e sobrevive a reinício do app.
+    // Formato: 1ª linha = cabeçalho (filtro, quando, maiorNúmero);
     // demais linhas = 1 solicitação, campos separados por US (, não aparece nos dados).
     public static class SolicitacoesCache
     {
         private static readonly object _lock = new object();
-        private static string _path;
+        private static string _dir;
         private const char US = '\u001F';
 
         public static void Init(string dirBase)
@@ -22,12 +23,19 @@ namespace SoulmvKit.Core
             {
                 try
                 {
-                    string dir = Path.Combine(dirBase, "dados");
-                    Directory.CreateDirectory(dir);
-                    _path = Path.Combine(dir, "solicitacoes-cache.txt");
+                    _dir = Path.Combine(dirBase, "dados");
+                    Directory.CreateDirectory(_dir);
                 }
                 catch (Exception ex) { Logger.Log("SolicitacoesCache init: " + ex.Message); }
             }
+        }
+
+        // Arquivo por estoque; o 5 (Farmácia Central) preserva o nome legado.
+        private static string Caminho(int estoque)
+        {
+            if (_dir == null) return null;
+            string nome = estoque == 5 ? "solicitacoes-cache.txt" : "solicitacoes-cache-" + estoque + ".txt";
+            return Path.Combine(_dir, nome);
         }
 
         public class Snapshot
@@ -38,11 +46,12 @@ namespace SoulmvKit.Core
             public List<Solicitacao> Itens = new List<Solicitacao>();
         }
 
-        public static void Salvar(string filtroKey, List<Solicitacao> itens, long maxNumero, DateTime quando)
+        public static void Salvar(int estoque, string filtroKey, List<Solicitacao> itens, long maxNumero, DateTime quando)
         {
             lock (_lock)
             {
-                if (_path == null || itens == null) return;
+                string path = Caminho(estoque);
+                if (path == null || itens == null) return;
                 try
                 {
                     var sb = new StringBuilder();
@@ -54,20 +63,21 @@ namespace SoulmvKit.Core
                           .Append(C(s.Hora)).Append(US).Append(s.Urgente ? "1" : "0").Append(US).Append(C(s.Solicitante)).Append(US)
                           .Append(C(s.Atendimento)).Append(US).Append(C(s.Paciente)).Append(US).Append(C(s.TpSol)).Append('\n');
                     }
-                    File.WriteAllText(_path, sb.ToString(), new UTF8Encoding(false));
+                    File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
                 }
                 catch (Exception ex) { Logger.Log("SolicitacoesCache salvar: " + ex.Message); }
             }
         }
 
-        public static Snapshot Carregar()
+        public static Snapshot Carregar(int estoque)
         {
             lock (_lock)
             {
-                if (_path == null || !File.Exists(_path)) return null;
+                string path = Caminho(estoque);
+                if (path == null || !File.Exists(path)) return null;
                 try
                 {
-                    var linhas = File.ReadAllLines(_path, Encoding.UTF8);
+                    var linhas = File.ReadAllLines(path, Encoding.UTF8);
                     if (linhas.Length == 0) return null;
                     var cab = linhas[0].Split(US);
                     if (cab.Length < 3) return null;

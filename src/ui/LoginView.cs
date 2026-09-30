@@ -13,6 +13,8 @@ namespace SoulmvKit.UI
         private LineEdit txtPass;
         private PrimaryButton btn;
         private Label lblStatus;
+        private Label lblVersao;
+        private Label lblAtualizacao;
         private readonly string _aviso;
 
         public LoginView(MainWindow host) : this(host, null) { }
@@ -27,13 +29,13 @@ namespace SoulmvKit.UI
             this.DoubleBuffered = true;
 
             _card = new Card();
-            _card.Size = new Size(380, 450);
+            _card.Size = new Size(Theme.S(380), Theme.S(450));
 
             var logo = new PictureBox();
             logo.Image = Assets.Logo;
             logo.SizeMode = PictureBoxSizeMode.Zoom;
             logo.BackColor = Color.Transparent;
-            logo.SetBounds(110, 26, 160, 150);
+            logo.SetBounds(Theme.S(110), Theme.S(26), Theme.S(160), Theme.S(150));
 
             var sub = new Label();
             sub.Text = "Entre com seu usuário e senha";
@@ -41,21 +43,21 @@ namespace SoulmvKit.UI
             sub.ForeColor = Theme.TextMuted;
             sub.AutoSize = false;
             sub.TextAlign = ContentAlignment.MiddleCenter;
-            sub.SetBounds(20, 184, 340, 20);
+            sub.SetBounds(Theme.S(20), Theme.S(184), Theme.S(340), Theme.S(20));
 
-            var lblU = MakeFieldLabel("USUÁRIO", 40, 216);
+            var lblU = MakeFieldLabel("USUÁRIO", Theme.S(40), Theme.S(216));
             txtUser = new LineEdit();
-            txtUser.SetBounds(40, 234, 300, 36);
+            txtUser.SetBounds(Theme.S(40), Theme.S(234), Theme.S(300), Theme.S(36));
             txtUser.Casing = CharacterCasing.Upper;
 
-            var lblP = MakeFieldLabel("SENHA", 40, 286);
+            var lblP = MakeFieldLabel("SENHA", Theme.S(40), Theme.S(286));
             txtPass = new LineEdit();
-            txtPass.SetBounds(40, 304, 300, 36);
+            txtPass.SetBounds(Theme.S(40), Theme.S(304), Theme.S(300), Theme.S(36));
             txtPass.Password = true;
 
             btn = new PrimaryButton();
             btn.Text = "Entrar";
-            btn.SetBounds(40, 356, 300, 42);
+            btn.SetBounds(Theme.S(40), Theme.S(356), Theme.S(300), Theme.S(42));
             btn.Click += new EventHandler(OnEntrar);
 
             lblStatus = new Label();
@@ -63,7 +65,7 @@ namespace SoulmvKit.UI
             lblStatus.TextAlign = ContentAlignment.MiddleCenter;
             lblStatus.ForeColor = Theme.TextMuted;
             lblStatus.Font = Theme.Small;
-            lblStatus.SetBounds(20, 406, 340, 32);
+            lblStatus.SetBounds(Theme.S(20), Theme.S(406), Theme.S(340), Theme.S(32));
 
             _card.Controls.Add(logo);
             _card.Controls.Add(sub);
@@ -72,6 +74,27 @@ namespace SoulmvKit.UI
             _card.Controls.Add(btn);
             _card.Controls.Add(lblStatus);
             this.Controls.Add(_card);
+
+            // Versão no canto da tela: com a atualização automática, é o que diz por
+            // telefone se a máquina já pegou a release nova.
+            lblVersao = new Label();
+            lblVersao.Text = "Versão " + SoulmvKit.AppConfig.Versao;
+            lblVersao.Font = Theme.Small;
+            lblVersao.ForeColor = Theme.TextSoft;
+            lblVersao.BackColor = Theme.AppBg;
+            lblVersao.AutoSize = true;
+            this.Controls.Add(lblVersao);
+
+            // Estágio da atualização automática ("Verificando atualizações...",
+            // "Baixando a versão X..."), centralizado sob o cartão. Sem ele o reinício
+            // da atualização parecia um bug — a janela fechava e voltava sem explicação.
+            lblAtualizacao = new Label();
+            lblAtualizacao.Font = Theme.Body;
+            lblAtualizacao.ForeColor = Theme.TextMuted;
+            lblAtualizacao.BackColor = Theme.AppBg;
+            lblAtualizacao.AutoSize = true;
+            lblAtualizacao.Visible = false;
+            this.Controls.Add(lblAtualizacao);
 
             // Ordem de tabulação: Usuário -> Senha -> Entrar
             txtUser.Inner.TabIndex = 0;
@@ -97,7 +120,7 @@ namespace SoulmvKit.UI
             l.Font = Theme.Small;
             l.ForeColor = Theme.TextMuted;
             l.AutoSize = false;
-            l.SetBounds(x, y, 300, 16);
+            l.SetBounds(x, y, Theme.S(300), Theme.S(16));
             return l;
         }
 
@@ -113,14 +136,24 @@ namespace SoulmvKit.UI
         {
             _card.Left = (this.ClientSize.Width - _card.Width) / 2;
             _card.Top = Math.Max(16, (this.ClientSize.Height - _card.Height) / 2);
-            this.Invalidate(); // redesenha a sombra na nova posição
+            lblVersao.Left = this.ClientSize.Width - lblVersao.Width - Theme.S(12);
+            lblVersao.Top = this.ClientSize.Height - lblVersao.Height - Theme.S(8);
+            PosicionarAtualizacao();
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        private void PosicionarAtualizacao()
         {
-            base.OnPaint(e);
-            // Sombra suave atrás do cartão
-            Theme.DrawSoftShadow(e.Graphics, _card.Bounds, _card.Radius, 9, 9);
+            lblAtualizacao.Left = (this.ClientSize.Width - lblAtualizacao.Width) / 2;
+            lblAtualizacao.Top = _card.Bottom + Theme.S(16);
+        }
+
+        // Chamado pelo MainWindow com o estágio atual da atualização; vazio = esconder.
+        public void MostrarAtualizacao(string texto)
+        {
+            if (IsDisposed || Disposing) return;
+            lblAtualizacao.Text = texto ?? "";
+            lblAtualizacao.Visible = lblAtualizacao.Text.Length > 0;
+            PosicionarAtualizacao();
         }
 
         private async void OnEntrar(object sender, EventArgs e)
@@ -131,6 +164,12 @@ namespace SoulmvKit.UI
             {
                 lblStatus.ForeColor = Theme.Error;
                 lblStatus.Text = "Informe usuário e senha.";
+                return;
+            }
+            if (!SoulmvKit.AppConfig.HostConfigurado)
+            {
+                lblStatus.ForeColor = Theme.Error;
+                lblStatus.Text = "Servidor não configurado. Crie o arquivo config.txt ao lado do programa com a linha host=http://IP-do-servidor.";
                 return;
             }
 

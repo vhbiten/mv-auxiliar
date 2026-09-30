@@ -162,7 +162,7 @@ namespace SoulmvKit.Core
             {
                 switch (OrigemEfetiva)
                 {
-                    case "PRE": return "Prescrição médica";
+                    case "PRE": return "Prescrição";   // igual ao filtro de origem da tela
                     case "AVU": return "Material";
                     case "SET": return "Material";          // pedido de setor: a equipe trata como material
                     case "TRA": return "Transferência";
@@ -180,5 +180,33 @@ namespace SoulmvKit.Core
         public System.Collections.Generic.List<Solicitacao> Itens = new System.Collections.Generic.List<Solicitacao>();
         public bool AtingiuTeto { get; set; }       // parou no limite de janelas (há mais além do coletado)
         public int TotalServidor { get; set; }      // totalRecords informado pelo servidor na 1ª página
+    }
+
+    // Um item do pedido de estoque à CAF (form M_SOLSAIPRO): código + quantidade.
+    public class PedidoItem
+    {
+        public int Codigo;
+        public int Quantidade;
+    }
+
+    // Produto que o MV recusou ao digitar o pedido (ex.: não padronizado p/ solicitação).
+    public class PedidoRejeitado
+    {
+        public int Codigo;
+        public string Motivo;
+    }
+
+    // Resultado do envio do pedido à CAF: nº gerado + comprovante + recusas.
+    public class PedidoResult
+    {
+        public long Numero;                        // CD_SOLSAI_PRO gravado (0 = não gravou)
+        public string ReportUrl;                   // PDF do comprovante (R_SOLSAI_PRO)
+        public System.Collections.Generic.List<PedidoRejeitado> Rejeitados = new System.Collections.Generic.List<PedidoRejeitado>();
+        public string Erro;                        // != null se o fluxo parou antes/na gravação
+
+        // true = a mensagem de COMMIT já saiu e não houve confirmação (o pedido PODE existir no
+        // MV). Diferente de Numero==0 com Ambiguo==false, que é aborto ANTES do commit — nesse
+        // caso é comprovado que nada foi gravado. Quem chama NUNCA deve reenviar se Ambiguo.
+        public bool Ambiguo;
     }
 }

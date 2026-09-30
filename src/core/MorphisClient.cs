@@ -282,6 +282,42 @@ namespace SoulmvKit.Core
             return r;
         }
 
+        // Os kits produzíveis num estoque, direto da LOV_FORMULA do M_PRODUZIR_KIT — a mesma
+        // lista que o form mostra ao clicar no campo "Kit". READ-ONLY: abre o form e pede a
+        // LOV; NÃO confirma seleção (sem LOV_OK) e não grava nada.
+        //
+        // Como todo CALL_FORM do app, deixa o form aberto no servidor em vez de sair dele:
+        // é o mesmo comportamento da pré-visualização, e a sessão suporta o próximo CALL_FORM
+        // por cima. Por isso quem chama deve estar com o portão do MV (MvGate) na mão.
+        public static async Task<System.Collections.Generic.List<KitOption>> ListarKitsAsync(Session s, int estoque)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            await m.CallFormAsync("M_PRODUZIR_KIT", "MV.12.01.01.06.01.#");
+            await m.GotoItemAsync("MVTO_ESTOQUE", "CD_ESTOQUE", "DT_MVTO_ESTOQUE", m.EstoqueRecordId, "CD_ESTOQUE", estoque.ToString());
+            await m.GotoItemAsync("MVTO_ESTOQUE", "DT_MVTO_ESTOQUE", "CD_KIT", m.EstoqueRecordId, null, null);
+
+            var lv = await m.ListValuesAsync("MVTO_ESTOQUE", "CD_KIT");
+            var lista = lv.List_("LOV_FORMULA");
+            if (lista == null) throw new Exception("Lista de kits (LOV_FORMULA) não retornou.");
+
+            var res = new System.Collections.Generic.List<KitOption>();
+            var vistos = new System.Collections.Generic.HashSet<int>();
+            foreach (var rec in lista.Records)
+            {
+                int cd;
+                if (!int.TryParse((rec.Get("CD_PRODUTO") ?? "").Trim(), out cd) || cd <= 0) continue;
+                if (!vistos.Add(cd)) continue;
+                int formula;
+                int.TryParse((rec.Get("CD_FORMULA") ?? "").Trim(), out formula);
+                string ds = (rec.Get("DS_PRODUTO") ?? "").Trim();
+                if (ds.Length == 0) ds = "KIT " + cd;   // sem descrição o combo ficaria com linha vazia
+                res.Add(new KitOption { CdProduto = cd, DsProduto = ds, CdFormula = formula });
+            }
+            Logger.Log("Morphis: LOV_FORMULA do estoque " + estoque + " trouxe " + res.Count + " kits.");
+            return res;
+        }
+
         // Alto nível: a partir de uma sessão logada, abre o form e monta o preview do kit.
         // NÃO finaliza nada.
         public static async Task<System.Collections.Generic.List<PreviewItem>> GerarPreviewAsync(
@@ -437,17 +473,88 @@ namespace SoulmvKit.Core
             return await m.ConferenciaLotesAsync(estoque, produtos);
         }
 
-        // Baixa o PDF da conferência recém-gerada e APRENDE os pares código -> nome
-        // (persistidos no cache local do ProdutoNomes). Melhor esforço; devolve quantos
-        // nomes eram inéditos.
-        public static async Task<int> AprenderNomesConferenciaAsync(Session s, string urlPdf)
+        // Busca ao vivo no MV o nome dos produtos pelo código: abre a conferência
+        // (R_CONF_LOTE) e CONFIRMA cada código (NEXT_ITEM em CD_SEL) — o mesmo que dar
+        // Enter no código na tela. O MV valida e devolve o nome no campo NM_SEL do bloco
+        // PRODUTO. READ-ONLY (não gera relatório, não grava). Devolve só os ACHADOS
+        // (código -> nome); códigos inexistentes ficam de fora. Também os grava no cache.
+        // aoResolver (opcional) é chamado a cada código, na ordem, com o nome achado ou
+        // null (não existe). Roda na mesma thread do chamador (UI), permitindo atualizar a
+        // tela em streaming. Devolve o dicionário só dos achados.
+        public static async Task<System.Collections.Generic.Dictionary<int, string>> ResolverNomesAsync(
+            Session s, int estoque, System.Collections.Generic.List<int> codigos, Action<int, string> aoResolver)
         {
+            var nomes = new System.Collections.Generic.Dictionary<int, string>();
+            if (codigos == null || codigos.Count == 0) return nomes;
             var m = new MorphisClient(s);
-            byte[] pdf = await m.BaixarBytesAsync(urlPdf).ConfigureAwait(false);
-            var pares = PdfConfLotes.ExtrairNomes(pdf);
-            int novos = ProdutoNomes.Aprender(pares);
-            Logger.Log("Nomes de produto: " + pares.Count + " no PDF, " + novos + " novos no cache.");
-            return novos;
+            await m.WorkspaceInitAsync();
+            nomes = await m.LerNomesProdutosAsync(estoque, codigos, aoResolver);
+            ProdutoNomes.Aprender(nomes);
+            Logger.Log("Nomes ao vivo: " + nomes.Count + " de " + codigos.Count + " resolvidos (estoque " + estoque + ").");
+            return nomes;
+        }
+
+        // Confirma cada código na aba de produtos da conferência e lê o NM_SEL da resposta.
+        public async Task<System.Collections.Generic.Dictionary<int, string>> LerNomesProdutosAsync(
+            int estoque, System.Collections.Generic.List<int> produtos, Action<int, string> aoResolver)
+        {
+            var nomes = new System.Collections.Generic.Dictionary<int, string>();
+            if (produtos == null || produtos.Count == 0) return nomes;
+
+            await CallFormAsync("R_CONF_LOTE", "MV.12.01.09.02.04.#");
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESTOQUE", GotoAction("PARAMETROS", "CD_ESTOQUE", "CD_ESPECIE"),
+                ParamBody("PARAMETROS", "", "CD_ESTOQUE", estoque.ToString()), "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESPECIE", GotoAction("PARAMETROS", "CD_ESPECIE", "TP_ORDEM"), "", "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "TP_ORDEM", GotoAction("PARAMETROS", "TP_ORDEM", "SN_IMPRIMIR_SEM_ESTOQUE"),
+                ParamBody("PARAMETROS", "", "TP_ORDEM", "Descricao"), "CV_TAB_PADRAO"));
+            string changeAct = "<action name=\"change\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            var rChange = await PostAsync(MsgWin("PARAMETROS", "SN_IMPRIMIR_SEM_ESTOQUE", changeAct,
+                ParamBody("PARAMETROS", "", "SN_IMPRIMIR_SEM_ESTOQUE", "N"), "CV_TAB_PRODUTO"));
+            string prodGuid = SelectedOf(rChange, "PRODUTO");
+
+            foreach (int cod in produtos)
+            {
+                if (prodGuid == null) { Logger.Log("Busca de nomes: sem GUID de produto — abortando."); break; }
+                string act = "<action block=\"PRODUTO\" item=\"CD_SEL\" name=\"NEXT_ITEM\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+                string body = ParamBody("PRODUTO", prodGuid, "CD_SEL", cod.ToString());
+                var r = await PostAsync(MsgWin("PRODUTO", "CD_SEL", act, body, "CV_TAB_PRODUTO"));
+
+                var alert = r.Command("SHOW_ALERT");
+                if (alert != null)
+                {
+                    string an = alert.Params.ContainsKey("name") ? alert.Params["name"] : "CFG_WARNING";
+                    Logger.Log("Busca de nomes: código " + cod + " rejeitado (" + an + ") — não existe no estoque " + estoque + ".");
+                    string closeAct = "<action name=\"CLOSE_ALERT\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+                    var rc = await PostAsync(MsgWin("PRODUTO", "CD_SEL", closeAct, "<alert name=\"" + an + "\"><selected>0</selected></alert>", "CV_TAB_PRODUTO"));
+                    string g2 = SelectedOf(rc, "PRODUTO"); if (g2 != null) prodGuid = g2;
+                    if (aoResolver != null) aoResolver(cod, null);
+                    continue;
+                }
+
+                string nm = NomeDoProduto(r, cod);
+                if (nm != null && nm.Trim().Length > 0) nomes[cod] = nm.Trim();
+                string ng = SelectedOf(r, "PRODUTO"); if (ng != null) prodGuid = ng;
+                if (aoResolver != null) aoResolver(cod, nm != null ? nm.Trim() : null);
+            }
+            return nomes;
+        }
+
+        // Acha no bloco PRODUTO o registro com CD_SEL == cod e devolve o NM_SEL (o nome).
+        private static string NomeDoProduto(MorphisResponse r, int cod)
+        {
+            var blk = r.Block_("PRODUTO");
+            if (blk == null) return null;
+            string alvo = cod.ToString();
+            foreach (var rec in blk.Records)
+            {
+                string cd = rec.Get("CD_SEL");
+                if (cd != null && cd.Trim() == alvo)
+                {
+                    string nm = rec.Get("NM_SEL");
+                    if (nm != null && nm.Trim().Length > 0) return nm;
+                }
+            }
+            return null;
         }
 
         // CONSULTA DE KITS (form R_KIT_PROD): a partir de um produto comum a todos os kits
@@ -517,6 +624,283 @@ namespace SoulmvKit.Core
             var res = new ConsultaKitsResult();
             res.ReportUrl = url;
             res.Kits = PdfKits.Interpretar(pdf);
+            return res;
+        }
+
+        // ===== MOVIMENTAÇÕES POR ESTOQUE (R_MOVI_ESTOQ) — só gera relatório PDF, READ-ONLY =====
+        // Consumo do período + estoque atual por produto, para o pré-pedido à CAF.
+        // Sequência do HAR fluxo-pedido-estoque (docs/protocolo-pedido-caf.md): CD_ESTOQUE →
+        // CD_ESPECIE → CD_CLASSE → DT_INICIAL + btnGerarRelatorio (DT_FINAL fica no default = hoje).
+        public async Task<string> MovimentacaoEstoqueAsync(int estoque, int especie, DateTime dtInicial)
+        {
+            return await MovimentacaoEstoqueAsync(estoque, especie, dtInicial, null);
+        }
+
+        // Desmarca "Não-Padronizados" no bloco DETALHES (os checkboxes de "Produtos
+        // Considerados" que os três forms de relatório têm) — o relatório passa a listar só
+        // os PADRONIZADOS, filtrado pelo cadastro do próprio MV (sem heurística por nome).
+        // Mesmo mecanismo do SN_IMPRIMIR_SEM_ESTOQUE da conferência: action "change" com o
+        // valor no body (record do DETALHES tem id vazio, como o PARAMETROS).
+        // A resposta ecoa o bloco; se o valor não voltar N, avisa alto — melhor falhar do
+        // que fingir que filtrou.
+        private async Task SoPadronizadosAsync()
+        {
+            string act = "<action name=\"change\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            var r = await PostAsync(MsgWin("DETALHES", "BTN_NAO_PADRONIZADOS", act,
+                ParamBody("DETALHES", "", "BTN_NAO_PADRONIZADOS", "N"), "CV_TAB_PADRAO"));
+            var blk = r.Block_("DETALHES");
+            string v = (blk != null && blk.Records.Count > 0) ? blk.Records[0].Get("BTN_NAO_PADRONIZADOS") : null;
+            if (v != "N")
+                throw new Exception("O MV não confirmou o filtro de padronizados (BTN_NAO_PADRONIZADOS voltou "
+                    + (v == null ? "vazio" : v) + ").");
+        }
+
+        // tpMovimentacao — MEDIDO ao vivo em 23/08/2026 (CAF, 30 dias):
+        //   null/"O" = "Todos" ≈ TUDO QUE SAI (Transferências + Saídas avulsas + ajustes;
+        //              entradas de compra NÃO entram — Todos vs T+S diferiu só R$ 717 em
+        //              R$ 253 mil, e teria diferido centenas de milhares se entradas contassem).
+        //              É o consumo correto para pré-pedido e análise de compras.
+        //   "T" = só Transferências (o grosso da saída da CAF aos setores);
+        //   "S" = só Saídas avulsas (perdas/baixas — pouca coisa);
+        //   "E" é INVÁLIDO (o form ignora e cai em Todos).
+        public async Task<string> MovimentacaoEstoqueAsync(int estoque, int especie, DateTime dtInicial, string tpMovimentacao)
+        {
+            return await MovimentacaoEstoqueAsync(estoque, especie, dtInicial, tpMovimentacao, false);
+        }
+
+        public async Task<string> MovimentacaoEstoqueAsync(int estoque, int especie, DateTime dtInicial, string tpMovimentacao, bool soPadronizados)
+        {
+            await CallFormAsync("R_MOVI_ESTOQ", "MV.12.01.09.06.05.05.#");
+            if (soPadronizados) await SoPadronizadosAsync();
+
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESTOQUE", GotoAction("PARAMETROS", "CD_ESTOQUE", "CD_ESPECIE"),
+                ParamBody("PARAMETROS", "", "CD_ESTOQUE", estoque.ToString()), "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESPECIE", GotoAction("PARAMETROS", "CD_ESPECIE", "CD_CLASSE"),
+                especie > 0 ? ParamBody("PARAMETROS", "", "CD_ESPECIE", especie.ToString()) : "", "CV_TAB_PADRAO"));
+            if (tpMovimentacao == null)
+            {
+                await PostAsync(MsgWin("PARAMETROS", "CD_CLASSE", GotoAction("PARAMETROS", "CD_CLASSE", "DT_INICIAL"), "", "CV_TAB_PADRAO"));
+            }
+            else
+            {
+                // desvia por TP_MOVIMENTACAO para setar o tipo antes da data
+                await PostAsync(MsgWin("PARAMETROS", "CD_CLASSE", GotoAction("PARAMETROS", "CD_CLASSE", "TP_MOVIMENTACAO"), "", "CV_TAB_PADRAO"));
+                await PostAsync(MsgWin("PARAMETROS", "TP_MOVIMENTACAO", GotoAction("PARAMETROS", "TP_MOVIMENTACAO", "DT_INICIAL"),
+                    ParamBody("PARAMETROS", "", "TP_MOVIMENTACAO", tpMovimentacao), "CV_TAB_PADRAO"));
+            }
+
+            // Seta DT_INICIAL e dispara o relatório no mesmo GOTOITEM (como no fluxo real).
+            string genAct = "<action block=\"PARAMETROS\" item=\"DT_INICIAL\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "DT_INICIAL") + Param("previousBlock", "PARAMETROS") + Param("previousRecord", "") +
+                Param("item", "BTN_GERAR_RELATORIO") + Param("block", "TOOLBAR") + Param("record", "") +
+                Param("actionValue", "") + Param("fireItemAction", "btnGerarRelatorio_click") + "</action>";
+            // InvariantCulture: em formato customizado o '/' é o SEPARADOR DA CULTURA — numa
+            // estação com regional diferente sairia "19.07.2026" e o MV rejeitaria a data.
+            var rGen = await PostAsync(MsgWin("PARAMETROS", "DT_INICIAL", genAct,
+                ParamBody("PARAMETROS", "", "DT_INICIAL",
+                    dtInicial.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture) + " 00:00:00"), "CV_TAB_PADRAO"));
+
+            var rep = rGen.Command("REPORT_GENERATED");
+            string url = (rep != null && rep.Params.ContainsKey("report_uri")) ? rep.Params["report_uri"] : null;
+            if (url == null)
+                throw new Exception("Movimentações: relatório não gerado (sem REPORT_GENERATED). Mensagens: " + string.Join("; ", rGen.Messages));
+            Logger.Log("Movimentações: relatório gerado em " + url);
+            return url;
+        }
+
+        // ===== POSIÇÃO DE ESTOQUE SIMPLIFICADO (R_POS_EST_S) — só gera relatório, READ-ONLY =====
+        // É o saldo de TODO O HOSPITAL, não de um estoque só: o form já abre com
+        // CD_ESTOQUE = "%" (todos) e LIST_QT_ZERO = "D" (saldo diferente de zero), que é
+        // exatamente o filtro que a farmácia usa. Só precisamos dizer espécie e classe.
+        // Menu: Materiais e Logística > Relatórios > ... (MV.12.01.09.09.05.#).
+        public async Task<string> PosicaoEstoqueAsync(int especie, int classe)
+        {
+            await CallFormAsync("R_POS_EST_S", "MV.12.01.09.09.05.#");
+
+            // Anda pela ordem declarada pelo próprio form (NextItem), sem tocar em
+            // CD_ESTOQUE nem CD_PRODUTO — os "%" default são o que queremos.
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESTOQUE",
+                GotoAction("PARAMETROS", "CD_ESTOQUE", "CD_PRODUTO"), "", "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_PRODUTO",
+                GotoAction("PARAMETROS", "CD_PRODUTO", "CD_ESPECIE"), "", "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESPECIE",
+                GotoAction("PARAMETROS", "CD_ESPECIE", "CD_CLASSE"),
+                ParamBody("PARAMETROS", "", "CD_ESPECIE", especie.ToString()), "CV_TAB_PADRAO"));
+
+            // Seta CD_CLASSE e dispara o relatório no mesmo GOTOITEM (igual ao R_MOVI_ESTOQ).
+            string genAct = "<action block=\"PARAMETROS\" item=\"CD_CLASSE\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "CD_CLASSE") + Param("previousBlock", "PARAMETROS") + Param("previousRecord", "") +
+                Param("item", "BTN_GERAR_RELATORIO") + Param("block", "TOOLBAR") + Param("record", "") +
+                Param("actionValue", "") + Param("fireItemAction", "btnGerarRelatorio_click") + "</action>";
+            var rGen = await PostAsync(MsgWin("PARAMETROS", "CD_CLASSE", genAct,
+                ParamBody("PARAMETROS", "", "CD_CLASSE", classe.ToString()), "CV_TAB_PADRAO"));
+
+            var rep = rGen.Command("REPORT_GENERATED");
+            string url = (rep != null && rep.Params.ContainsKey("report_uri")) ? rep.Params["report_uri"] : null;
+            if (url == null)
+                throw new Exception("Posição de estoque: relatório não gerado (sem REPORT_GENERATED). Mensagens: "
+                    + string.Join("; ", rGen.Messages));
+            Logger.Log("Posição de estoque: relatório gerado em " + url);
+            return url;
+        }
+
+        // Variante do R_POS_EST_S com filtros opcionais: estoque específico (0 = todos, "%"),
+        // espécie (0 = todas) e classe (0 = todas). O caminho de navegação é o MESMO do método
+        // acima — só muda o que vai no body de cada GOTOITEM. Continua READ-ONLY (relatório).
+        public async Task<string> PosicaoEstoqueFiltradaAsync(int estoque, int especie, int classe)
+        {
+            return await PosicaoEstoqueFiltradaAsync(estoque, especie, classe, false);
+        }
+
+        public async Task<string> PosicaoEstoqueFiltradaAsync(int estoque, int especie, int classe, bool soPadronizados)
+        {
+            await CallFormAsync("R_POS_EST_S", "MV.12.01.09.09.05.#");
+            if (soPadronizados) await SoPadronizadosAsync();
+
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESTOQUE",
+                GotoAction("PARAMETROS", "CD_ESTOQUE", "CD_PRODUTO"),
+                estoque > 0 ? ParamBody("PARAMETROS", "", "CD_ESTOQUE", estoque.ToString()) : "", "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_PRODUTO",
+                GotoAction("PARAMETROS", "CD_PRODUTO", "CD_ESPECIE"), "", "CV_TAB_PADRAO"));
+            await PostAsync(MsgWin("PARAMETROS", "CD_ESPECIE",
+                GotoAction("PARAMETROS", "CD_ESPECIE", "CD_CLASSE"),
+                especie > 0 ? ParamBody("PARAMETROS", "", "CD_ESPECIE", especie.ToString()) : "", "CV_TAB_PADRAO"));
+
+            string genAct = "<action block=\"PARAMETROS\" item=\"CD_CLASSE\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "CD_CLASSE") + Param("previousBlock", "PARAMETROS") + Param("previousRecord", "") +
+                Param("item", "BTN_GERAR_RELATORIO") + Param("block", "TOOLBAR") + Param("record", "") +
+                Param("actionValue", "") + Param("fireItemAction", "btnGerarRelatorio_click") + "</action>";
+            var rGen = await PostAsync(MsgWin("PARAMETROS", "CD_CLASSE", genAct,
+                classe > 0 ? ParamBody("PARAMETROS", "", "CD_CLASSE", classe.ToString()) : "", "CV_TAB_PADRAO"));
+
+            var rep = rGen.Command("REPORT_GENERATED");
+            string url = (rep != null && rep.Params.ContainsKey("report_uri")) ? rep.Params["report_uri"] : null;
+            if (url == null)
+                throw new Exception("Posição de estoque (estoque " + estoque + "): relatório não gerado (sem REPORT_GENERATED). Mensagens: "
+                    + string.Join("; ", rGen.Messages));
+            Logger.Log("Posição de estoque (estoque " + (estoque > 0 ? estoque.ToString() : "todos") + "): relatório gerado em " + url);
+            return url;
+        }
+
+        // Alto nível: posição de estoque de UM estoque (saldo por produto naquele setor).
+        public static async Task<PosicaoEstoqueResult> GerarPosicaoPorEstoqueAsync(Session s, int estoque, int especie, int classe)
+        {
+            return await GerarPosicaoPorEstoqueAsync(s, estoque, especie, classe, false);
+        }
+
+        public static async Task<PosicaoEstoqueResult> GerarPosicaoPorEstoqueAsync(Session s, int estoque, int especie, int classe, bool soPadronizados)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var res = new PosicaoEstoqueResult();
+            res.ReportUrl = await m.PosicaoEstoqueFiltradaAsync(estoque, especie, classe, soPadronizados);
+            res.Pdf = await m.BaixarBytesAsync(res.ReportUrl);
+            res.Produtos = PdfPosicaoEstoque.Interpretar(res.Pdf);
+            Logger.Log("Posição de estoque: " + res.Produtos.Count + " produtos (estoque " + estoque + ", espécie "
+                + especie + ", classe " + (classe > 0 ? classe.ToString() : "todas") + ").");
+            return res;
+        }
+
+        public static async Task<PosicaoEstoqueResult> GerarPosicaoEstoqueAsync(Session s, int especie, int classe)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var res = new PosicaoEstoqueResult();
+            res.ReportUrl = await m.PosicaoEstoqueAsync(especie, classe);
+            res.Pdf = await m.BaixarBytesAsync(res.ReportUrl);
+            res.Produtos = PdfPosicaoEstoque.Interpretar(res.Pdf);
+            Logger.Log("Posição de estoque: " + res.Produtos.Count + " produtos (todos os estoques, espécie "
+                + especie + ", classe " + classe + ").");
+            return res;
+        }
+
+        // ===== PRODUTOS CRÍTICOS (R_PROD_CRIT) — só gera relatório PDF, READ-ONLY =====
+        // Traz o CADASTRO de reposição que os farmacêuticos mantêm no MV: estoque mínimo,
+        // máximo e ponto de pedido por produto, mais custo médio, fornecedor e data da
+        // última entrada. Defaults do form aceitos: "Todos os Produtos Críticos", consumo
+        // médio anual, analítico. Navegação validada ao vivo em 23/08/2026.
+        // O menuId é o do R_POS_EST_S (mesmo menu Administrativos): o servidor não valida
+        // menuId × form — se um dia passar a validar, isto falha alto e o chamador segue
+        // sem o cadastro (é enriquecimento, não fonte primária).
+        public async Task<string> ProdutosCriticosAsync(int estoque)
+        {
+            return await ProdutosCriticosAsync(estoque, false);
+        }
+
+        public async Task<string> ProdutosCriticosAsync(int estoque, bool soPadronizados)
+        {
+            await CallFormAsync("R_PROD_CRIT", "MV.12.01.09.09.05.#");
+            if (soPadronizados) await SoPadronizadosAsync();
+
+            // Ordem declarada pelo próprio form (NextItem de cada campo).
+            await GotoItemAsync("PARAMETROS", "CD_ESTOQUE", "CD_ESPECIE", "", "CD_ESTOQUE", estoque.ToString());
+            await GotoItemAsync("PARAMETROS", "CD_ESPECIE", "CD_CLASSE", "", null, null);
+            await GotoItemAsync("PARAMETROS", "CD_CLASSE", "CD_SUB_CLA", "", null, null);
+            await GotoItemAsync("PARAMETROS", "CD_SUB_CLA", "TP_PROD_CRIT", "", null, null);
+            await GotoItemAsync("PARAMETROS", "TP_PROD_CRIT", "SN_MESTRE", "", null, null);
+            await GotoItemAsync("PARAMETROS", "SN_MESTRE", "CHK_IMPRIMIR", "", null, null);
+            await GotoItemAsync("PARAMETROS", "CHK_IMPRIMIR", "TP_ANA_SINT", "", null, null);
+            await GotoItemAsync("PARAMETROS", "TP_ANA_SINT", "TP_CONSUMO", "", null, null);
+
+            string genAct = "<action block=\"PARAMETROS\" item=\"TP_CONSUMO\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "TP_CONSUMO") + Param("previousBlock", "PARAMETROS") + Param("previousRecord", "") +
+                Param("item", "BTN_GERAR_RELATORIO") + Param("block", "TOOLBAR") + Param("record", "") +
+                Param("actionValue", "") + Param("fireItemAction", "btnGerarRelatorio_click") + "</action>";
+            var rGen = await PostAsync(Msg("PARAMETROS", "TP_CONSUMO", genAct, ""));
+
+            var rep = rGen.Command("REPORT_GENERATED");
+            string url = (rep != null && rep.Params.ContainsKey("report_uri")) ? rep.Params["report_uri"] : null;
+            if (url == null)
+                throw new Exception("Produtos críticos: relatório não gerado (sem REPORT_GENERATED). Mensagens: "
+                    + string.Join("; ", rGen.Messages));
+            Logger.Log("Produtos críticos: relatório gerado em " + url);
+            return url;
+        }
+
+        public class ProdCritResult
+        {
+            public string ReportUrl;
+            public System.Collections.Generic.List<ProdCritItem> Itens = new System.Collections.Generic.List<ProdCritItem>();
+        }
+
+        public static async Task<ProdCritResult> GerarProdutosCriticosAsync(Session s, int estoque)
+        {
+            return await GerarProdutosCriticosAsync(s, estoque, false);
+        }
+
+        public static async Task<ProdCritResult> GerarProdutosCriticosAsync(Session s, int estoque, bool soPadronizados)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var res = new ProdCritResult();
+            res.ReportUrl = await m.ProdutosCriticosAsync(estoque, soPadronizados);
+            byte[] pdf = await m.BaixarBytesAsync(res.ReportUrl);
+            res.Itens = PdfProdCrit.Interpretar(pdf);
+            Logger.Log("Produtos críticos: " + res.Itens.Count + " produtos com cadastro (estoque " + estoque + ").");
+            return res;
+        }
+
+        // Alto nível: gera o R_MOVI_ESTOQ, baixa o PDF e interpreta consumo/estoque por produto.
+        public static async Task<MovimentacaoResult> GerarMovimentacaoAsync(Session s, int estoque, int especie, DateTime dtInicial)
+        {
+            return await GerarMovimentacaoAsync(s, estoque, especie, dtInicial, null);
+        }
+
+        public static async Task<MovimentacaoResult> GerarMovimentacaoAsync(Session s, int estoque, int especie, DateTime dtInicial, string tpMovimentacao)
+        {
+            return await GerarMovimentacaoAsync(s, estoque, especie, dtInicial, tpMovimentacao, false);
+        }
+
+        public static async Task<MovimentacaoResult> GerarMovimentacaoAsync(Session s, int estoque, int especie, DateTime dtInicial, string tpMovimentacao, bool soPadronizados)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var res = new MovimentacaoResult();
+            res.ReportUrl = await m.MovimentacaoEstoqueAsync(estoque, especie, dtInicial, tpMovimentacao, soPadronizados);
+            byte[] pdf = await m.BaixarBytesAsync(res.ReportUrl);
+            res.Produtos = PdfMovimentacao.Interpretar(pdf);
+            Logger.Log("Movimentações: " + res.Produtos.Count + " produtos (estoque " + estoque + ", espécie " + especie +
+                ", desde " + dtInicial.ToString("dd/MM") + ").");
             return res;
         }
 
@@ -659,6 +1043,89 @@ namespace SoulmvKit.Core
             return todas;
         }
 
+        // ===== LISTAGEM DE UM DIA VIA PAGINAÇÃO NATIVA (form M_BAIXASOL) — READ-ONLY =====
+        // Lista TODAS as solicitações de um estoque em UM DIA (DT_SOLSAI_PRO = dia, igualdade),
+        // usando a PAGINAÇÃO NATIVA do form: o EXECUTE_QUERY devolve <page pageNumber/totalPages>
+        // e a ação NEXT_PAGE avança o cursor no servidor, página a página, até a última.
+        //
+        // Por que substituiu a varredura por janela de número (ScanSituacaoAsync): validado ao
+        // vivo, o servidor NÃO devolve "os 50 menores números >= piso" — cada página vem numa
+        // ordem interna (não por número). Avançar o piso para maior+1 PULAVA registros no meio
+        // da faixa (ex.: hoje trazia só ~51 de ~153 pendentes reais). A paginação nativa é por
+        // offset sobre uma ordem estável: cada registro aparece em exatamente uma página, então
+        // é completa (2 passadas seguidas deram o MESMO conjunto, sem pular nem duplicar depois
+        // da deduplicação). O filtro por igualdade de data devolve exatamente aquele dia.
+        public static async Task<SolicitacoesResult> ListarDiaAsync(
+            Session s, int estoque, string situacao, string origem, DateTime dia)
+        {
+            var res = new SolicitacoesResult();
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("M_BAIXASOL", "MV.12.01.02.01.#");
+            var blk = cf.Block_("SOLSAI_PRO");
+            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
+            if (recId == null) { Logger.Log("Solicitações: form sem registro inicial."); return res; }
+
+            var filtro = new System.Collections.Generic.Dictionary<string, string>();
+            filtro["CD_ESTOQUE"] = estoque.ToString();
+            filtro["DT_SOLSAI_PRO"] = dia.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);   // IGUALDADE = só aquele dia
+            if (!string.IsNullOrEmpty(situacao)) filtro["TP_SITUACAO"] = situacao;
+            // Origem no servidor (igual à consulta antiga): PRE/TRA por TP_ORIGEM; "DEV" por
+            // TP_SOLSAI_PRO=C; "AVU" (Material) não filtra no servidor — refino no cliente.
+            if (origem == "PRE" || origem == "TRA") filtro["TP_ORIGEM_SOLICITACAO"] = origem;
+            else if (origem == "DEV") filtro["TP_SOLSAI_PRO"] = "C";
+
+            var sb = new StringBuilder();
+            foreach (var c in SolCampos)
+            {
+                string v; if (!filtro.TryGetValue(c, out v)) v = "";
+                sb.Append("<item name=\"").Append(c).Append("\">").Append(Xml(v)).Append("</item>");
+            }
+            string body = "<body><block selected=\"" + recId + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + recId + "\">" + sb + "</record></block></body>";
+            string execHdr = "<header><control block=\"SOLSAI_PRO\" item=\"CD_SOLSAI_PRO\" task=\"" + m.FormTask +
+                "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
+                "<action name=\"EXECUTE_QUERY\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
+
+            var vistos = new System.Collections.Generic.HashSet<long>();
+            var q = await m.PostAsync(execHdr + body);
+            int pagina = 0;
+            while (true)
+            {
+                pagina++;
+                int pageNumber, totalPages;
+                LerPaginacao(q.Raw, out pageNumber, out totalPages);
+                foreach (var sol in ParseSolicitacoes(q.Raw, estoque))
+                    if (vistos.Add(sol.Numero)) res.Itens.Add(sol);
+                Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + " est " + estoque + ": página " + pageNumber + "/" + totalPages + " -> " + res.Itens.Count + " distintas");
+                if (pageNumber >= totalPages) break;
+                if (pagina >= 400) { res.AtingiuTeto = true; break; }   // trava anti-loop (400×50 = 20000)
+                q = await m.PostAsync(NextPageHdr(m.FormTask) + "<body></body>");
+            }
+            res.Itens.Sort(delegate(Solicitacao a, Solicitacao b) { return b.Numero.CompareTo(a.Numero); });
+            res.TotalServidor = res.Itens.Count;
+            return res;
+        }
+
+        private static string NextPageHdr(string task)
+        {
+            return "<header><control block=\"SOLSAI_PRO\" item=\"CD_SOLSAI_PRO\" task=\"" + task +
+                "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
+                "<action name=\"NEXT_PAGE\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
+        }
+
+        // Lê os atributos pageNumber/totalPages do <page ...> da resposta (0 registros -> 1/1).
+        private static void LerPaginacao(string xml, out int pageNumber, out int totalPages)
+        {
+            pageNumber = 1; totalPages = 1;
+            var mm = System.Text.RegularExpressions.Regex.Match(xml, "<[a-zA-Z:]*page\\b[^>]*>");
+            if (!mm.Success) return;
+            int v;
+            var pn = System.Text.RegularExpressions.Regex.Match(mm.Value, "pageNumber=\"(\\d+)\"");
+            if (pn.Success && int.TryParse(pn.Groups[1].Value, out v)) pageNumber = v;
+            var tp = System.Text.RegularExpressions.Regex.Match(mm.Value, "totalPages=\"(\\d+)\"");
+            if (tp.Success && int.TryParse(tp.Groups[1].Value, out v)) totalPages = v;
+        }
+
         // IMPORTANTE (aprendido na engenharia reversa): a consulta com filtro de DATA
         // devolve os registros ESPALHADOS (não pelo índice de número), o que quebra a
         // paginação por janela. Já a consulta SEM filtro de data devolve sempre os 50
@@ -754,7 +1221,7 @@ namespace SoulmvKit.Core
             // então o refino fica no cliente (OrigemEfetiva).
             if (origem == "PRE" || origem == "TRA") filtro["TP_ORIGEM_SOLICITACAO"] = origem;
             else if (origem == "DEV") filtro["TP_SOLSAI_PRO"] = "C";
-            if (de.HasValue) filtro["DT_SOLSAI_PRO"] = ">=" + de.Value.ToString("dd/MM/yyyy");
+            if (de.HasValue) filtro["DT_SOLSAI_PRO"] = ">=" + de.Value.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);
             if (pisoCd > 1) filtro["CD_SOLSAI_PRO"] = ">=" + pisoCd;
 
             var sb = new StringBuilder();
@@ -910,6 +1377,413 @@ namespace SoulmvKit.Core
         }
 
         private static string FormTaskOf(MorphisClient m) { return m.FormTask; }
+
+        // ===== PEDIDO DE ESTOQUE À CAF (form M_SOLSAIPRO) =====
+        // ⚠️⚠️ ESTE FLUXO GRAVA UMA SOLICITAÇÃO NO MV (na ÚLTIMA etapa: btnImprimir do modal).
+        // NÃO chamar sem ordem expressa do usuário — a UI mantém o envio DESABILITADO até a
+        // validação assistida com a CAF. Protocolo do HAR real (docs/protocolo-pedido-caf.md):
+        //   1. CALL_FORM M_SOLSAIPRO; TP_SOLSAI_PRO=E (pedido entre estoques) via
+        //      tpSolsaiPro_change — ATENÇÃO: essa ação DESCARTA e RECRIA a linha em branco
+        //      do grid ITSOLSAI_PRO (ler o novo GUID da response).
+        //   2. CD_ESTOQUE = estoque ATENDENTE (2 = CAF, quem separa e entrega);
+        //      CD_ESTOQUE_SOLICITANTE = quem pede/recebe (5 = Farmácia Central).
+        //      Datas/horas são preenchidas pelo servidor — o cliente não as envia.
+        //   3. Por item: GOTOITEM CD_PRODUTO→DSP_DS_UNIDADE (seta o código; o servidor
+        //      devolve nome/unidade/saldo) e NEXT_ITEM QT_SOLICITADO (valida a linha e CRIA
+        //      a próxima em branco — o novo selected é o GUID do próximo ciclo).
+        //      Produto recusado (CFG_ERROR, ex. não padronizado): CLOSE_ALERT e sobrescreve
+        //      o MESMO record com o próximo código (não precisa excluir a linha).
+        //   4. btnImprimeSolicitacao_click abre o modal (NADA gravado ainda; a task fica
+        //      suspensa) → btnImprimir_click no modal GRAVA tudo de uma vez ("Registros
+        //      gravados com sucesso"), devolve o nº CD_SOLSAI_PRO e o PDF do comprovante.
+        public static async Task<PedidoResult> EnviarPedidoCafAsync(
+            Session s, System.Collections.Generic.List<PedidoItem> itens, int estoqueAtendente, int estoqueSolicitante)
+        {
+            var res = new PedidoResult();
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("M_SOLSAIPRO", "MV.06.02.02.01.#");
+            string master = SelectedOf(cf, "SOLSAI_PRO");
+            if (master == null) throw new Exception("Formulário de pedido (M_SOLSAIPRO) não abriu.");
+
+            // 1) tipo = E (pedido entre estoques) — recria a linha do grid
+            string actTp = "<action block=\"SOLSAI_PRO\" item=\"TP_SOLSAI_PRO\" name=\"tpSolsaiPro_change\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            string bodyTp = "<block selected=\"" + master + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + master + "\"><item name=\"TP_SOLSAI_PRO\">E</item></record></block>";
+            var rTp = await m.PostAsync(m.Msg("SOLSAI_PRO", "TP_SOLSAI_PRO", actTp, bodyTp));
+            string linha = SelectedOf(rTp, "ITSOLSAI_PRO");
+            string m2 = SelectedOf(rTp, "SOLSAI_PRO"); if (m2 != null) master = m2;
+            if (linha == null) throw new Exception("Pedido: o grid de itens não veio após TP_SOLSAI_PRO=E.");
+
+            // 2) estoques do cabeçalho
+            await m.GotoItemAsync("SOLSAI_PRO", "CD_ESTOQUE", "CD_ESTOQUE_SOLICITANTE", master, "CD_ESTOQUE", estoqueAtendente.ToString());
+            var rSol = await m.GotoItemAsync("SOLSAI_PRO", "CD_ESTOQUE_SOLICITANTE", "DT_SOLSAI_PRO", master, "CD_ESTOQUE_SOLICITANTE", estoqueSolicitante.ToString());
+            string l2 = SelectedOf(rSol, "ITSOLSAI_PRO"); if (l2 != null) linha = l2;
+
+            // sai do cabeçalho para o grid (valida o cabeçalho no servidor)
+            string actCross = "<action block=\"SOLSAI_PRO\" item=\"DT_SOLSAI_PRO\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "DT_SOLSAI_PRO") + Param("previousBlock", "SOLSAI_PRO") + Param("previousRecord", master) +
+                Param("item", "CD_PRODUTO") + Param("block", "ITSOLSAI_PRO") + Param("record", linha) +
+                Param("actionValue", "") + Param("fireItemAction", "") + "</action>";
+            var rCross = await m.PostAsync(m.Msg("SOLSAI_PRO", "DT_SOLSAI_PRO", actCross, ""));
+            l2 = SelectedOf(rCross, "ITSOLSAI_PRO"); if (l2 != null) linha = l2;
+
+            // Confere o cabeçalho pelo ECO do servidor ANTES de digitar qualquer item: tipo E e
+            // os dois estoques na direção certa (atendente = quem FORNECE). Trocar os dois
+            // argumentos gravaria o pedido ao contrário e o MV não reclamaria.
+            // EXIGE os três campos PRESENTES: campo ausente no eco é a assinatura do MV para
+            // "esse valor não pegou" (é assim que um produto recusado volta, sem os campos do
+            // lookup). Validado ao vivo em 17/08/2026: o eco vem com TP=E, CD_ESTOQUE=2 e
+            // CD_ESTOQUE_SOLICITANTE=5, limpos. Abortar aqui é de graça — nada foi gravado.
+            {
+                var hdr = rCross.Block_("SOLSAI_PRO");
+                var h = (hdr != null && hdr.Records.Count > 0) ? hdr.Records[0] : null;
+                string tp = h == null ? null : h.Get("TP_SOLSAI_PRO");
+                string cdA = h == null ? null : h.Get("CD_ESTOQUE");
+                string cdS = h == null ? null : h.Get("CD_ESTOQUE_SOLICITANTE");
+                int nA, nS;
+                if (tp == null || tp.Trim() != "E" ||
+                    !int.TryParse((cdA ?? "").Trim(), out nA) || nA != estoqueAtendente ||
+                    !int.TryParse((cdS ?? "").Trim(), out nS) || nS != estoqueSolicitante)
+                {
+                    res.Erro = "O cabeçalho do pedido não confere no servidor (tipo=" + tp + ", atendente=" +
+                        cdA + ", solicitante=" + cdS + ") — nada foi gravado.";
+                    Logger.Log("Pedido CAF: ABORTADO — " + res.Erro);
+                    return res;
+                }
+                Logger.Log("Pedido CAF: cabeçalho OK — atendente " + cdA + " (" + h.Get("DSP_DS_ESTOQUE") +
+                    ") fornece para o solicitante " + cdS + " (" + h.Get("DSP_DS_ESTOQUE_SOLICITANTE") + ").");
+            }
+
+            // 3) itens: código -> quantidade (2 mensagens por produto)
+            string closeAct = "<action name=\"CLOSE_ALERT\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            bool ultimaRejeitada = false;
+            int linhasNaGrade = -1;
+            foreach (var it in itens)
+            {
+                var rProd = await m.GotoItemAsync("ITSOLSAI_PRO", "CD_PRODUTO", "DSP_DS_UNIDADE", linha, "CD_PRODUTO", it.Codigo.ToString());
+                var alerta = rProd.Command("SHOW_ALERT");
+                if (alerta != null)
+                {
+                    // produto recusado pelo MV (ex.: não padronizado p/ solicitação de estoque)
+                    string an = alerta.Params.ContainsKey("name") ? alerta.Params["name"] : "CFG_ERROR";
+                    var rej = new PedidoRejeitado();
+                    rej.Codigo = it.Codigo;
+                    rej.Motivo = TextoAlerta(rProd);
+                    if (rej.Motivo.Length == 0) rej.Motivo = "recusado pelo MV Soul";
+                    res.Rejeitados.Add(rej);
+                    Logger.Log("Pedido CAF: produto " + it.Codigo + " recusado (" + an + "): " + rej.Motivo);
+                    await m.PostAsync(m.Msg("ITSOLSAI_PRO", "CD_PRODUTO", closeAct, "<alert name=\"" + an + "\"><selected>0</selected></alert>"));
+                    ultimaRejeitada = true;
+                    continue;   // sobrescreve o MESMO record com o próximo produto
+                }
+                ultimaRejeitada = false;
+                // o GOTOITEM não troca a linha corrente na captura, mas a regra do protocolo é
+                // reler o 'selected' de toda resposta (igual ao ConsultarSaldosCafAsync).
+                string ngLinha = SelectedOf(rProd, "ITSOLSAI_PRO"); if (ngLinha != null) linha = ngLinha;
+
+                string actQt = "<action block=\"ITSOLSAI_PRO\" item=\"QT_SOLICITADO\" name=\"NEXT_ITEM\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+                string bodyQt = "<block selected=\"" + linha + "\" name=\"ITSOLSAI_PRO\"><record status=\"C\" id=\"" + linha + "\"><item name=\"QT_SOLICITADO\">" + it.Quantidade + "</item></record></block>";
+                var rQt = await m.PostAsync(m.Msg("ITSOLSAI_PRO", "QT_SOLICITADO", actQt, bodyQt));
+                var alQt = rQt.Command("SHOW_ALERT");
+                if (alQt != null)
+                {
+                    // quantidade recusada (a grade valida antes; isto é rede de segurança)
+                    string an = alQt.Params.ContainsKey("name") ? alQt.Params["name"] : "CFG_WARNING_A";
+                    string motivoQt = TextoAlerta(rQt);
+                    await m.PostAsync(m.Msg("ITSOLSAI_PRO", "QT_SOLICITADO", closeAct, "<alert name=\"" + an + "\"><selected>0</selected></alert>"));
+                    res.Erro = "O MV recusou a quantidade " + it.Quantidade + " do produto " + it.Codigo +
+                        " — nada foi gravado." + (motivoQt.Length > 0 ? " Motivo: " + motivoQt : "");
+                    Logger.Log("Pedido CAF: ABORTADO — " + res.Erro);
+                    return res;   // aborta ANTES do commit: nenhuma solicitação foi criada
+                }
+
+                // Confere o ECO da linha antes de seguir: o servidor devolve a grade com os
+                // valores efetivos. Sem isso, uma recusa SILENCIOSA (sem alerta) passaria batida
+                // e o próximo produto sobrescreveria esta linha — o pedido gravaria com um item
+                // de menos e ninguém veria. EXIGE código e quantidade PRESENTES e iguais: campo
+                // ausente é como o MV devolve "não pegou" (validado ao vivo em 17/08/2026, o eco
+                // vem com CD_PRODUTO e QT_SOLICITADO inteiros; a grade não pagina).
+                MorphisRecord recEco = null;
+                var blkEco = rQt.Block_("ITSOLSAI_PRO");
+                if (blkEco != null)
+                    foreach (var rr in blkEco.Records) if (rr.Id == linha) { recEco = rr; break; }
+                string ecoCod = recEco == null ? null : recEco.Get("CD_PRODUTO");
+                string ecoQt = recEco == null ? null : recEco.Get("QT_SOLICITADO");
+                decimal qEco;
+                if (ecoCod == null || ecoQt == null ||
+                    ecoCod.Trim() != it.Codigo.ToString() ||
+                    !ParseSaldo(ecoQt, out qEco) || qEco != it.Quantidade)
+                {
+                    res.Erro = "O MV não confirmou a linha do produto " + it.Codigo + " (código=" +
+                        (ecoCod ?? "ausente") + ", quantidade=" + (ecoQt ?? "ausente") + ") — nada foi gravado.";
+                    Logger.Log("Pedido CAF: ABORTADO — " + res.Erro);
+                    return res;
+                }
+                Logger.Log("Pedido CAF: linha OK " + ecoCod + " x " + ecoQt + " (" +
+                    recEco.Get("DSP_DS_PRODUTO") + ", saldo do atendente " + recEco.Get("QT_ESTOQUE_ATUAL") + ")");
+
+                // A linha TEM que avançar: NEXT_ITEM aceito sempre cria um record novo em branco
+                // (é o novo 'selected'). Não avançar = a linha não foi validada; seguir daqui
+                // faria o próximo produto sobrescrever este.
+                l2 = SelectedOf(rQt, "ITSOLSAI_PRO");
+                if (l2 == null || l2 == linha)
+                {
+                    res.Erro = "O MV não abriu a linha seguinte depois do produto " + it.Codigo +
+                        " — nada foi gravado.";
+                    Logger.Log("Pedido CAF: ABORTADO — " + res.Erro);
+                    return res;
+                }
+                linha = l2;
+                linhasNaGrade = blkEco == null ? -1 : blkEco.Records.Count;
+            }
+
+            // Invariante do protocolo: a grade termina com 1 linha por produto aceito + a linha em
+            // branco pendente (que o servidor descarta ao gravar). Divergir aqui significa item
+            // perdido no caminho — não aborta (a grade pode paginar em pedidos gigantes), mas fica
+            // registrado para conferência contra o comprovante.
+            if (linhasNaGrade >= 0 && linhasNaGrade != (itens.Count - res.Rejeitados.Count) + 1)
+                Logger.Log("Pedido CAF: ATENÇÃO — a grade do MV tem " + linhasNaGrade + " linhas para " +
+                    (itens.Count - res.Rejeitados.Count) + " produtos aceitos (esperado " +
+                    ((itens.Count - res.Rejeitados.Count) + 1) + " com a linha em branco).");
+
+            if (res.Rejeitados.Count == itens.Count)
+            {
+                res.Erro = "Nenhum produto foi aceito pelo MV — pedido não gerado.";
+                return res;   // nada digitado de verdade: não finaliza
+            }
+
+            // Se o ÚLTIMO produto foi recusado, a linha corrente ficou com o código inválido
+            // pendente — remove antes de finalizar (DELETE_RECORD; a linha em BRANCO pura,
+            // caso normal, o servidor descarta sozinho na finalização — validado no HAR).
+            if (ultimaRejeitada)
+            {
+                string delAct = "<action name=\"DELETE_RECORD\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+                var rDel = await m.PostAsync(m.Msg("ITSOLSAI_PRO", "CD_PRODUTO", delAct, ""));
+                string l3 = SelectedOf(rDel, "ITSOLSAI_PRO"); if (l3 != null) linha = l3;
+            }
+
+            // 4a) abre o modal de confirmação (NADA gravado até aqui)
+            string actFim = "<action block=\"ITSOLSAI_PRO\" item=\"BTN_IMPRIME_SOLICITACAO\" name=\"btnImprimeSolicitacao_click\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            var rFim = await m.PostAsync(m.Msg("ITSOLSAI_PRO", "CD_PRODUTO", actFim, ""));
+            var to = rFim.Command("TASK_OPEN");
+            string modal = (to != null && to.Params.ContainsKey("task")) ? to.Params["task"] : null;
+            if (modal == null)
+                throw new Exception("Pedido: o modal de confirmação não abriu (sem TASK_OPEN). Mensagens: " + string.Join("; ", rFim.Messages));
+
+            // O modal vai com body VAZIO (defaults do servidor) — logo o que ele traz decide o
+            // destino da impressão. Registrar para saber o que aconteceu de verdade na farmácia.
+            var comum = rFim.Block_("COMUM");
+            if (comum != null && comum.Records.Count > 0)
+                Logger.Log("Pedido CAF: modal — saida=" + comum.Records[0].Get("TP_SAIDA") +
+                    " formato=" + comum.Records[0].Get("DESFORMAT") +
+                    " impressora=" + comum.Records[0].Get("NM_IMPRESSORA") +
+                    " copias=" + comum.Records[0].Get("NR_COPIAS"));
+
+            // 4b) ⚠️ COMMIT: btnImprimir do modal — AQUI o pedido é gravado e numerado.
+            string actImp = "<action block=\"COMUM\" item=\"TP_SAIDA\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "TP_SAIDA") + Param("previousBlock", "COMUM") + Param("previousRecord", "") +
+                Param("item", "BTN_IMPRIMIR") + Param("block", "COMUM") + Param("record", "") +
+                Param("actionValue", "") + Param("fireItemAction", "btnImprimir_click") + "</action>";
+
+            // ⚠️ ÚNICO ponto do fluxo em que uma falha é AMBÍGUA: o comando de gravar já saiu.
+            // Sem resposta não há como saber se o MV gravou — então NUNCA reenviar automaticamente
+            // (reenvio = pedido duplicado; não existe chave de idempotência neste form).
+            MorphisResponse rImp;
+            Logger.Log("Pedido CAF: COMMIT enviado (btnImprimir no modal " + modal + ").");
+            try { rImp = await m.PostAsync(m.MsgT("COMUM", "TP_SAIDA", modal, actImp, "")); }
+            catch (Exception ex)
+            {
+                res.Ambiguo = true;
+                res.Erro = "GRAVAÇÃO INCERTA: o comando de gravar foi enviado, mas a resposta não chegou (" +
+                    ex.Message + "). NÃO envie de novo: confira no MV se já existe a solicitação de hoje " +
+                    "do estoque " + estoqueSolicitante + " para o estoque " + estoqueAtendente + ".";
+                Logger.Log("Pedido CAF: " + res.Erro);
+                return res;
+            }
+
+            // O NÚMERO vem PRIMEIRO: ele é a prova de gravação e tem que vencer um eventual
+            // alerta informativo na mesma resposta (checar o alerta antes jogaria o número fora).
+            var blkPed = rImp.Block_("SOLSAI_PRO");
+            if (blkPed != null)
+                foreach (var rec in blkPed.Records)
+                {
+                    string v = rec.Get("CD_SOLSAI_PRO"); long n;
+                    if (v != null && long.TryParse(v.Trim(), out n) && n > 0) { res.Numero = n; break; }
+                }
+            if (res.Numero == 0)
+            {
+                // rede: pega o número no XML cru (mesma técnica do saldo) se o bloco não vier parseado
+                var mn = System.Text.RegularExpressions.Regex.Match(rImp.Raw ?? "",
+                    "name=\"CD_SOLSAI_PRO\"[^>]*>\\s*(\\d+)\\s*<");
+                long nf;
+                if (mn.Success && long.TryParse(mn.Groups[1].Value, out nf) && nf > 0) res.Numero = nf;
+            }
+            var repPed = rImp.Command("REPORT_GENERATED");
+            res.ReportUrl = (repPed != null && repPed.Params.ContainsKey("report_uri")) ? repPed.Params["report_uri"] : null;
+
+            var alImp = rImp.Command("SHOW_ALERT");
+            if (alImp != null && res.Numero == 0)
+            {
+                // Alerta SEM número: o MV recusou (ou não confirmou). Responde o alerta para não
+                // deixar o modal pendente e devolve como INCERTO — o commit já havia saído.
+                string an = alImp.Params.ContainsKey("name") ? alImp.Params["name"] : "CFG_ERROR";
+                try { await m.PostAsync(m.MsgT("COMUM", "TP_SAIDA", modal, closeAct, "<alert name=\"" + an + "\"><selected>0</selected></alert>")); }
+                catch { }
+                res.Ambiguo = true;
+                res.Erro = "O MV respondeu com um alerta no modal de gravação: " + TextoAlerta(rImp) +
+                    " — confira no MV se a solicitação foi criada antes de tentar de novo.";
+                Logger.Log("Pedido CAF: COMMIT com alerta — " + res.Erro);
+                return res;
+            }
+            if (alImp != null)
+                Logger.Log("Pedido CAF: alerta informativo junto do nº " + res.Numero + ": " + TextoAlerta(rImp));
+
+            // Sem número não há prova de gravação — mas se o MV disse "gravados com sucesso", o
+            // pedido EXISTE e o que falta é só o número (não pode virar "tente de novo").
+            if (res.Numero == 0)
+            {
+                bool gravou = false;
+                foreach (var msg in rImp.Messages)
+                    if (msg != null && msg.IndexOf("gravados com sucesso", StringComparison.OrdinalIgnoreCase) >= 0) gravou = true;
+                res.Ambiguo = true;   // o commit já saiu: pode ter gravado sem devolver o número
+                res.Erro = (gravou
+                        ? "O MV informou \"gravados com sucesso\" mas não devolveu o número — a solicitação EXISTE: pegue o número em Solicitações (estoque CAF)."
+                        : "O MV não devolveu o número da solicitação.") +
+                    (res.ReportUrl != null ? " PDF do comprovante: " + res.ReportUrl + "." : "") +
+                    " NÃO envie de novo. Mensagens: " + string.Join("; ", rImp.Messages) + " " + TextoAlerta(rImp);
+            }
+            Logger.Log("Pedido CAF: gravado nº " + res.Numero + " (" + (itens.Count - res.Rejeitados.Count) + " itens, " +
+                res.Rejeitados.Count + " recusados) -> " + res.ReportUrl +
+                " | MV: " + string.Join("; ", rImp.Messages));
+            return res;
+        }
+
+        // Texto de um alerta do MV: vem em <alert><text> no body (alertas NÃO populam <messages>)
+        // ou em ValidationMessage do blockCtrl. Sem isto as recusas chegam ao usuário em branco.
+        private static string TextoAlerta(MorphisResponse r)
+        {
+            if (r == null) return "";
+            try
+            {
+                if (r.Doc != null && r.Doc.DocumentElement != null)
+                {
+                    var al = MorphisResponse.FirstByLocal(r.Doc.DocumentElement, "alert");
+                    if (al != null)
+                    {
+                        var t = MorphisResponse.FirstByLocal(al, "text");
+                        if (t != null && t.InnerText.Trim().Length > 0) return Curto(t.InnerText.Trim());
+                    }
+                }
+            }
+            catch { }
+            var mm = System.Text.RegularExpressions.Regex.Match(r.Raw ?? "", "ValidationMessage=\"([^\"]+)\"");
+            if (mm.Success) return Curto(System.Net.WebUtility.HtmlDecode(mm.Groups[1].Value));
+            return r.Messages.Count > 0 ? Curto(r.Messages[0]) : "";
+        }
+
+        // O texto do MV vai direto para o banner/diálogo: sem teto, um motivo gigante come a tela.
+        private static string Curto(string s)
+        {
+            if (s == null) return "";
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length <= 300 ? s : s.Substring(0, 297) + "...";
+        }
+
+        // READ-ONLY: lê o saldo REAL (atual) de produtos no estoque atendente pelo MESMO
+        // caminho que o MV usa ao digitar o código no pedido entre estoques (M_SOLSAIPRO):
+        // abre o form, entra cada CD_PRODUTO no grid ITSOLSAI_PRO e lê QT_ESTOQUE_ATUAL da
+        // resposta. NÃO seta quantidade, NÃO faz NEXT_ITEM, NÃO finaliza (nunca chama
+        // btnImprimeSolicitacao/btnImprimir) — nada é gravado; a task é abandonada e o servidor
+        // a descarta (mesma garantia do MontarPreviewAsync). Diferente do R_MOVI_ESTOQ, isto
+        // traz o saldo de QUALQUER produto, inclusive os sem movimento no período.
+        // estoqueAtendente = quem tem o saldo (2 = CAF). Devolve código -> saldo (só os lidos).
+        public static async Task<System.Collections.Generic.Dictionary<int, decimal>> ConsultarSaldosCafAsync(
+            Session s, int estoqueAtendente, int estoqueSolicitante, System.Collections.Generic.List<int> codigos)
+        {
+            var saldos = new System.Collections.Generic.Dictionary<int, decimal>();
+            if (codigos == null || codigos.Count == 0) return saldos;
+
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("M_SOLSAIPRO", "MV.06.02.02.01.#");
+            string master = SelectedOf(cf, "SOLSAI_PRO");
+            if (master == null) throw new Exception("Consulta de saldo: M_SOLSAIPRO não abriu.");
+
+            // tipo = E (pedido entre estoques) — recria a linha em branco do grid
+            string actTp = "<action block=\"SOLSAI_PRO\" item=\"TP_SOLSAI_PRO\" name=\"tpSolsaiPro_change\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            string bodyTp = "<block selected=\"" + master + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + master + "\"><item name=\"TP_SOLSAI_PRO\">E</item></record></block>";
+            var rTp = await m.PostAsync(m.Msg("SOLSAI_PRO", "TP_SOLSAI_PRO", actTp, bodyTp));
+            string linha = SelectedOf(rTp, "ITSOLSAI_PRO");
+            string mm2 = SelectedOf(rTp, "SOLSAI_PRO"); if (mm2 != null) master = mm2;
+            if (linha == null) throw new Exception("Consulta de saldo: grid de itens não veio após TP=E.");
+
+            // cabeçalho: estoque ATENDENTE (dono do saldo) + solicitante
+            await m.GotoItemAsync("SOLSAI_PRO", "CD_ESTOQUE", "CD_ESTOQUE_SOLICITANTE", master, "CD_ESTOQUE", estoqueAtendente.ToString());
+            var rSol = await m.GotoItemAsync("SOLSAI_PRO", "CD_ESTOQUE_SOLICITANTE", "DT_SOLSAI_PRO", master, "CD_ESTOQUE_SOLICITANTE", estoqueSolicitante.ToString());
+            string l2 = SelectedOf(rSol, "ITSOLSAI_PRO"); if (l2 != null) linha = l2;
+
+            // sai do cabeçalho para o grid de itens
+            string actCross = "<action block=\"SOLSAI_PRO\" item=\"DT_SOLSAI_PRO\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "DT_SOLSAI_PRO") + Param("previousBlock", "SOLSAI_PRO") + Param("previousRecord", master) +
+                Param("item", "CD_PRODUTO") + Param("block", "ITSOLSAI_PRO") + Param("record", linha) +
+                Param("actionValue", "") + Param("fireItemAction", "") + "</action>";
+            var rCross = await m.PostAsync(m.Msg("SOLSAI_PRO", "DT_SOLSAI_PRO", actCross, ""));
+            l2 = SelectedOf(rCross, "ITSOLSAI_PRO"); if (l2 != null) linha = l2;
+
+            string closeAct = "<action name=\"CLOSE_ALERT\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            foreach (int cod in codigos)
+            {
+                // seta o código na MESMA linha (sobrescreve) e lê o que o servidor devolve.
+                var rProd = await m.GotoItemAsync("ITSOLSAI_PRO", "CD_PRODUTO", "DSP_DS_UNIDADE", linha, "CD_PRODUTO", cod.ToString());
+                var alerta = rProd.Command("SHOW_ALERT");
+                if (alerta != null)
+                {
+                    string an = alerta.Params.ContainsKey("name") ? alerta.Params["name"] : "CFG_ERROR";
+                    await m.PostAsync(m.Msg("ITSOLSAI_PRO", "CD_PRODUTO", closeAct, "<alert name=\"" + an + "\"><selected>0</selected></alert>"));
+                    Logger.Log("Saldo CAF: produto " + cod + " recusado (" + an + ") — sem saldo/estoque nesse estoque.");
+                    continue;
+                }
+                string ng = SelectedOf(rProd, "ITSOLSAI_PRO"); if (ng != null) linha = ng;
+                decimal saldo;
+                if (LerSaldoEstoqueAtual(rProd, out saldo)) saldos[cod] = saldo;
+                else Logger.Log("Saldo CAF: QT_ESTOQUE_ATUAL não veio para " + cod + ".");
+                // NÃO faz NEXT_ITEM: a linha nunca é validada/criada; o próximo laço sobrescreve.
+            }
+
+            // NÃO finaliza: nenhuma solicitação é criada. A task é abandonada.
+            Logger.Log("Saldo CAF: " + saldos.Count + " de " + codigos.Count + " lidos (estoque atendente " + estoqueAtendente + ").");
+            return saldos;
+        }
+
+        // Extrai QT_ESTOQUE_ATUAL (saldo atual) da resposta do grid ITSOLSAI_PRO.
+        private static bool LerSaldoEstoqueAtual(MorphisResponse r, out decimal saldo)
+        {
+            saldo = 0;
+            var blk = r.Block_("ITSOLSAI_PRO");
+            if (blk != null)
+                foreach (var rec in blk.Records)
+                {
+                    string v = rec.Get("QT_ESTOQUE_ATUAL");
+                    if (ParseSaldo(v, out saldo)) return true;
+                }
+            // fallback: pega o último QT_ESTOQUE_ATUAL com valor no XML cru
+            var ms = System.Text.RegularExpressions.Regex.Matches(r.Raw ?? "",
+                "name=\"QT_ESTOQUE_ATUAL\"[^>]*type=\"value\">(-?[0-9.,]+)<");
+            for (int i = ms.Count - 1; i >= 0; i--)
+                if (ParseSaldo(ms[i].Groups[1].Value, out saldo)) return true;
+            return false;
+        }
+
+        private static bool ParseSaldo(string v, out decimal saldo)
+        {
+            saldo = 0;
+            if (string.IsNullOrEmpty(v)) return false;
+            v = v.Trim();
+            // pt-BR: ponto = milhar, vírgula = decimal ("3.801,0000"); ou inteiro puro ("4170")
+            string norm = v.Replace(".", "").Replace(',', '.');
+            return decimal.TryParse(norm, System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture, out saldo);
+        }
 
         private static int TotalRegistros(string xml)
         {

@@ -1,23 +1,26 @@
 using System;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace SoulmvKit.UI
 {
     public enum StatusKind { Info, Busy, Success, Warning, Error }
 
-    // Banner de status arredondado: barra de acento + ícone à esquerda e texto
-    // que quebra linha. Altura calculada conforme o texto. Pintado à mão (leve).
+    // Banner de status sóbrio: fundo pastel + barra de acento 3px à esquerda +
+    // glifo na cor do estado + texto em TextDark (legível, sem gritar).
+    // Estado Busy anima o glifo (· ·· ···) para a espera não parecer travamento.
     public class StatusBanner : Panel
     {
         private StatusKind _kind = StatusKind.Info;
         private string _text = "";
 
-        private const int PadL = 50;   // espaço para barra de acento + ícone
-        private const int PadR = 16;
-        private const int PadV = 11;
-        private const int MinH = 48;
+        private readonly int PadL = Theme.S(42);   // barra de acento + glifo
+        private readonly int PadR = Theme.S(14);
+        private readonly int PadV = Theme.S(10);
+        private readonly int MinH = Theme.S(40);
+
+        private Timer _anim;           // só roda em Busy
+        private int _animPasso;
 
         public StatusBanner()
         {
@@ -36,6 +39,7 @@ namespace SoulmvKit.UI
         {
             _kind = kind;
             _text = text == null ? "" : text;
+            Animar(_kind == StatusKind.Busy && _text.Length > 0);
             NotificarLayout();
             this.Invalidate();
         }
@@ -43,8 +47,38 @@ namespace SoulmvKit.UI
         public void Clear()
         {
             _text = "";
+            Animar(false);
             NotificarLayout();
             this.Invalidate();
+        }
+
+        private void Animar(bool ligar)
+        {
+            if (ligar)
+            {
+                if (_anim == null)
+                {
+                    _anim = new Timer();
+                    _anim.Interval = 350;
+                    _anim.Tick += new EventHandler(delegate
+                    {
+                        _animPasso = (_animPasso + 1) % 3;
+                        this.Invalidate(new Rectangle(0, 0, PadL, this.Height));
+                    });
+                }
+                if (!_anim.Enabled) _anim.Start();
+            }
+            else if (_anim != null && _anim.Enabled)
+            {
+                _anim.Stop();
+                _animPasso = 0;
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _anim != null) { _anim.Dispose(); _anim = null; }
+            base.Dispose(disposing);
         }
 
         // Avisa o container que a altura preferida mudou (o layout chama GetPreferredSize).
@@ -78,47 +112,42 @@ namespace SoulmvKit.UI
         {
             switch (_kind)
             {
-                case StatusKind.Success: bg = Theme.SuccessBg; strong = Theme.Success; glyph = "✓"; break; // check
-                case StatusKind.Warning: bg = Theme.WarningBg; strong = Theme.Warning; glyph = "!";        break;
-                case StatusKind.Error:   bg = Theme.ErrorBg;   strong = Theme.Error;   glyph = "×";   break; // ×
-                case StatusKind.Busy:    bg = Theme.InfoBg;    strong = Theme.Primary; glyph = "…";   break; // …
-                default:                 bg = Theme.InfoBg;    strong = Theme.Primary; glyph = "i";        break;
+                case StatusKind.Success: bg = Theme.SuccessBg; strong = Theme.Success; glyph = "✓"; break;
+                case StatusKind.Warning: bg = Theme.WarningBg; strong = Theme.Warning; glyph = "!"; break;
+                case StatusKind.Error:   bg = Theme.ErrorBg;   strong = Theme.Error;   glyph = "×"; break;
+                case StatusKind.Busy:
+                    bg = Theme.InfoBg; strong = Theme.Primary;
+                    glyph = _animPasso == 0 ? "·" : (_animPasso == 1 ? "··" : "···");
+                    break;
+                default:                 bg = Theme.InfoBg;    strong = Theme.Primary; glyph = "i"; break;
             }
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(this.Parent != null ? this.Parent.BackColor : Theme.ContentBg);
+            using (var br = new SolidBrush(this.Parent != null ? this.Parent.BackColor : Theme.ContentBg))
+                g.FillRectangle(br, this.ClientRectangle);
             if (_text.Length == 0) return;
 
             Color bg, strong; string glyph;
             Palette(out bg, out strong, out glyph);
 
-            var r = new Rectangle(0, 0, this.Width - 1, this.Height - 1);
-            using (var path = Theme.RoundedRect(r, 8))
             using (var br = new SolidBrush(bg))
-            using (var pen = new Pen(Color.FromArgb(70, strong)))
-            {
-                g.FillPath(br, path);
-                g.DrawPath(pen, path);
-            }
+                g.FillRectangle(br, this.ClientRectangle);
 
-            // barra de acento à esquerda
+            // barra de acento à esquerda (único enfeite)
             using (var br = new SolidBrush(strong))
-                g.FillRectangle(br, 0, 7, 4, this.Height - 14);
+                g.FillRectangle(br, 0, 0, Theme.S(3), this.Height);
 
-            // ícone em disco
-            var ic = new Rectangle(16, (this.Height - 22) / 2, 22, 22);
-            using (var br = new SolidBrush(strong))
-                g.FillEllipse(br, ic);
-            TextRenderer.DrawText(g, glyph, Theme.BodyBold, ic, Color.White,
+            // glifo na cor do estado (sem disco)
+            var ic = new Rectangle(Theme.S(11), 0, Theme.S(24), this.Height);
+            TextRenderer.DrawText(g, glyph, Theme.H2, ic, strong,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
-            // texto (quebra linha, alinhado verticalmente)
+            // texto legível (TextDark), quebra linha
             var tr = new Rectangle(PadL, PadV, this.Width - PadL - PadR, this.Height - PadV * 2);
-            TextRenderer.DrawText(g, _text, Theme.Body, tr, strong,
+            TextRenderer.DrawText(g, _text, Theme.Body, tr, Theme.TextDark,
                 TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
     }

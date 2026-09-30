@@ -1,21 +1,21 @@
 using System;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace SoulmvKit.UI
 {
-    // Botão flat arredondado. Dois estilos:
-    //  - Preenchido (padrão): fundo da marca + hover/press, texto branco.
+    // Botão flat de cantos retos. Dois estilos:
+    //  - Preenchido (padrão): fundo da marca, hover um degrau mais ESCURO, texto branco.
     //  - Ghost (secundário): fundo branco + borda da marca, texto azul (ações de menor peso).
+    // Foco por teclado: anel sólido (branco interno no cheio, borda 2px no ghost).
     public class PrimaryButton : Button
     {
         private bool _hover;
         private bool _pressed;
-        public int Radius = 8;
+        public int Radius = 0;                          // mantido por compatibilidade; o desenho é reto
         public bool Ghost = false;                      // estilo secundário (contorno)
         public Color BaseColor = Theme.Primary;         // #005691
-        public Color HoverColor = Theme.Accent;         // #337AB7 (mais claro no hover)
+        public Color HoverColor = Theme.PrimaryMid;     // #004A7D (escurece no hover — monotônico)
         public Color PressColor = Theme.PrimaryHover;   // #003366 (mais escuro ao pressionar)
 
         public PrimaryButton()
@@ -40,42 +40,42 @@ namespace SoulmvKit.UI
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(this.Parent != null ? this.Parent.BackColor : Color.White);
-
+            var full = this.ClientRectangle;
             var rect = new Rectangle(0, 0, this.Width - 1, this.Height - 1);
             const TextFormatFlags center = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                                            TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
 
-            using (var path = Theme.RoundedRect(rect, Radius))
+            if (Ghost)
             {
-                if (Ghost)
+                Color fill = !this.Enabled ? Color.White
+                           : (_pressed ? Theme.SelBg : (_hover ? Theme.InfoBg : Color.White));
+                Color line = !this.Enabled ? Theme.BorderSoft : BaseColor;
+                Color txt  = !this.Enabled ? Theme.TextSoft : BaseColor;
+                using (var br = new SolidBrush(fill)) g.FillRectangle(br, full);
+                // foco = borda 2px; repouso = 1px
+                if (this.Focused && this.Enabled)
                 {
-                    Color fill = !this.Enabled ? Color.White : (_pressed ? Theme.Light : (_hover ? Theme.InfoBg : Color.White));
-                    Color line = !this.Enabled ? Theme.Border : BaseColor;
-                    Color txt  = !this.Enabled ? Theme.Border : BaseColor;
-                    using (var br = new SolidBrush(fill)) g.FillPath(br, path);
-                    using (var pen = new Pen(line, 1.4f)) g.DrawPath(pen, path);
-                    TextRenderer.DrawText(g, this.Text, this.Font, rect, txt, center);
+                    using (var pen = new Pen(BaseColor, 2f))
+                        g.DrawRectangle(pen, 1, 1, this.Width - 3, this.Height - 3);
                 }
                 else
                 {
-                    Color fill = !this.Enabled ? Theme.DisabledFill : (_pressed ? PressColor : (_hover ? HoverColor : BaseColor));
-                    Color txt  = !this.Enabled ? Theme.TextMuted : Color.White;
-                    using (var br = new SolidBrush(fill)) g.FillPath(br, path);
-                    TextRenderer.DrawText(g, this.Text, this.Font, rect, txt, center);
+                    using (var pen = new Pen(line, 1f))
+                        g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
                 }
+                TextRenderer.DrawText(g, this.Text, this.Font, rect, txt, center);
             }
-
-            if (this.Focused && this.Enabled)
+            else
             {
-                int fr = Radius - 3; if (fr < 1) fr = 1;
-                var ring = Rectangle.Inflate(rect, -3, -3);
-                using (var path = Theme.RoundedRect(ring, fr))
-                using (var pen = new Pen(Color.FromArgb(150, Ghost ? BaseColor : Color.White)))
+                Color fill = !this.Enabled ? Theme.DisabledFill
+                           : (_pressed ? PressColor : (_hover ? HoverColor : BaseColor));
+                Color txt  = !this.Enabled ? Theme.TextSoft : Color.White;
+                using (var br = new SolidBrush(fill)) g.FillRectangle(br, full);
+                TextRenderer.DrawText(g, this.Text, this.Font, rect, txt, center);
+                if (this.Focused && this.Enabled)
                 {
-                    pen.DashStyle = DashStyle.Dot;
-                    g.DrawPath(pen, path);
+                    using (var pen = new Pen(Color.White, 1f))
+                        g.DrawRectangle(pen, 2, 2, this.Width - 5, this.Height - 5);
                 }
             }
         }

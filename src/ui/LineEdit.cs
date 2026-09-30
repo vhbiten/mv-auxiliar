@@ -12,10 +12,10 @@ namespace SoulmvKit.UI
 
         public LineEdit()
         {
-            this.Height = 36;
+            this.Height = Theme.S(36);
             this.BackColor = Color.White;
             this.DoubleBuffered = true;
-            this.Padding = new Padding(2, 8, 2, 0);
+            this.Padding = new Padding(Theme.S(2), Theme.S(8), Theme.S(2), 0);
             this.TabStop = false;   // o tab vai direto para o TextBox interno
 
             _tb = new TextBox();
@@ -26,6 +26,14 @@ namespace SoulmvKit.UI
             _tb.ForeColor = Theme.TextDark;
             _tb.GotFocus += new EventHandler(delegate { _focado = true; this.Invalidate(); });
             _tb.LostFocus += new EventHandler(delegate { _focado = false; this.Invalidate(); });
+            // desabilitado (ex.: "Conectando..."): fundo apagado deixa claro que está travado
+            _tb.EnabledChanged += new EventHandler(delegate
+            {
+                Color c = _tb.Enabled ? Color.White : ColorTranslator.FromHtml("#F3F6F9");
+                _tb.BackColor = c;
+                this.BackColor = c;
+                this.Invalidate();
+            });
             this.Controls.Add(_tb);
         }
 

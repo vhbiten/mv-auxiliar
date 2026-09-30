@@ -2,9 +2,13 @@ using System.Collections.Generic;
 
 namespace SoulmvKit.Core
 {
-    // DADOS DE EXEMPLO (temporário) - os 14 kits capturados do sistema real.
-    // Será substituído pela leitura ao vivo (LIST_VALUES CD_KIT) quando o
-    // MorphisClient estiver conectado na LAN.
+    // Os kits produzíveis na Farmácia Central (estoque 5), copiados da LOV_FORMULA do form
+    // M_PRODUZIR_KIT. A ordem é a do MV. Só o CdProduto é usado para produzir: é por ele que
+    // o MorphisClient acha a linha na LOV. CdFormula e DsProduto são referência e rótulo.
+    //
+    // Kit novo cadastrado no MV não aparece sozinho aqui. Para conferir a lista contra o
+    // servidor: powershell -File test\build-probe.ps1 e depois estoque-probe.exe kits 5.
+    // (Foi assim que o KIT HEMODIÁLISE BBRAUN entrou, em 02/09/2026.)
     public static class SampleData
     {
         public static List<KitOption> Kits()
@@ -24,6 +28,7 @@ namespace SoulmvKit.Core
                 new KitOption { CdProduto = 16104, DsProduto = "KIT PAMIDRONATO DE CALCIO", CdFormula = 23 },
                 new KitOption { CdProduto = 16199, DsProduto = "KIT CIRURGICO DAY CLINIC", CdFormula = 25 },
                 new KitOption { CdProduto = 16730, DsProduto = "KIT AGULHAMENTO", CdFormula = 30 },
+                new KitOption { CdProduto = 16704, DsProduto = "KIT - HEMODIALISE BBRAUN", CdFormula = 27 },
             };
         }
     }
