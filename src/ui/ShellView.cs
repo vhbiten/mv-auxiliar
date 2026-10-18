@@ -54,39 +54,11 @@ namespace SoulmvKit.UI
             side.RowCount = 3;
             side.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(96)));   // marca (faixa branca)
             side.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // nav
-            side.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(76)));   // rodapé (usuário/sair)
+            side.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.S(108)));   // rodapé (usuário/configurações/sair)
 
-            // Marca: faixa branca (largura toda) com favicon + "AUXILIAR".
-            // TableLayoutPanel (não coordenadas absolutas) para preencher a faixa e escalar com o DPI.
-            var brand = new TableLayoutPanel();
+            // Marca: faixa branca com símbolo + "AUXILIAR" centralizados como um bloco (BrandHeader).
+            var brand = new BrandHeader();
             brand.Dock = DockStyle.Fill;
-            brand.BackColor = Color.White;
-            brand.Padding = new Padding(Theme.S(16), 0, Theme.S(8), 0);
-            brand.ColumnCount = 2;
-            brand.RowCount = 1;
-            brand.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(50)));
-            brand.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            brand.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-            var pic = new PictureBox();
-            pic.Image = Assets.Favicon;
-            pic.SizeMode = PictureBoxSizeMode.Zoom;
-            pic.BackColor = Color.White;
-            pic.Dock = DockStyle.Fill;
-            pic.Margin = new Padding(0, Theme.S(22), 0, Theme.S(22));
-
-            var marca = new Label();
-            marca.Text = "AUXILIAR";
-            marca.Font = new System.Drawing.Font("Segoe UI", 14f, System.Drawing.FontStyle.Bold);
-            marca.ForeColor = Theme.Primary;
-            marca.Dock = DockStyle.Fill;
-            marca.TextAlign = ContentAlignment.MiddleLeft;
-            marca.AutoEllipsis = true;       // se faltar espaço, trunca em 1 linha (nunca quebra feio)
-            marca.UseMnemonic = false;
-            marca.Padding = new Padding(Theme.S(10), 0, 0, 0);
-
-            brand.Controls.Add(pic, 0, 0);
-            brand.Controls.Add(marca, 1, 0);
             side.Controls.Add(brand, 0, 0);
 
             // Navegação
@@ -96,6 +68,16 @@ namespace SoulmvKit.UI
             nav.WrapContents = false;
             nav.BackColor = Theme.Primary;
             nav.Padding = new Padding(0, Theme.S(6), 0, 0);
+            // Janela baixa com todos os grupos abertos: rola na vertical em vez de esconder
+            // o último item atrás do rodapé. A largura dos itens acompanha a área útil para
+            // a barra de rolagem não puxar uma horizontal junto.
+            // Só vertical: desliga a horizontal ANTES de ligar o AutoScroll (sem isso o
+            // WinForms mostrava as duas barras na janela mínima).
+            nav.HorizontalScroll.Maximum = 0;
+            nav.HorizontalScroll.Enabled = false;
+            nav.HorizontalScroll.Visible = false;
+            nav.AutoScroll = true;
+            nav.ClientSizeChanged += new EventHandler(delegate { AjustarLarguras(nav); });
 
             _navKits = new NavButton("Produção de Kits");
             _navKits.Selected += new EventHandler(delegate { Selecionar(_navKits, "Produção de Kits", new ProduzirView(_host)); });
@@ -124,38 +106,41 @@ namespace SoulmvKit.UI
                 _navPedido = new NavButton("Previsão de Consumo");
                 _navPedido.Selected += new EventHandler(delegate { Selecionar(_navPedido, "Previsão de Consumo", new PedidoCafView(_host)); });
 
-                _navEstoque = new NavButton("Estoque");
-                _navEstoque.Selected += new EventHandler(delegate { Selecionar(_navEstoque, "Estoque", new EstoqueView(_host)); });
+                _navEstoque = new NavButton("Compras CAF");
+                _navEstoque.Selected += new EventHandler(delegate { Selecionar(_navEstoque, "Compras CAF", new EstoqueView(_host)); });
             }
 
             _navs.Add(_navKits); _navs.Add(_navConf); _navs.Add(_navConsulta); _navs.Add(_navSolic); _navs.Add(_navAtb); _navs.Add(_navJust);
             if (_navPedido != null) _navs.Add(_navPedido);
             if (_navEstoque != null) _navs.Add(_navEstoque);
 
-            // Ordem do menu: os dois módulos de KIT ficam juntos (produzir e consultar), depois
-            // conferência e solicitações, os dois de antimicrobiano juntos (a lista de uso e as
-            // justificativas se leem em par) e, por último, o par de reposição: Previsão de
-            // Consumo (Central pede à CAF) e Estoque (CAF decide o que comprar).
-            nav.Controls.Add(_navKits);
-            nav.Controls.Add(_navConsulta);
-            nav.Controls.Add(_navConf);
-            nav.Controls.Add(_navSolic);
-            nav.Controls.Add(_navAtb);
-            nav.Controls.Add(_navJust);
-            if (_navPedido != null) nav.Controls.Add(_navPedido);
-            if (_navEstoque != null) nav.Controls.Add(_navEstoque);
+            // Menu em grupos recolhíveis (o estado aberto/fechado fica em dados\menu.txt):
+            //   KITS: produzir e consultar;
+            //   SOLICITAÇÕES;
+            //   ANTIMICROBIANOS: a lista de uso e as justificativas se leem em par;
+            //   ESTOQUE: Conferência de Lotes (físico x eletrônico) e o par de reposição —
+            //   Previsão de Consumo (Central pede à CAF) e Compras CAF (a CAF decide o que comprar;
+            //   era a aba "Estoque", renomeada para não repetir o nome do grupo).
+            // Para o atendente o grupo ESTOQUE fica só com a Conferência (ver Permissoes).
+            _recolhidos = CarregarRecolhidos();
+            AdicionarGrupo(nav, "kits", "Kits", "\uE7B8", _navKits, _navConsulta);              // caixa
+            AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navSolic);              // prancheta
+            AdicionarGrupo(nav, "antimicrobianos", "Antimicrobianos", null, _navAtb, _navJust);    // cápsula (desenhada)
+            AdicionarGrupo(nav, "estoque", "Estoque", "\uE81E", _navConf, _navPedido, _navEstoque);  // camadas
+            AjustarLarguras(nav);
             side.Controls.Add(nav, 0, 1);
 
-            // Rodapé: usuário (ícone de perfil + nome) + sair (ícone de desligar + "Sair")
+            // Rodapé: usuário (perfil + nome) · Configurações (engrenagem) · Sair (desligar)
             var footer = new TableLayoutPanel();
             footer.Dock = DockStyle.Fill;
             footer.BackColor = Theme.NavActive;
             footer.ColumnCount = 2;
-            footer.RowCount = 2;
+            footer.RowCount = 3;
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(38)));   // ícone
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));   // texto
-            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 33.34f));
+            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
 
             // linha do usuário — só o primeiro nome (ex.: "VICTOR")
             string nomeUsuario = _host.Usuario;
@@ -165,7 +150,7 @@ namespace SoulmvKit.UI
                 int esp = nomeUsuario.IndexOf(' ');
                 if (esp > 0) nomeUsuario = nomeUsuario.Substring(0, esp);
             }
-            var icUser = RodapeIcone("");   // Contact (pessoa)
+            var icUser = RodapeIcone("\uE77B");   // Contact (pessoa)
             var lblUser = new Label();
             lblUser.Text = nomeUsuario;
             lblUser.Font = Theme.BodyBold;
@@ -178,32 +163,10 @@ namespace SoulmvKit.UI
             footer.Controls.Add(icUser, 0, 0);
             footer.Controls.Add(lblUser, 1, 0);
 
-            // linha do sair — um ÚNICO painel (ícone + "Sair") p/ o realce cobrir a linha
-            // inteira; selecionável para o teclado alcançar (Tab + Enter).
-            var sairRow = new PainelAcionavel();
-            sairRow.Dock = DockStyle.Fill;
-            sairRow.BackColor = Theme.NavActive;
-            sairRow.Cursor = Cursors.Hand;
-
-            var sairTl = new TableLayoutPanel();
-            sairTl.Dock = DockStyle.Fill;
-            sairTl.BackColor = Theme.NavActive;
-            sairTl.ColumnCount = 2; sairTl.RowCount = 1;
-            sairTl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(38)));
-            sairTl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            sairTl.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-            var icSair = RodapeIcone("");   // PowerButton (desligar)
-            var lblSair = new Label();
-            lblSair.Text = "Sair";
-            lblSair.Font = Theme.Body;
-            lblSair.ForeColor = Color.White;
-            lblSair.BackColor = Theme.NavActive;
-            lblSair.Dock = DockStyle.Fill;
-            lblSair.TextAlign = ContentAlignment.MiddleLeft;
-            sairTl.Controls.Add(icSair, 0, 0);
-            sairTl.Controls.Add(lblSair, 1, 0);
-            sairRow.Controls.Add(sairTl);
+            // Configurações: abre a página no lugar do módulo atual (como as outras telas)
+            _cfgRow = LinhaAcao("\uE713", "Configurações", new EventHandler(delegate { AbrirConfiguracoes(); }));
+            footer.Controls.Add(_cfgRow, 0, 1);
+            footer.SetColumnSpan(_cfgRow, 2);
 
             EventHandler sair = new EventHandler(delegate
             {
@@ -221,29 +184,75 @@ namespace SoulmvKit.UI
                 _host.Usuario = null;
                 _host.ShowView(new LoginView(_host));
             });
-            EventHandler entra = new EventHandler(delegate
-            {
-                sairRow.BackColor = Theme.Primary; sairTl.BackColor = Theme.Primary;
-                icSair.BackColor = Theme.Primary; lblSair.BackColor = Theme.Primary;
-            });
-            EventHandler sai = new EventHandler(delegate
-            {
-                var pt = sairRow.PointToClient(Cursor.Position);
-                if (sairRow.ClientRectangle.Contains(pt)) return;
-                sairRow.BackColor = Theme.NavActive; sairTl.BackColor = Theme.NavActive;
-                icSair.BackColor = Theme.NavActive; lblSair.BackColor = Theme.NavActive;
-            });
-            Control[] alvos = new Control[] { sairRow, sairTl, icSair, lblSair };
-            foreach (Control c in alvos) { c.MouseEnter += entra; c.MouseLeave += sai; c.Click += sair; }
-            sairRow.Acionado += sair;   // Enter/Espaço quando focado por Tab
-            sairRow.GotFocus += entra;  // foco por teclado usa o mesmo realce do hover
-            sairRow.LostFocus += sai;
-
-            footer.Controls.Add(sairRow, 0, 1);
+            var sairRow = LinhaAcao("\uE7E8", "Sair", sair);   // PowerButton (desligar)
+            footer.Controls.Add(sairRow, 0, 2);
             footer.SetColumnSpan(sairRow, 2);
             side.Controls.Add(footer, 0, 2);
 
             return side;
+        }
+
+        // Linha clicável do rodapé (ícone + texto) — um ÚNICO painel para o realce cobrir a
+        // linha inteira; selecionável para o teclado alcançar (Tab + Enter/Espaço).
+        private PainelAcionavel LinhaAcao(string glifo, string texto, EventHandler acao)
+        {
+            var row = new PainelAcionavel();
+            row.Dock = DockStyle.Fill;
+            row.Margin = new Padding(0);
+            row.BackColor = Theme.NavActive;
+            row.Cursor = Cursors.Hand;
+
+            var tl = new TableLayoutPanel();
+            tl.Dock = DockStyle.Fill;
+            tl.BackColor = Theme.NavActive;
+            tl.ColumnCount = 2; tl.RowCount = 1;
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(38)));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tl.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var ic = RodapeIcone(glifo);
+            var lbl = new Label();
+            lbl.Text = texto;
+            lbl.Font = Theme.Body;
+            lbl.ForeColor = Color.White;
+            lbl.BackColor = Theme.NavActive;
+            lbl.Dock = DockStyle.Fill;
+            lbl.TextAlign = ContentAlignment.MiddleLeft;
+            lbl.UseMnemonic = false;
+            tl.Controls.Add(ic, 0, 0);
+            tl.Controls.Add(lbl, 1, 0);
+            row.Controls.Add(tl);
+
+            Control[] partes = new Control[] { row, tl, ic, lbl };
+            EventHandler entra = new EventHandler(delegate { foreach (Control c in partes) c.BackColor = Theme.Primary; });
+            EventHandler sai = new EventHandler(delegate
+            {
+                var pt = row.PointToClient(Cursor.Position);
+                if (row.ClientRectangle.Contains(pt) || row.Focused) return;
+                foreach (Control c in partes) c.BackColor = Theme.NavActive;
+            });
+            foreach (Control c in partes) { c.MouseEnter += entra; c.MouseLeave += sai; c.Click += acao; }
+            row.Acionado += acao;      // Enter/Espaço quando focado por Tab
+            row.GotFocus += entra;     // foco por teclado usa o mesmo realce do hover
+            row.LostFocus += sai;
+            return row;
+        }
+
+        private PainelAcionavel _cfgRow;
+
+        // Configurações: página no lugar do módulo atual; nenhuma aba fica ativa.
+        public void AbrirConfiguracoes()
+        {
+            if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
+            {
+                StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", ProduzirView.ProducaoEmAndamento
+                        ? "Aguarde a produção terminar antes de trocar de tela."
+                        : "Aguarde o pedido à CAF terminar de ser enviado antes de trocar de tela.", "Entendi");
+                return;
+            }
+            foreach (var nb in _navs) nb.Active = false;
+            foreach (var g in _grupos) g.Titulo.ContemAtivo = false;
+            ShowModule("Configurações", new ConfiguracoesView(_host));
         }
 
         // Ícone (glifo Segoe MDL2) do rodapé da sidebar.
@@ -366,7 +375,7 @@ namespace SoulmvKit.UI
         public void IrParaEstoque()
         {
             if (_navEstoque == null) return;
-            Selecionar(_navEstoque, "Estoque", new EstoqueView(_host));
+            Selecionar(_navEstoque, "Compras CAF", new EstoqueView(_host));
         }
 
         public void IrParaPedidoCaf()
@@ -390,7 +399,94 @@ namespace SoulmvKit.UI
                 return;
             }
             foreach (var nb in _navs) nb.Active = (nb == nav);
+            foreach (var g in _grupos)
+            {
+                bool contem = g.Itens.Contains(nav);
+                g.Titulo.ContemAtivo = contem;
+                // módulo aberto por atalho/flag dentro de um grupo fechado: abre o grupo
+                if (contem && !g.Titulo.Expanded) DefinirAberto(g, true);
+            }
             ShowModule(titulo, view);
+        }
+
+        // ---- Grupos recolhíveis da sidebar ----
+        private class GrupoNav
+        {
+            public string Chave;
+            public NavGroupHeader Titulo;
+            public readonly System.Collections.Generic.List<NavButton> Itens = new System.Collections.Generic.List<NavButton>();
+        }
+
+        private readonly System.Collections.Generic.List<GrupoNav> _grupos = new System.Collections.Generic.List<GrupoNav>();
+        private System.Collections.Generic.HashSet<string> _recolhidos = new System.Collections.Generic.HashSet<string>();
+
+        // Cria o título do grupo e coloca os itens embaixo. Item nulo (módulo sem
+        // permissão para o usuário) é ignorado; grupo sem nenhum item não aparece.
+        private void AdicionarGrupo(FlowLayoutPanel nav, string chave, string titulo, string glifo, params NavButton[] itens)
+        {
+            var g = new GrupoNav();
+            g.Chave = chave;
+            foreach (var it in itens) if (it != null) g.Itens.Add(it);
+            if (g.Itens.Count == 0) return;
+
+            g.Titulo = glifo != null ? new NavGroupHeader(titulo, glifo)
+                : new NavGroupHeader(titulo, new Action<Graphics, Rectangle, Color>(NavGroupHeader.DesenharCapsula));
+            g.Titulo.Primeiro = (_grupos.Count == 0);
+            g.Titulo.Toggled += new EventHandler(delegate
+            {
+                DefinirAberto(g, !g.Titulo.Expanded);
+            });
+            nav.Controls.Add(g.Titulo);
+            foreach (var it in g.Itens) nav.Controls.Add(it);
+            _grupos.Add(g);
+
+            bool aberto = !_recolhidos.Contains(chave);
+            g.Titulo.Expanded = aberto;
+            foreach (var it in g.Itens) it.Visible = aberto;
+        }
+
+        private static void AjustarLarguras(FlowLayoutPanel nav)
+        {
+            int w = nav.ClientSize.Width;
+            if (w <= 0) return;
+            foreach (Control c in nav.Controls) if (c.Width != w) c.Width = w;
+        }
+
+        private void DefinirAberto(GrupoNav g, bool aberto)
+        {
+            g.Titulo.Expanded = aberto;
+            foreach (var it in g.Itens) it.Visible = aberto;
+            if (aberto) _recolhidos.Remove(g.Chave); else _recolhidos.Add(g.Chave);
+            SalvarRecolhidos();
+        }
+
+        private static string CaminhoMenu()
+        {
+            return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dados", "menu.txt");
+        }
+
+        // Uma chave de grupo fechado por linha. Arquivo ausente = tudo aberto.
+        private static System.Collections.Generic.HashSet<string> CarregarRecolhidos()
+        {
+            var h = new System.Collections.Generic.HashSet<string>();
+            try
+            {
+                if (System.IO.File.Exists(CaminhoMenu()))
+                    foreach (string l in System.IO.File.ReadAllLines(CaminhoMenu()))
+                        if (l.Trim().Length > 0) h.Add(l.Trim());
+            }
+            catch { }
+            return h;
+        }
+
+        private void SalvarRecolhidos()
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(CaminhoMenu()));
+                System.IO.File.WriteAllLines(CaminhoMenu(), new System.Collections.Generic.List<string>(_recolhidos).ToArray());
+            }
+            catch { }
         }
 
         // Panel que participa do Tab e dispara Acionado com Enter/Espaço (o "Sair").

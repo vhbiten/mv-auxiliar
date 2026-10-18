@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Marca do Auxiliar — símbolo (mestre, grade de 256).
+       "M" geométrico de peso único: hastes de 30 e diagonais com o mesmo peso óptico
+       (34 na horizontal = ~29 na perpendicular). A diagonal da direita, em ciano claro,
+       passa na frente da haste como uma fita dobrada: o "V" de MV aparece na própria
+       construção da letra. Cantos externos com raio 5; encaixes internos vivos. -->
+  <circle cx="128" cy="128" r="126" fill="#005691"/>
+  <path fill="#FFFFFF" d="
+    M62 183 V73 Q62 68 67 68 H96 L128 119.4 L160 68 H189 Q194 68 194 73 V183 Q194 188 189 188 H169 Q164 188 164 183
+    V116.2 L128 174 L92 116.2 V183 Q92 188 87 188 H67 Q62 188 62 183 Z"/>
+  <path fill="#A8DADC" d="M128 119.4 L160 68 H189 Q192.6 68 193.6 70.4 L128 174 Z"/>
+</svg>

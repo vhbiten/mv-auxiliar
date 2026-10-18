@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- Marca do Auxiliar — versão de 16/20 px: mesma letra, alinhada ao pixel, só em branco
+       (a dobra em ciano vira borrão abaixo de 24 px). -->
+  <circle cx="8" cy="8" r="8" fill="#005691"/>
+  <path fill="#FFFFFF" d="M4 12 V4 H6.2 L8 7.1 L9.8 4 H12 V12 H10 V7.3 L8 10.6 L6 7.3 V12 Z"/>
+</svg>

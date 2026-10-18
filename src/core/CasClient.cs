@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
@@ -92,14 +92,7 @@ namespace SoulmvKit.Core
                 }
 
                 // 3) Bootstrap do contexto (empresa/usuário) via integrated-services
-                string isvc = host + "/soul-integrated-services";
-                await SafeGet(http, isvc + "/config");
-                await SafeGet(http, isvc + "/api/company/list");
-                await SafeGet(http, isvc + "/api/contextInfo");
-                await SafeGet(http, isvc + "/api/applications");
-                await SafeGet(http, isvc + "/api/findSnSbisByCompany/" + company);
-                await SafeGet(http, isvc + "/api/menus");
-                Logger.Log("integrated-services: contexto carregado");
+                await CarregarContextoAsync(http, host, company);
 
                 // 4) Sessão do módulo de forms. O SSO do 2º serviço NÃO vem por 302: o CAS
                 //    devolve uma página HTML "mv sso" com <a href="...?ticket=ST-...">. Seguimos esse link.
@@ -121,6 +114,7 @@ namespace SoulmvKit.Core
 
                 res.Success = true;
                 res.Session = new Session(http, host, user);
+                res.Session.Empresa = company;
                 res.Session.NomeCompleto = await ObterNomeCompleto(http, host, user);   // best-effort
                 res.Message = "Conectado.";
                 Logger.Log("CAS: login completo para " + user + (res.Session.NomeCompleto != null ? " (" + res.Session.NomeCompleto + ")" : ""));
@@ -131,6 +125,70 @@ namespace SoulmvKit.Core
                 Logger.Log("CAS: erro - " + ex.Message);
                 res.Message = "Falha de conexão: " + ex.Message;
                 return res;
+            }
+        }
+
+        // Passo 3 do login: carrega o contexto de empresa/usuário/menus no integrated-services.
+        // É ele que o forms consulta para saber a empresa e os papéis do usuário.
+        private static async Task CarregarContextoAsync(HttpClient http, string host, int company)
+        {
+            string isvc = host + "/soul-integrated-services";
+            await SafeGet(http, isvc + "/config");
+            await SafeGet(http, isvc + "/api/company/list");
+            await SafeGet(http, isvc + "/api/contextInfo");
+            await SafeGet(http, isvc + "/api/applications");
+            await SafeGet(http, isvc + "/api/findSnSbisByCompany/" + company);
+            await SafeGet(http, isvc + "/api/menus");
+            Logger.Log("integrated-services: contexto carregado");
+        }
+
+        // Reconecta SEM senha uma sessão que caiu por inatividade, refazendo os passos 1, 3 e
+        // 4 do login pelo SSO: enquanto o login único do CAS (cookie CASTGC) estiver vivo,
+        // cada serviço recebe um ticket novo no mesmo HttpClient.
+        //
+        // Por que os três (teste ao vivo de 18/10/2026, sessão parada 80 min): o forms
+        // respondia "Não existe Empresa cadastrada ou Usuário não esta cadastrado nesta
+        // empresa" — o contexto de empresa tinha caído; renovando só o forms (passo 4) a
+        // resposta virava "Acesso negado: o usuário não tem permissão para acessar a tela"
+        // — faltavam os papéis, que vêm do contexto (passo 3).
+        // LIMITE (2º teste ao vivo, 18/10/2026, 70 min parada): o login único do CAS TAMBÉM
+        // vence por inatividade no mesmo prazo (~60–70 min) — o /soul-mv/ cai no formulário
+        // de login. Então isto só recupera quedas em que o CAS segue vivo (ex.: o forms
+        // reiniciou no servidor); a queda por inatividade quem evita é o ManterSessao. O PEP
+        // reabrir por SSO horas depois do login só acontecia com o usuário em atividade.
+        // Devolve false se o CAS também venceu (cai no formulário de login) — só com a senha.
+        public static async Task<bool> RenovarSessaoAsync(Session s)
+        {
+            if (s == null) return false;
+            try
+            {
+                // 1) soul-mv: com o CASTGC vivo o CAS devolve direto o ticket (sem formulário)
+                var r1 = await s.Http.GetAsync(s.Host + "/soul-mv/");
+                string d1 = r1.RequestMessage != null && r1.RequestMessage.RequestUri != null ? r1.RequestMessage.RequestUri.AbsoluteUri : "";
+                if (d1.IndexOf("/mvautenticador-cas/login", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Logger.Log("Sessão: login único do MV também venceu — reconexão só com a senha.");
+                    return false;
+                }
+
+                // 3) contexto de empresa/usuário
+                await CarregarContextoAsync(s.Http, s.Host, s.Empresa);
+
+                // 4) forms
+                var r4 = await s.Http.GetAsync(s.Host + "/soul-product-forms/services/status?ts=" + NowMs());
+                r4 = await FollowSso(s.Http, r4, 4);
+                string d4 = r4.RequestMessage != null && r4.RequestMessage.RequestUri != null ? r4.RequestMessage.RequestUri.AbsoluteUri : "";
+                bool ok = (int)r4.StatusCode == 200 &&
+                          d4.IndexOf("/mvautenticador-cas/login", StringComparison.OrdinalIgnoreCase) < 0;
+                Logger.Log("Sessão: reconexão sem senha " + (ok ? "OK" : "FALHOU") +
+                    " (forms HTTP " + (int)r4.StatusCode + ", " + Sanitize(d4) + ").");
+                if (ok) s.UltimaRenovacao = DateTime.Now;
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("Sessão: reconexão sem senha falhou: " + ex.Message);
+                return false;
             }
         }
 

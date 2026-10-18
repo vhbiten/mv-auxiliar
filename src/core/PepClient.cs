@@ -101,6 +101,12 @@ namespace SoulmvKit.Core
             catch (Exception ex) { Logger.Log("PEP: falha ao abrir sessão: " + ex.Message); return false; }
         }
 
+        // O PEP já foi aberto com esta sessão? (o keepalive só mantém o PEP de quem já usou)
+        public static bool Aberto(Session s)
+        {
+            return s != null && object.ReferenceEquals(_sessao, s);
+        }
+
         private static async Task<bool> SessaoValidaAsync(Session s)
         {
             string j = await GetAsync(s, Pep + "/api/session?hostname=" + Uri.EscapeDataString(AppConfig.Estacao));

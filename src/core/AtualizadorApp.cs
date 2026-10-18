@@ -81,6 +81,36 @@ namespace SoulmvKit.Core
             }
         }
 
+        // Só CONSULTA a última versão publicada (Configurações > Atualizações), sem baixar nem
+        // trocar nada. null = não deu para consultar (sem internet, GitHub fora).
+        public static async Task<string> ConsultarVersaoAsync()
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                using (var http = new HttpClient())
+                {
+                    http.Timeout = TimeSpan.FromSeconds(15);
+                    http.DefaultRequestHeaders.UserAgent.ParseAdd("mv-auxiliar");
+                    string texto = (await http.GetStringAsync(UrlBase + "versao.txt?t=" + DateTime.UtcNow.Ticks)).Trim();
+                    Version v;
+                    return Version.TryParse(texto, out v) ? texto : null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("Atualizador: consulta de versão falhou (" + ex.Message + ").");
+                return null;
+            }
+        }
+
+        // A versão publicada é mais nova que esta?
+        public static bool EhMaisNova(string publicada)
+        {
+            Version nova, atual;
+            return Version.TryParse(publicada ?? "", out nova) && Version.TryParse(AppConfig.Versao, out atual) && nova > atual;
+        }
+
         // Troca os arquivos no disco. O processo atual continua rodando a versão velha;
         // quem chama decide reiniciar (só faz sentido se ninguém estiver logado).
         private static void Aplicar(string zipPath)

@@ -27,7 +27,7 @@ namespace SoulmvKit.UI
         {
             _text = text;
             this.Width = Theme.S(210);
-            this.Height = Theme.S(48);
+            this.Height = Theme.S(42);   // 48 -> 42 com os títulos de grupo (cabe tudo aberto em 700 px)
             this.Margin = new Padding(0);
             this.Cursor = Cursors.Hand;
             this.BackColor = Theme.Primary;
@@ -69,7 +69,9 @@ namespace SoulmvKit.UI
 
             Color cor = _active ? Color.White : (EnabledItem ? Theme.SidebarText : Theme.SidebarMuted);
             Font fnt = _active ? Theme.BodyBold : Theme.Body;
-            var area = new Rectangle(Theme.S(24), 0, this.Width - Theme.S(30), this.Height);
+            // recuo igual ao do texto do título do grupo: o item fica "dentro" do grupo
+            int recuo = Theme.S(NavGroupHeader.RecuoTexto);
+            var area = new Rectangle(recuo, 0, this.Width - recuo - Theme.S(6), this.Height);
             TextRenderer.DrawText(e.Graphics, _text, fnt, area, cor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -77,7 +79,7 @@ namespace SoulmvKit.UI
             // módulo futuro: além do tom apagado, um rótulo explícito
             if (!EnabledItem)
             {
-                var tag = new Rectangle(Theme.S(24), 0, this.Width - Theme.S(34), this.Height);
+                var tag = new Rectangle(recuo, 0, this.Width - recuo - Theme.S(10), this.Height);
                 TextRenderer.DrawText(e.Graphics, "em breve", Theme.Small, tag, Theme.SidebarMuted,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             }

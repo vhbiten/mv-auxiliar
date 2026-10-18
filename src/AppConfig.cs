@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.3.2";
+        public const string Versao = "0.4.0";   // 0.4.0: menu em grupos, marca nova, sessão mantida, Configurações
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 
@@ -71,6 +71,35 @@ namespace SoulmvKit
                 if (chave == "host") return s;   // formato antigo: só a URL na linha
             }
             return null;
+        }
+
+        // Grava "chave=valor" no config.txt (Configurações > Conexão com o MV): troca a linha
+        // existente ou acrescenta no fim, preservando comentários e as demais chaves. Valor
+        // vazio remove a chave (volta ao padrão: estação = nome da máquina). Vale a partir
+        // do próximo login — a sessão aberta continua no servidor em que entrou.
+        public static void SalvarConfig(string chave, string valor)
+        {
+            string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.txt");
+            var linhas = new System.Collections.Generic.List<string>();
+            if (File.Exists(cfg)) linhas.AddRange(File.ReadAllLines(cfg));
+            bool achou = false;
+            for (int i = linhas.Count - 1; i >= 0; i--)
+            {
+                string s = linhas[i].Trim();
+                if (s.Length == 0 || s.StartsWith("#")) continue;
+                int ig = s.IndexOf('=');
+                bool eh = ig > 0
+                    ? string.Equals(s.Substring(0, ig).Trim(), chave, StringComparison.OrdinalIgnoreCase)
+                    : chave == "host";   // formato antigo: URL solta na linha
+                if (!eh) continue;
+                if (achou || string.IsNullOrEmpty(valor)) linhas.RemoveAt(i);
+                else { linhas[i] = chave + "=" + valor; achou = true; }
+            }
+            if (!achou && !string.IsNullOrEmpty(valor)) linhas.Add(chave + "=" + valor);
+            File.WriteAllLines(cfg, linhas.ToArray());
+            lock (_hostLock) { _host = null; }
+            _estacao = null;
+            Core.Logger.Log("AppConfig: " + chave + " alterado em Configurações.");
         }
 
         public const string CasApp   = "/mvautenticador-cas";

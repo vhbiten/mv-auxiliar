@@ -45,6 +45,15 @@ namespace SoulmvKit.Core
             var resp = await _s.Http.SendAsync(req);
             string text = await resp.Content.ReadAsStringAsync();
 
+            // 502/503/504 = servidor ou proxy fora do ar por instantes. A página de erro vem em
+            // HTML e era confundida com "sessão expirada" (log de 02/09 e 18/09): o usuário
+            // perdia a sessão por uma falha passageira. A sessão continua válida — só repetir.
+            if (ServidorIndisponivel(resp))
+            {
+                Logger.Log("Morphis: servidor indisponível (HTTP " + (int)resp.StatusCode + ") — sessão mantida.");
+                throw new Exception("O servidor do MV não respondeu (HTTP " + (int)resp.StatusCode + "). Tente de novo em instantes.");
+            }
+
             // Sessão morta? O servidor redireciona para o login do CAS (o HttpClient segue
             // o redirect e recebe a página HTML) ou nega o acesso com 401/403.
             if (RespostaEhLogin(resp, text))
@@ -69,6 +78,12 @@ namespace SoulmvKit.Core
             }
             if (parsed.ReqId != null) LastReqId = parsed.ReqId;
             return parsed;
+        }
+
+        private static bool ServidorIndisponivel(HttpResponseMessage resp)
+        {
+            int st = (int)resp.StatusCode;
+            return st == 502 || st == 503 || st == 504;
         }
 
         private static string DestinoFinal(HttpResponseMessage resp)
@@ -118,14 +133,25 @@ namespace SoulmvKit.Core
         // 2) Abre o form (M_PRODUZIR_KIT). Usa o task da área de trabalho.
         public async Task<MorphisResponse> CallFormAsync(string formName, string menuId)
         {
-            string header =
-                "<header><control block=\"$MAIN$_BLOCK\" item=\"MENU_TREE\" task=\"" + WorkspaceTask + "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
-                "<action block=\"$MAIN$_BLOCK\" item=\"MENU_TREE\" name=\"CALL_FORM\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>" +
-                MonitorInfo() + "</control></header>" +
-                "<body><callForm taskName=\"" + Xml(formName) + "\"><parameters>" +
-                "<parameter value=\"" + Xml(menuId) + "\" name=\"menuId\"></parameter>" +
-                "</parameters></callForm></body>";
-            var r = await PostAsync(header);
+            var r = await PostAsync(MensagemCallForm(formName, menuId));
+
+            // Sessão caída por inatividade: o MV NÃO redireciona para o login — responde "OK"
+            // com a tela suspensa e um alerta de empresa/permissão (ver CasClient.RenovarSessaoAsync).
+            // Abrir o form é sempre o 2º passo de toda operação (nada foi feito ainda), então
+            // é seguro reconectar sem senha e abrir de novo, uma vez.
+            if (SessaoSemContexto(r))
+            {
+                Logger.Log("Morphis CALL_FORM " + formName + ": sessão sem contexto (" + TextoAlerta(r) + ") — reconectando sem senha.");
+                if (await CasClient.RenovarSessaoAsync(_s))
+                {
+                    await WorkspaceInitAsync();
+                    r = await PostAsync(MensagemCallForm(formName, menuId));
+                }
+                // ainda sem empresa = a reconexão não pegou (o CAS também venceu, o caso comum
+                // depois de ~60 min parado): volta para o login com "Sua sessão expirou".
+                // "Acesso negado" que persiste é permissão de verdade: segue como resposta normal.
+                if (AlertaSemEmpresa(r)) throw new SessaoExpiradaException();
+            }
             if (r.IsOk)
             {
                 FormTask = r.Task;
@@ -134,6 +160,36 @@ namespace SoulmvKit.Core
             }
             Logger.Log("Morphis CALL_FORM " + formName + ": outcome=" + r.Outcome + " task=" + r.Task + " estoqueRec=" + EstoqueRecordId);
             return r;
+        }
+
+        private string MensagemCallForm(string formName, string menuId)
+        {
+            return
+                "<header><control block=\"$MAIN$_BLOCK\" item=\"MENU_TREE\" task=\"" + WorkspaceTask + "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
+                "<action block=\"$MAIN$_BLOCK\" item=\"MENU_TREE\" name=\"CALL_FORM\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>" +
+                MonitorInfo() + "</control></header>" +
+                "<body><callForm taskName=\"" + Xml(formName) + "\"><parameters>" +
+                "<parameter value=\"" + Xml(menuId) + "\" name=\"menuId\"></parameter>" +
+                "</parameters></callForm></body>";
+        }
+
+        // Assinaturas da sessão que perdeu o contexto (capturadas ao vivo em 18/10/2026):
+        //   parada ~60+ min  -> CFG_ERROR "Não existe Empresa cadastrada ou Usuário não esta cadastrado nesta empresa"
+        //   forms renovado sem o contexto -> CFG_WARNING_A "Acesso negado! ... não tem permissão para acessar a tela"
+        private static bool AlertaSemEmpresa(MorphisResponse r)
+        {
+            if (r == null || r.Command("SHOW_ALERT") == null) return false;
+            string t = TextoAlerta(r).ToLowerInvariant();
+            return t.Contains("não existe empresa cadastrada") || t.Contains("nao existe empresa cadastrada") ||
+                   t.Contains("cadastrado nesta empresa");
+        }
+
+        private static bool SessaoSemContexto(MorphisResponse r)
+        {
+            if (AlertaSemEmpresa(r)) return true;
+            if (r == null || r.Command("SHOW_ALERT") == null) return false;
+            string t = TextoAlerta(r).ToLowerInvariant();
+            return t.Contains("acesso negado") && t.Contains("permissão para acessar a tela");
         }
 
         private static string Param(string n, string v)
@@ -600,6 +656,11 @@ namespace SoulmvKit.Core
 
             // sessão morta: em vez do arquivo vem a página de login (HTML) ou 401/403
             int st = (int)resp.StatusCode;
+            if (ServidorIndisponivel(resp))
+            {
+                Logger.Log("BaixarBytes: servidor indisponível (HTTP " + st + ") — sessão mantida.");
+                throw new Exception("O servidor do MV não respondeu (HTTP " + st + "). Tente de novo em instantes.");
+            }
             string ini = bytes.Length > 0
                 ? Encoding.ASCII.GetString(bytes, 0, Math.Min(bytes.Length, 64)).TrimStart()
                 : "";

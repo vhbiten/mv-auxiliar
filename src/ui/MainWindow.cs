@@ -144,6 +144,7 @@ namespace SoulmvKit.UI
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             SalvarJanela();
+            SoulmvKit.Core.ManterSessao.Parar();
             SolicitacoesView.PararMonitor();
             AntimicrobianosView.PararMonitor();
             JustificativasView.PararMonitor();
@@ -176,6 +177,12 @@ namespace SoulmvKit.UI
                 SolicitacoesView.PararMonitor();
                 AntimicrobianosView.PararMonitor();
                 JustificativasView.PararMonitor();
+                SoulmvKit.Core.ManterSessao.Parar();
+            }
+            else if (Session != null)
+            {
+                // logado: mantém a sessão do MV viva enquanto o shell estiver aberto
+                SoulmvKit.Core.ManterSessao.Iniciar(() => this.Session);
             }
 
             this.AcceptButton = null;   // o botão "Entrar" do login não pode sobreviver disposed

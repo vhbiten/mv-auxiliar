@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 900">
+  <!-- Logo da tela de login: símbolo (marca.svg) + palavra AUXILIAR. -->
+  <g transform="translate(165 40) scale(2.2265625)">
+    <circle cx="128" cy="128" r="126" fill="#005691"/>
+    <path fill="#FFFFFF" d="
+      M62 183 V73 Q62 68 67 68 H96 L128 119.4 L160 68 H189 Q194 68 194 73 V183 Q194 188 189 188 H169 Q164 188 164 183
+      V116.2 L128 174 L92 116.2 V183 Q92 188 87 188 H67 Q62 188 62 183 Z"/>
+    <path fill="#A8DADC" d="M128 119.4 L160 68 H189 Q192.6 68 193.6 70.4 L128 174 Z"/>
+  </g>
+  <text x="456" y="796" text-anchor="middle" font-family="Segoe UI, sans-serif" font-weight="700"
+        font-size="112" letter-spacing="14" fill="#005691">AUXILIAR</text>
+</svg>
