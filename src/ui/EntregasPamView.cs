@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using SoulmvKit.Core;
 
@@ -19,6 +20,9 @@ namespace SoulmvKit.UI
     // não gerou pedido, descrita pelo que ela tem (exames, cuidados, suspensão de item:
     // PainelPam.Conteudo). Na ponta do item, os ícones abrem no navegador (Cent Browser) a
     // SOLICITAÇÃO (R_SOLSAI_PRO do MV) e a PRESCRIÇÃO MÉDICA (folha oficial do PEP).
+    //
+    // Viva em segundo plano: um monitor estático (ver MONITOR) relê o PAM a cada minuto desde a
+    // 1ª visita até o logout, com a aba aberta ou não; a tela só desenha o que ele leu.
     //
     // Fluidez: a grade é montada num modelo (LinhaGrade) uma vez por atualização; a atualização
     // automática só troca o texto das células quando a lista não mudou (sem piscar, sem perder
@@ -42,13 +46,12 @@ namespace SoulmvKit.UI
         private StatusBanner banner;
         private GridPro grid;
         private Label lblVazio;
-        private Timer _relogio;
-        private bool _busy;
         private bool _abrindo;
-        private bool _carregou;     // já mostrou uma leitura (a 1ª carga espera mais pelo MV)
+        private bool _carregou;     // já mostrou uma leitura
         private List<LinhaPam> _linhas = new List<LinhaPam>();
-        // Acordeões abertos, por atendimento: sobrevivem à atualização automática de 1 min.
-        private readonly HashSet<string> _abertos = new HashSet<string>();
+        // Acordeões abertos, por atendimento: sobrevivem à atualização de 1 min e à troca de
+        // aba (estático, apagado no logout).
+        private static readonly HashSet<string> _abertos = new HashSet<string>();
 
         // Ícone sob o mouse (para o realce do botão) e animação do acordeão em curso.
         private int _hoverLinha = -1, _hoverColuna = -1;
@@ -57,8 +60,6 @@ namespace SoulmvKit.UI
         private bool _animAbrindo;
         private DateTime _animInicio;
         private DataGridViewRow _animPai;
-
-        public const int IntervaloMs = 60000;   // atualiza sozinho a cada 1 min enquanto a aba está aberta
 
         // Uma linha da grade, calculada UMA vez por atualização. CellFormatting e CellPainting
         // rodam a cada repintura e só leem daqui (antes refaziam o casamento pedido↔prescrição
@@ -107,7 +108,7 @@ namespace SoulmvKit.UI
             this.Load += new EventHandler(OnLoad);
             this.Disposed += new EventHandler(delegate
             {
-                PararRelogio();
+                if (_viva == this) _viva = null;   // o monitor segue sozinho; só para de desenhar aqui
                 if (_anim != null) { _anim.Stop(); _anim.Dispose(); _anim = null; }
             });
         }
@@ -910,6 +911,9 @@ namespace SoulmvKit.UI
         }
 
         // ===== CICLO DE ATUALIZAÇÃO =====
+        // A tela só DESENHA o que o monitor de fundo leu (ver abaixo). Voltando para a aba com
+        // uma leitura em memória, a lista aparece na hora; na 1ª visita da sessão, dispara a
+        // leitura e espera a vez no portão do MV.
         private void OnLoad(object sender, EventArgs e)
         {
             if (_host.Session == null)
@@ -919,78 +923,43 @@ namespace SoulmvKit.UI
                 lblVazio.Text = "Faça login para ver os atendimentos do PAM.";
                 return;
             }
-            _relogio = new Timer();
-            _relogio.Interval = IntervaloMs;
-            _relogio.Tick += new EventHandler(delegate { Atualizar(false); });
-            _relogio.Start();
-            Atualizar(true);
+            _viva = this;
+            IniciarMonitor(_host);   // a partir da 1ª visita, atualiza sozinho até o logout
+            if (_memQuando > DateTime.MinValue) Absorver();
+            else LerAgora(false);
         }
 
-        // Nova tentativa curta quando o portão do MV estava ocupado no tique do relógio (o
-        // monitor da aba Solicitações segura ~10 s): não deixa a tela 1 min sem atualizar.
-        private void TentarDeNovoEmBreve()
-        {
-            var t = new Timer();
-            t.Interval = 8000;
-            t.Tick += new EventHandler(delegate { t.Stop(); t.Dispose(); if (!IsDisposed && !Disposing) Atualizar(false); });
-            t.Start();
-        }
-
-        private void PararRelogio()
-        {
-            if (_relogio == null) return;
-            _relogio.Stop(); _relogio.Dispose(); _relogio = null;
-        }
-
-        public void ComandoAtualizar() { Atualizar(true); }
+        public void ComandoAtualizar() { LerAgora(true); }
         public void ComandoFocarBusca() { }
 
-        private async void Atualizar(bool pedidoDoUsuario)
+        // F5 e 1ª visita: a MESMA leitura do monitor, na hora, esperando a vez no portão como as
+        // outras telas (60 s). O tique de fundo recomeça a contar a partir daqui.
+        private async void LerAgora(bool pedidoDoUsuario)
         {
-            if (_busy || IsDisposed || Disposing) return;
+            if (IsDisposed || Disposing) return;
             if (_host.Session == null) { banner.SetState(StatusKind.Warning, "Faça login para ver os atendimentos do PAM."); return; }
-            bool primeira = !_carregou;
-            if (!pedidoDoUsuario && !primeira)
+            if (_varrendo)
             {
-                // Tique do relógio: janela minimizada ou prévia de kit aberta no MV não precisam
-                // (nem devem) disputar o servidor de forms — mesma regra dos monitores.
-                if (_host.WindowState == FormWindowState.Minimized) return;
-                if (ProduzirView.OcupadoNoMv) return;
+                // Já tem leitura em curso (em geral a de fundo): ela cai na grade ao terminar.
+                if (pedidoDoUsuario && !_abrindo) banner.SetState(StatusKind.Busy, "Atualização em andamento — a lista se renova em instantes.");
+                return;
             }
-            _busy = true;
-            if ((pedidoDoUsuario || primeira) && !_abrindo) banner.SetState(StatusKind.Busy, "Atualizando os atendimentos do PAM...");
-            PainelPamResult res = null;
+            IniciarMonitor(_host);   // idempotente: religa se a sessão expirou em segundo plano
+            if (!_abrindo) banner.SetState(StatusKind.Busy, "Atualizando os atendimentos do PAM...");
+            int sessao = _sessaoId;
             try
             {
-                // Forms (atendimentos + pedidos) pelo portão único do MV; o PEP fica fora dele
-                // para não prender a aba Solicitações enquanto lê as prescrições. A 1ª carga e
-                // o F5 esperam a vez como as outras telas (60 s); o tique espera 15 s e, sem
-                // vez, tenta de novo em 8 s em vez de esperar o próximo minuto.
-                int espera = (pedidoDoUsuario || primeira) ? 60000 : 15000;
-                if (!await MvGate.EntrarAsync("urgencia-pam", espera))
+                bool ok = await VarrerAsync(_host.Session, sessao, 60000);
+                if (sessao != _sessaoId) return;
+                if (!ok)
                 {
+                    Rearmar(NovaTentativaMs);
                     if (IsDisposed || Disposing) return;
                     if (!_abrindo) banner.SetState(StatusKind.Warning, "O MV está respondendo outra consulta. Tentando de novo em instantes...");
-                    if (primeira) lblVazio.Text = "O MV está ocupado com outra consulta. Tentando de novo em instantes...";
-                    TentarDeNovoEmBreve();
+                    if (!_carregou) lblVazio.Text = "O MV está ocupado com outra consulta. Tentando de novo em instantes...";
                     return;
                 }
-                try { res = await PainelPam.LerMvAsync(_host.Session); }
-                finally { MvGate.Sair(); }
-                if (IsDisposed || Disposing) return;   // trocou de aba no meio: nada de ir ao PEP à toa
-                await PainelPam.CompletarPepAsync(_host.Session, res);
-                if (IsDisposed || Disposing) return;
-                int semPep = PainelPam.HerdarPrescricoes(res, _linhas);
-                _linhas = res.Linhas;
-                _carregou = true;
-                Render();
-                // Mensagem de uma ação (documento aberto) não é apagada no mesmo instante.
-                if (_abrindo) return;
-                string quando = "Atualizado às " + res.Quando.ToString("HH:mm:ss") + " · atualiza sozinho a cada minuto.";
-                if (res.AvisoPep != null)
-                    banner.SetState(StatusKind.Warning, quando + " O PEP não respondeu"
-                        + (semPep > 0 ? " (" + semPep + " paciente(s) sem dado de prescrição)." : ": mostrando as prescrições da leitura anterior."));
-                else banner.SetState(StatusKind.Info, quando);
+                Rearmar(IntervaloMs);
             }
             catch (SessaoExpiradaException)
             {
@@ -999,13 +968,179 @@ namespace SoulmvKit.UI
             catch (Exception ex)
             {
                 Logger.Log("Urgência (PAM): erro ao atualizar: " + ex.Message);
-                if (!IsDisposed && !Disposing)
+                if (sessao == _sessaoId) _memErro = ex.Message;
+                if (!IsDisposed && !Disposing) MostrarBanner();
+            }
+        }
+
+        // Uma leitura terminou (do monitor ou do F5): desenha e atualiza o banner.
+        private void Absorver()
+        {
+            _linhas = _memLinhas;
+            _carregou = true;
+            Render();
+            MostrarBanner();
+        }
+
+        private void MostrarBanner()
+        {
+            if (_abrindo) return;   // a mensagem de uma ação (documento aberto) não é apagada no mesmo instante
+            if (_memErro != null)
+            {
+                string ultima = _memQuando > DateTime.MinValue ? " A lista é a das " + _memQuando.ToString("HH:mm") + "." : "";
+                banner.SetState(StatusKind.Error, "Erro ao consultar o PAM: " + _memErro + ultima);
+                if (!_carregou) lblVazio.Text = "Não foi possível consultar o PAM. Tente de novo com F5.";
+                return;
+            }
+            if (_memQuando == DateTime.MinValue) return;
+            string quando = "Atualizado às " + _memQuando.ToString("HH:mm:ss") + " · atualiza sozinho a cada minuto.";
+            if (_memAviso != null) banner.SetState(StatusKind.Warning, quando + " " + _memAviso);
+            else banner.SetState(StatusKind.Info, quando);
+        }
+
+        // ===== MONITOR EM SEGUNDO PLANO =====
+        // Como o das Solicitações: liga na PRIMEIRA visita à aba e vive enquanto durar a SESSÃO,
+        // não enquanto a aba está aberta — o shell destrói a view ao trocar de módulo, então um
+        // timer de instância morreria junto. A cada minuto relê o PAM; o resultado fica em
+        // memória (estático) e, com a aba na tela, cai direto na grade. Quem volta para a aba
+        // encontra pronto o que mudou na ausência.
+        //
+        // Custo por ciclo: os pedidos de hoje saem da foto que o monitor das Solicitações tira
+        // a cada 30 s (ligado junto, como faz a aba Antimicrobianos); no portão do MV sobra o
+        // CON_ATE de hoje (os dias anteriores têm cache de 5 min). O PEP é outra sessão. O tique
+        // desiste SEM enfileirar se o portão estiver ocupado — nunca atrapalha quem está
+        // produzindo kit ou enviando pedido — e tenta de novo em 8 s.
+        public const int IntervaloMs = 60000;
+        private const int NovaTentativaMs = 8000;
+        private const int IdadeMaxFotoSeg = 90;     // foto das Solicitações mais velha que isso: busca aqui
+
+        private static Timer _monitor;
+        private static MainWindow _monitorHost;
+        private static int _sessaoId;               // muda no logout: descarta leitura órfã
+        private static EntregasPamView _viva;       // instância na tela (null = aba fechada)
+        private static bool _varrendo;
+        private static List<LinhaPam> _memLinhas = new List<LinhaPam>();
+        private static DateTime _memQuando = DateTime.MinValue;   // MinValue = nada lido nesta sessão
+        private static string _memAviso;            // o PEP não respondeu na última leitura
+        private static string _memErro;             // a última leitura falhou (null = ok)
+
+        public static void IniciarMonitor(MainWindow host)
+        {
+            _monitorHost = host;
+            SolicitacoesView.IniciarMonitor(host);   // os pedidos de hoje saem da foto dele
+            if (_monitor == null)
+            {
+                _monitor = new Timer();
+                _monitor.Interval = IntervaloMs;
+                _monitor.Tick += new EventHandler(MonitorTick);
+            }
+            if (_monitor.Enabled) return;            // já ligado nesta sessão
+            _monitor.Interval = IntervaloMs;
+            _monitor.Start();
+            Logger.Log("Urgência (PAM): monitor em segundo plano ligado (a cada " + (IntervaloMs / 1000) + "s).");
+        }
+
+        // Fim de sessão (logout, expiração, fechamento): invalida a leitura em voo e APAGA o que
+        // está em memória — tem nome de paciente e não pode reaparecer no login seguinte.
+        public static void PararMonitor()
+        {
+            bool estava = _monitor != null && _monitor.Enabled;
+            if (_monitor != null) _monitor.Stop();
+            _monitorHost = null;
+            _sessaoId++;
+            _memLinhas = new List<LinhaPam>();
+            _memQuando = DateTime.MinValue;
+            _memAviso = null; _memErro = null;
+            _abertos.Clear();
+            if (estava) Logger.Log("Urgência (PAM): monitor em segundo plano desligado.");
+        }
+
+        // Próximo tique daqui a 'ms' (8 s quando o portão estava ocupado; 1 min no resto).
+        private static void Rearmar(int ms)
+        {
+            if (_monitor == null || _monitorHost == null) return;
+            _monitor.Stop();
+            _monitor.Interval = ms;
+            _monitor.Start();
+        }
+
+        private static async void MonitorTick(object sender, EventArgs e)
+        {
+            if (_monitorHost == null || _monitorHost.Session == null) return;
+            if (_varrendo) return;                                          // F5 em curso
+            if (_monitorHost.WindowState == FormWindowState.Minimized) return;
+            if (ProduzirView.OcupadoNoMv) return;                           // preview de kit aberto
+
+            int sessao = _sessaoId;
+            _monitor.Stop();   // o intervalo conta do FIM da leitura
+            int proximo = IntervaloMs;
+            try
+            {
+                if (!await VarrerAsync(_monitorHost.Session, sessao, 0)) proximo = NovaTentativaMs;
+            }
+            catch (SessaoExpiradaException)
+            {
+                // Em segundo plano não se arranca o usuário do que ele está fazendo: só para o
+                // monitor. A próxima ação dele encontra a sessão morta e vai ao login.
+                Logger.Log("Urgência (PAM): sessão expirada — monitor parado.");
+                if (sessao == _sessaoId) PararMonitor();
+                return;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("Urgência (PAM): falha no monitor: " + ex.Message);
+                if (sessao == _sessaoId)
                 {
-                    banner.SetState(StatusKind.Error, "Erro ao consultar o PAM: " + ex.Message);
-                    if (!_carregou) lblVazio.Text = "Não foi possível consultar o PAM. Tente de novo com F5.";
+                    _memErro = ex.Message;
+                    var v = _viva;
+                    if (v != null && !v.IsDisposed && !v.Disposing) v.MostrarBanner();
                 }
             }
-            finally { _busy = false; }
+            finally
+            {
+                // Só rearma se ainda for a mesma sessão (senão o logout já parou de propósito).
+                if (sessao == _sessaoId) Rearmar(proximo);
+            }
+        }
+
+        // Uma leitura completa: forms (atendimentos + pedidos) pelo portão do MV, depois o PEP
+        // fora dele. ESTÁTICA: roda com a aba fechada; o resultado vai para a memória e, se a
+        // aba estiver na tela, para a grade. esperaMs = 0 desiste na hora se o portão estiver
+        // ocupado (tique de fundo); > 0 espera a vez (F5, 1ª visita).
+        // false = não conseguiu a vez no portão.
+        private static async Task<bool> VarrerAsync(Session s, int sessao, int esperaMs)
+        {
+            _varrendo = true;
+            try
+            {
+                bool tenho = esperaMs > 0
+                    ? await MvGate.EntrarAsync("urgencia-pam", esperaMs)
+                    : (!MvGate.Ocupado && MvGate.Entrar("monitor-urgencia-pam"));
+                if (!tenho) return false;
+                PainelPamResult res;
+                try
+                {
+                    var foto = SolicitacoesView.FotoDeHoje(PainelPam.EstoqueFarmacia, IdadeMaxFotoSeg);
+                    res = await PainelPam.LerMvAsync(s, foto);
+                }
+                finally { MvGate.Sair(); }
+                if (sessao != _sessaoId) return true;   // logout no meio: descarta tudo
+                await PainelPam.CompletarPepAsync(s, res);
+                if (sessao != _sessaoId) return true;
+
+                int semPep = PainelPam.HerdarPrescricoes(res, _memLinhas);
+                _memLinhas = res.Linhas;
+                _memQuando = res.Quando;
+                _memErro = null;
+                _memAviso = res.AvisoPep == null ? null
+                    : "O PEP não respondeu" + (semPep > 0
+                        ? " (" + semPep + " paciente(s) sem dado de prescrição)."
+                        : ": mostrando as prescrições da leitura anterior.");
+                var v = _viva;
+                if (v != null && !v.IsDisposed && !v.Disposing) v.Absorver();
+                return true;
+            }
+            finally { _varrendo = false; }
         }
 
         // ===== TEXTOS =====

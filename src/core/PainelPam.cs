@@ -258,7 +258,15 @@ namespace SoulmvKit.Core
         // Parte do servidor de forms (chamar DENTRO do MvGate): atendimentos de hoje e dos
         // DiasAnteriores (quem virou a noite no PAM ainda está ativo) e os pedidos à farmácia de
         // cada um, desde o dia da entrada mais antiga da lista.
-        public static async Task<PainelPamResult> LerMvAsync(Session s)
+        public static Task<PainelPamResult> LerMvAsync(Session s)
+        {
+            return LerMvAsync(s, null);
+        }
+
+        // pedidosDeHoje: a foto recente que o monitor da aba Solicitações já tirou dos pedidos
+        // de hoje do estoque da farmácia (null = busca aqui). Poupa a varredura mais pesada do
+        // ciclo — sobra o CON_ATE de hoje.
+        public static async Task<PainelPamResult> LerMvAsync(Session s, List<Solicitacao> pedidosDeHoje)
         {
             var res = new PainelPamResult();
             DateTime hoje = DateTime.Today;
@@ -280,7 +288,8 @@ namespace SoulmvKit.Core
             foreach (var l in porAt.Values) if (l.At.Entrada.Date < desde) desde = l.At.Entrada.Date;
             for (DateTime d = desde; d <= hoje; d = d.AddDays(1))
             {
-                foreach (var sol in await PedidosDoDiaAsync(s, d))
+                var doDia = (d == hoje && pedidosDeHoje != null) ? pedidosDeHoje : await PedidosDoDiaAsync(s, d);
+                foreach (var sol in doDia)
                 {
                     if (sol.OrigemEfetiva == "DEV") continue;   // devolução não é entrega
                     LinhaPam l;

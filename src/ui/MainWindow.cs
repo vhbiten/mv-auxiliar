@@ -148,6 +148,7 @@ namespace SoulmvKit.UI
             SolicitacoesView.PararMonitor();
             AntimicrobianosView.PararMonitor();
             JustificativasView.PararMonitor();
+            EntregasPamView.PararMonitor();
             base.OnFormClosed(e);
         }
 
@@ -177,6 +178,7 @@ namespace SoulmvKit.UI
                 SolicitacoesView.PararMonitor();
                 AntimicrobianosView.PararMonitor();
                 JustificativasView.PararMonitor();
+                EntregasPamView.PararMonitor();
                 SoulmvKit.Core.ManterSessao.Parar();
                 // Urgência (PAM): atendimentos/pedidos de dias anteriores e itens das prescrições
                 // lidas ficam em cache — têm dado de paciente, não passam para o próximo login.

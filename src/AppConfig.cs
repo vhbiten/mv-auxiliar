@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.5.0";   // 0.5.0: aba Urgência (PAM)
+        public const string Versao = "0.5.1";   // 0.5.1: Urgência (PAM) atualiza em segundo plano
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

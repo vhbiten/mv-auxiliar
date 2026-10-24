@@ -713,6 +713,16 @@ namespace SoulmvKit.UI
             return new List<Solicitacao>(s.Itens);
         }
 
+        // A mesma foto, só se for RECENTE: quem precisa da SITUAÇÃO de cada pedido quase em
+        // tempo real (a aba Urgência (PAM)) não pode usar uma foto de minutos atrás — o monitor
+        // pode estar parado, minimizado ou varrendo outro estoque. null = faça a própria busca.
+        public static List<Solicitacao> FotoDeHoje(int estoque, int segundosMax)
+        {
+            var s = SnapshotEstatico(estoque);
+            if (s == null || (DateTime.Now - s.Quando).TotalSeconds > segundosMax) return null;
+            return FotoDeHoje(estoque);
+        }
+
         // Grava em memória sempre; em DISCO só quando o conteúdo mudou de verdade — a varredura
         // é de 30 em 30 segundos e reescrever ~20 KB o dia inteiro sem necessidade trava a UI
         // em máquina lenta (e o arquivo pode estar em pasta de rede).
