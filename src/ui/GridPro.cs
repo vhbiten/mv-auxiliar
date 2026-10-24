@@ -125,6 +125,15 @@ namespace SoulmvKit.UI
             }
         }
 
+        // Linhas inseridas/removidas embaixo do mouse parado (acordeão): o hover apontava para
+        // a linha que estava ali antes até o mouse se mexer.
+        public void RecalcularHover()
+        {
+            if (!this.IsHandleCreated) return;
+            var pt = this.PointToClient(Cursor.Position);
+            AtualizarHover(this.ClientRectangle.Contains(pt) ? this.HitTest(pt.X, pt.Y).RowIndex : -1);
+        }
+
         private void AtualizarHover(int nova)
         {
             if (nova < 0) nova = -1;

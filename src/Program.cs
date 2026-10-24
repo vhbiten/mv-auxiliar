@@ -56,7 +56,8 @@ namespace SoulmvKit
             bool justPrev = args != null && Array.IndexOf(args, "--just-preview") >= 0;
             bool estoquePrev = args != null && Array.IndexOf(args, "--estoque-preview") >= 0;
             bool cfgPrev = args != null && Array.IndexOf(args, "--config-preview") >= 0;
-            bool algumPreview = shellPrev || confPrev || consPrev || solicPrev || pedidoPrev || atbPrev || justPrev || estoquePrev || cfgPrev;
+            bool pamPrev = args != null && Array.IndexOf(args, "--pam-preview") >= 0;
+            bool algumPreview = shellPrev || confPrev || consPrev || solicPrev || pedidoPrev || atbPrev || justPrev || estoquePrev || cfgPrev || pamPrev;
 
             // A janela só lembra o estado (maximizada/tamanho) na abertura NORMAL, sem
             // argumento nenhum: preview e captura de tela precisam de tamanho controlado.
@@ -71,6 +72,7 @@ namespace SoulmvKit
                 else if (confPrev) shell.IrParaConferencia();
                 else if (consPrev) shell.IrParaConsulta();
                 else if (solicPrev) shell.IrParaSolicitacoes();
+                else if (pamPrev) shell.IrParaEntregasPam();
                 else if (pedidoPrev) shell.IrParaPedidoCaf();
                 else if (atbPrev) shell.IrParaAntimicrobianos();
                 else if (justPrev) shell.IrParaJustificativas();

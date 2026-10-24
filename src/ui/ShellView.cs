@@ -16,6 +16,7 @@ namespace SoulmvKit.UI
         private NavButton _navConf;
         private NavButton _navConsulta;
         private NavButton _navSolic;
+        private NavButton _navPam;
         private NavButton _navPedido;
         private NavButton _navAtb;
         private NavButton _navJust;
@@ -91,6 +92,10 @@ namespace SoulmvKit.UI
             _navSolic = new NavButton("Solicitações");
             _navSolic.Selected += new EventHandler(delegate { Selecionar(_navSolic, "Solicitações", new SolicitacoesView(_host)); });
 
+            // Pacientes do PAM e a situação da prescrição de cada um (para levar tudo de uma vez).
+            _navPam = new NavButton("Urgência (PAM)");
+            _navPam.Selected += new EventHandler(delegate { Selecionar(_navPam, "Urgência (PAM)", new EntregasPamView(_host)); });
+
             _navAtb = new NavButton("Antimicrobianos");
             _navAtb.Selected += new EventHandler(delegate { Selecionar(_navAtb, "Antimicrobianos", new AntimicrobianosView(_host)); });
 
@@ -110,7 +115,7 @@ namespace SoulmvKit.UI
                 _navEstoque.Selected += new EventHandler(delegate { Selecionar(_navEstoque, "Compras CAF", new EstoqueView(_host)); });
             }
 
-            _navs.Add(_navKits); _navs.Add(_navConf); _navs.Add(_navConsulta); _navs.Add(_navSolic); _navs.Add(_navAtb); _navs.Add(_navJust);
+            _navs.Add(_navKits); _navs.Add(_navConf); _navs.Add(_navConsulta); _navs.Add(_navSolic); _navs.Add(_navPam); _navs.Add(_navAtb); _navs.Add(_navJust);
             if (_navPedido != null) _navs.Add(_navPedido);
             if (_navEstoque != null) _navs.Add(_navEstoque);
 
@@ -124,7 +129,7 @@ namespace SoulmvKit.UI
             // Para o atendente o grupo ESTOQUE fica só com a Conferência (ver Permissoes).
             _recolhidos = CarregarRecolhidos();
             AdicionarGrupo(nav, "kits", "Kits", "\uE7B8", _navKits, _navConsulta);              // caixa
-            AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navSolic);              // prancheta
+            AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navSolic, _navPam);     // prancheta
             AdicionarGrupo(nav, "antimicrobianos", "Antimicrobianos", null, _navAtb, _navJust);    // cápsula (desenhada)
             AdicionarGrupo(nav, "estoque", "Estoque", "\uE81E", _navConf, _navPedido, _navEstoque);  // camadas
             AjustarLarguras(nav);
@@ -357,6 +362,12 @@ namespace SoulmvKit.UI
         public void IrParaSolicitacoes()
         {
             Selecionar(_navSolic, "Solicitações", new SolicitacoesView(_host));
+        }
+
+        // usado por flag de desenvolvimento (--pam-preview)
+        public void IrParaEntregasPam()
+        {
+            Selecionar(_navPam, "Urgência (PAM)", new EntregasPamView(_host));
         }
 
         // usado por flag de desenvolvimento (--pedido-preview)

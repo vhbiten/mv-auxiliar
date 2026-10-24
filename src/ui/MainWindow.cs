@@ -178,6 +178,10 @@ namespace SoulmvKit.UI
                 AntimicrobianosView.PararMonitor();
                 JustificativasView.PararMonitor();
                 SoulmvKit.Core.ManterSessao.Parar();
+                // Urgência (PAM): atendimentos/pedidos de dias anteriores e itens das prescrições
+                // lidas ficam em cache — têm dado de paciente, não passam para o próximo login.
+                SoulmvKit.Core.PainelPam.LimparCache();
+                SoulmvKit.Core.PepClient.LimparFolhas();
             }
             else if (Session != null)
             {

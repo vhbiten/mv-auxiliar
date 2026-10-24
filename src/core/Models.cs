@@ -124,6 +124,7 @@ namespace SoulmvKit.Core
         public string Atendimento { get; set; }     // CD_ATENDIMENTO
         public string Paciente { get; set; }        // DSP_NM_PACIENTE (fallback NM_PACIENTE_INTEGRA)
         public string TpSol { get; set; }           // TP_SOLSAI_PRO: P=p/ paciente, S=pedido de setor, C=devolução
+        public string CdPreMed { get; set; }        // CD_PRE_MED: nº da prescrição no MV que gerou o pedido (vazio em material)
 
         // Origem "efetiva": TP_ORIGEM_SOLICITACAO quando preenchido; senão deduz do
         // TP_SOLSAI_PRO — pedidos de setor (S), devoluções (C) e pedidos de outro

@@ -65,9 +65,27 @@ namespace SoulmvKit.Core
         // Abre a sessão do PEP reaproveitando o login do CAS que a sessão já tem.
         // Três detalhes que custaram caro: o service precisa do ":80"; applications/current
         // tem que vir antes; e o hostname tem que ser uma estação cadastrada no MV.
-        public static async Task<bool> EntrarAsync(Session s)
+        // Uma abertura por vez: a aba Urgência (PAM), o clique numa prescrição e a nova tentativa
+        // podiam disparar o login do CAS ao mesmo tempo no mesmo HttpClient. Quem chega com uma
+        // abertura em curso para a MESMA sessão espera o resultado dela.
+        private static readonly object _travaEntrar = new object();
+        private static Task<bool> _entrando;
+        private static Session _entrandoCom;
+
+        public static Task<bool> EntrarAsync(Session s)
         {
-            if (s == null) return false;
+            if (s == null) return Task.FromResult(false);
+            lock (_travaEntrar)
+            {
+                if (_entrando != null && !_entrando.IsCompleted && object.ReferenceEquals(_entrandoCom, s)) return _entrando;
+                _entrandoCom = s;
+                _entrando = EntrarAgoraAsync(s);
+                return _entrando;
+            }
+        }
+
+        private static async Task<bool> EntrarAgoraAsync(Session s)
+        {
             if (object.ReferenceEquals(_sessao, s) && await SessaoValidaAsync(s)) return true;
 
             try
@@ -549,6 +567,145 @@ namespace SoulmvKit.Core
             return await BaixarJustificativaPdfAsync(s, documento, 0);
         }
 
+        // A PRESCRIÇÃO também é documento clínico, e o id que /prescriptions?hospitalAdmission=
+        // devolve é o próprio cdDocumentoClinico: o mesmo servlet devolve a folha oficial
+        // ("PRESCRICAO MEDICA", 1ª via, assinada ICP-Brasil, com o nº da prescrição do MV).
+        // Validado ao vivo em 24/10/2026 em 3 prescrições; não altera o "printed" do PEP.
+        // Prescrição de enfermagem fechada e prescrição em elaboração não rendem folha (null).
+        public static async Task<byte[]> BaixarDocumentoPdfAsync(Session s, long documento)
+        {
+            if (documento <= 0 || documento > int.MaxValue) return null;
+            return await BaixarJustificativaPdfAsync(s, (int)documento, 0);
+        }
+
+        // Nº da prescrição no MV (o CD_PRE_MED que a solicitação à farmácia carrega) e itens de
+        // uma prescrição do PEP. Nenhuma rota REST devolve esse número — ele só aparece impresso
+        // na folha ("Prescrição.: 1234567"; a linha "Prescrição......: N" é a da prescrição
+        // anterior, por isso o padrão exige UM ponto). Com o número, /prescriptions/{nº}/items
+        // dá os itens e o tipo de cada um; a SUSPENSÃO de item só a folha mostra ("Suspenso
+        // dia.: 24/10" logo abaixo do item). Prescrição assinada não muda, então fica em cache
+        // e cada folha é lida uma vez só. null = não deu para ler. Folha que não veio (ou veio
+        // sem o nº) só é tentada de novo depois de MinutosNovaTentativaFolha — antes era baixada
+        // a cada minuto, com uma linha de log a cada vez. Tem item de prescrição: LimparFolhas
+        // no logout/expiração.
+        private static readonly Dictionary<long, FolhaPrescricao> _folhaPorDocumento = new Dictionary<long, FolhaPrescricao>();
+        private static readonly Dictionary<long, DateTime> _falhaPorDocumento = new Dictionary<long, DateTime>();
+        private const int MinutosNovaTentativaFolha = 10;
+
+        public static void LimparFolhas()
+        {
+            lock (_folhaPorDocumento) { _folhaPorDocumento.Clear(); _falhaPorDocumento.Clear(); }
+            _sessao = null;
+        }
+
+        public static async Task<FolhaPrescricao> LerFolhaPrescricaoAsync(Session s, long documento)
+        {
+            lock (_folhaPorDocumento)
+            {
+                FolhaPrescricao ja;
+                if (_folhaPorDocumento.TryGetValue(documento, out ja)) return ja;
+                DateTime falhou;
+                if (_falhaPorDocumento.TryGetValue(documento, out falhou)
+                    && (DateTime.Now - falhou).TotalMinutes < MinutosNovaTentativaFolha) return null;
+            }
+            byte[] pdf = await BaixarDocumentoPdfAsync(s, documento);
+            if (pdf == null) { FolhaFalhou(documento); return null; }
+            // Extrair e normalizar o texto custa CPU: fora da thread da tela (a primeira carga lê
+            // até 6 folhas por vez e a grade estaria animando).
+            string texto = await Task.Run(() => TextoDaFolha(pdf, documento));
+            var folha = new FolhaPrescricao();
+            if (texto != null)
+            {
+                var m = Regex.Match(texto, "PRESCRICAO\\.\\s*:\\s*(\\d{5,})");
+                if (m.Success) long.TryParse(m.Groups[1].Value, out folha.CdPreMed);
+            }
+            if (folha.CdPreMed <= 0) { FolhaFalhou(documento); return null; }
+
+            folha.Itens = await ItensPrescricaoAsync(s, folha.CdPreMed);
+            if (folha.Itens == null) return folha;          // número sem itens (PEP oscilou): não guarda, relê depois
+            await Task.Run(() => MarcarSuspensos(texto, folha.Itens));
+            lock (_folhaPorDocumento) _folhaPorDocumento[documento] = folha;
+            return folha;
+        }
+
+        private static string TextoDaFolha(byte[] pdf, long documento)
+        {
+            try { return PainelPam.SemAcento(string.Join("\n", PdfKits.ExtrairTextos(pdf).ToArray())); }
+            catch (Exception ex) { Logger.Log("PEP: nº da prescrição " + documento + ": " + ex.Message); return null; }
+            finally { Array.Clear(pdf, 0, pdf.Length); }   // a folha tem dado de paciente: não fica na memória
+        }
+
+        private static void FolhaFalhou(long documento)
+        {
+            lock (_folhaPorDocumento) _falhaPorDocumento[documento] = DateTime.Now;
+        }
+
+        // Itens da prescrição (pelo nº do MV). Cada item traz "type":{"id","name","schemeType":
+        // {"id":"MDN",...,"medicineType":true,...}}; o medicineType separa o que é da farmácia
+        // (medicamento, soro, droga vasoativa) de exame, cuidado, dieta, gás e hemocomponente.
+        // DEP (nutrição parenteral) vem com medicineType false, mas é a farmácia que dispensa.
+        private static async Task<List<ItemPrescrito>> ItensPrescricaoAsync(Session s, long cdPreMed)
+        {
+            string j = await GetAsync(s, Pep + "/api/prescriptions/" + cdPreMed + "/items?page=0&size=500");
+            if (j == null || !j.TrimStart().StartsWith("[")) return null;
+            var res = new List<ItemPrescrito>();
+            foreach (Match m in Regex.Matches(j,
+                "\"type\":\\{\"id\":\\d+,\"name\":\"((?:[^\"\\\\]|\\\\.)*)\",\"schemeType\":\\{\"id\":\"([A-Za-z0-9_]+)\"([^}]*)\\}"))
+            {
+                var it = new ItemPrescrito();
+                string nome = m.Groups[1].Value;
+                try { nome = Regex.Unescape(nome); } catch { }
+                it.Nome = nome.Trim();
+                it.Esquema = m.Groups[2].Value.ToUpperInvariant();
+                it.Medicamento = m.Groups[3].Value.Contains("\"medicineType\":true") || it.Esquema == "DEP";
+                res.Add(it);
+            }
+            return res;
+        }
+
+        // Acha cada item na folha pelo começo do nome e dá cada "SUSPENSO DIA" ao item que vem
+        // logo antes dele. A folha agrupa por tipo e a rota não, então cada nome é procurado
+        // desde o começo da lista de itens (o repetido, depois da ocorrência anterior).
+        // Na dúvida, NÃO marca: um item que não se acha na folha faria a marca cair no vizinho,
+        // e um medicamento ativo marcado como suspenso esconderia o "Medicamento sem pedido".
+        private static void MarcarSuspensos(string texto, List<ItemPrescrito> itens)
+        {
+            if (string.IsNullOrEmpty(texto) || itens.Count == 0) return;
+            string t = Regex.Replace(texto, "\\s+", " ");
+            int ini = t.IndexOf("DATAS/HORARIOS", StringComparison.Ordinal);   // fim do cabeçalho
+            if (ini < 0) ini = 0;
+            var marcas = new List<int>();
+            for (int p = t.IndexOf("SUSPENSO DIA", ini, StringComparison.Ordinal); p >= 0;
+                 p = t.IndexOf("SUSPENSO DIA", p + 1, StringComparison.Ordinal))
+                marcas.Add(p);
+            if (marcas.Count == 0) return;
+            if (marcas.Count >= itens.Count)
+            {
+                foreach (var it in itens) it.Suspenso = true;   // uma marca por item: todos suspensos
+                return;
+            }
+
+            var pos = new int[itens.Count];
+            var ultima = new Dictionary<string, int>();
+            for (int i = 0; i < itens.Count; i++)
+            {
+                string k = Regex.Replace(PainelPam.SemAcento(itens[i].Nome), "\\s+", " ").Trim();
+                if (k.Length > 30) k = k.Substring(0, 30);
+                int de = ini, u;
+                if (ultima.TryGetValue(k, out u)) de = u + 1;
+                pos[i] = k.Length > 0 ? t.IndexOf(k, de, StringComparison.Ordinal) : -1;
+                if (pos[i] < 0) return;
+                ultima[k] = pos[i];
+            }
+            foreach (int marca in marcas)
+            {
+                int dono = -1;
+                for (int i = 0; i < itens.Count; i++)
+                    if (pos[i] >= 0 && pos[i] < marca && (dono < 0 || pos[i] > pos[dono])) dono = i;
+                if (dono >= 0) itens[dono].Suspenso = true;
+            }
+        }
+
         // Com registro > 0 a chamada também serve as justificativas SEM assinatura: é o
         // cdEditorRegistro que o servlet exige quando não consegue localizar o documento
         // sozinho. Ver PepAmf, que é de onde esse número vem.
@@ -575,6 +732,55 @@ namespace SoulmvKit.Core
                 Logger.Log("PEP: erro ao baixar a justificativa " + documento + ": " + ex.Message);
                 return null;
             }
+        }
+
+        // ===== PRESCRIÇÕES DE UM ATENDIMENTO (aba Urgência (PAM)) =====
+        // /prescriptions?hospitalAdmission= devolve TODAS as prescrições do atendimento com o
+        // status: OPENED enquanto o médico escreve, SIGNED/CLOSED depois de assinada (validado
+        // ao vivo em 24/10/2026: a solicitação à farmácia nasce no minuto da assinatura).
+        // null = o PEP não respondeu (quem chama reabre a sessão UMA vez e repete — as chamadas
+        // rodam em paralelo, e reabrir em cada uma dispararia vários logins ao mesmo tempo);
+        // lista vazia = nenhuma prescrição.
+        // Um registro por objeto do array: ancora no início de cada prescrição ({"id":N,"status":...)
+        // e lê os campos até a próxima — os objetos aninhados (paciente, atendimento, médico)
+        // não têm "status", "created" nem "template", então não confundem a leitura.
+        public static async Task<List<PrescricaoPep>> PrescricoesDoAtendimentoAsync(Session s, string atendimento)
+        {
+            string caminho = Pep + "/api/prescriptions?hospitalAdmission=" + Uri.EscapeDataString(atendimento) + "&page=0&size=100";
+            string j = await GetAsync(s, caminho);
+            if (j == null || !j.TrimStart().StartsWith("[")) return null;
+            var res = new List<PrescricaoPep>();
+            var ancoras = Regex.Matches(j, "\\{\"id\":(\\d+),\"status\":\"([A-Za-z_]+)\"");
+            for (int i = 0; i < ancoras.Count; i++)
+            {
+                int ini = ancoras[i].Index;
+                int fim = i + 1 < ancoras.Count ? ancoras[i + 1].Index : j.Length;
+                string trecho = j.Substring(ini, fim - ini);
+                var p = new PrescricaoPep();
+                p.Id = long.Parse(ancoras[i].Groups[1].Value);
+                p.Status = ancoras[i].Groups[2].Value;
+                p.Criada = DataIso(Regex.Match(trecho, "\"created\":\"([^\"]+)\""));
+                p.Fechada = DataIso(Regex.Match(trecho, "\"closed\":\"([^\"]+)\""));
+                var mt = Regex.Match(trecho, "\"template\":\\{\"id\":\\d+,\"name\":\"((?:[^\"\\\\]|\\\\.)*)\"");
+                if (mt.Success)
+                {
+                    string nome = mt.Groups[1].Value;
+                    try { nome = Regex.Unescape(nome); } catch { }
+                    p.Modelo = nome;
+                }
+                res.Add(p);
+            }
+            return res;
+        }
+
+        private static DateTime? DataIso(Match m)
+        {
+            if (!m.Success) return null;
+            DateTime d;
+            if (DateTime.TryParse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out d))
+                return d.Kind == DateTimeKind.Utc ? d.ToLocalTime() : d;
+            return null;
         }
 
         private static async Task<string> GetAsync(Session s, string caminho)

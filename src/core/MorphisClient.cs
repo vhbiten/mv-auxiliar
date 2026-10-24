@@ -1187,6 +1187,106 @@ namespace SoulmvKit.Core
             if (tp.Success && int.TryParse(tp.Groups[1].Value, out v)) totalPages = v;
         }
 
+        // ===== ATENDIMENTOS DE URGÊNCIA (form CON_ATE, bloco ATENDIME) — READ-ONLY =====
+        // "Consulta: Atendimentos Realizados" (Urgência e Emergência > Consultas > Atendimento).
+        // Só consulta: EXECUTE_QUERY + NEXT_PAGE. O form vizinho do menu, EXCL_ATE, é o de
+        // EXCLUSÃO de atendimento e nunca é aberto por aqui.
+        // Validado ao vivo em 24/10/2026: TP_ATENDIMENTO=U + DT_ATENDIMENTO (igualdade) devolve os
+        // atendimentos do PAM daquele dia (41 numa sexta), com alta, alta médica e motivo.
+        // A paginação do bloco vem no <page> logo depois da abertura do bloco ATENDIME (50 por
+        // página); o primeiro <page> da resposta é de uma aba da tela, por isso o leitor é por bloco.
+        public static async Task<System.Collections.Generic.List<AtendimentoPam>> ListarAtendimentosUrgenciaAsync(Session s, DateTime dia)
+        {
+            var res = new System.Collections.Generic.List<AtendimentoPam>();
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("CON_ATE", "MV.07.01.03.03.#");
+            var blk = cf.Block_("ATENDIME");
+            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
+            if (recId == null)
+                throw new Exception("A consulta de atendimentos do MV (Urgência e Emergência > Consultas > Atendimento) não abriu para este usuário.");
+
+            string body = "<body><block selected=\"" + recId + "\" name=\"ATENDIME\"><record status=\"C\" id=\"" + recId + "\">" +
+                "<item name=\"TP_ATENDIMENTO\">U</item>" +
+                "<item name=\"DT_ATENDIMENTO\">" + dia.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture) + "</item>" +
+                "</record></block></body>";
+            var q = await m.PostAsync(AcaoBlocoHdr("ATENDIME", "CD_ATENDIMENTO", m.FormTask, "EXECUTE_QUERY") + body);
+
+            var vistos = new System.Collections.Generic.HashSet<string>();
+            int pagina = 0;
+            while (true)
+            {
+                pagina++;
+                var b = q.Block_("ATENDIME");
+                if (b != null)
+                    foreach (var r in b.Records)
+                    {
+                        var a = AtendimentoDe(r);
+                        if (a != null && vistos.Add(a.Atendimento)) res.Add(a);
+                    }
+                int pageNumber, totalPages;
+                LerPaginacaoBloco(q.Raw, "ATENDIME", out pageNumber, out totalPages);
+                if (pageNumber >= totalPages) break;
+                if (pagina >= 40) break;   // trava anti-loop (40×50 = 2000 atendimentos num dia)
+                q = await m.PostAsync(AcaoBlocoHdr("ATENDIME", "CD_ATENDIMENTO", m.FormTask, "NEXT_PAGE") + "<body></body>");
+            }
+            Logger.Log("PAM: atendimentos de urgência de " + dia.ToString("dd/MM") + " -> " + res.Count + " (" + pagina + " página(s))");
+            return res;
+        }
+
+        private static string AcaoBlocoHdr(string block, string item, string task, string acao)
+        {
+            return "<header><control block=\"" + block + "\" item=\"" + item + "\" task=\"" + task +
+                "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
+                "<action name=\"" + acao + "\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
+        }
+
+        // pageNumber/totalPages do <page> que vem logo depois da abertura do bloco pedido.
+        private static void LerPaginacaoBloco(string xml, string bloco, out int pageNumber, out int totalPages)
+        {
+            pageNumber = 1; totalPages = 1;
+            if (string.IsNullOrEmpty(xml)) return;
+            var ab = System.Text.RegularExpressions.Regex.Match(xml, "<block\\b[^>]*\\bname=\"" + bloco + "\"[^>]*>");
+            if (!ab.Success) return;
+            var mm = System.Text.RegularExpressions.Regex.Match(xml.Substring(ab.Index + ab.Length), "^\\s*<[a-zA-Z:]*page\\b[^>]*>");
+            if (!mm.Success) return;
+            int v;
+            var pn = System.Text.RegularExpressions.Regex.Match(mm.Value, "pageNumber=\"(\\d+)\"");
+            if (pn.Success && int.TryParse(pn.Groups[1].Value, out v)) pageNumber = v;
+            var tp = System.Text.RegularExpressions.Regex.Match(mm.Value, "totalPages=\"(\\d+)\"");
+            if (tp.Success && int.TryParse(tp.Groups[1].Value, out v)) totalPages = v;
+        }
+
+        private static AtendimentoPam AtendimentoDe(MorphisRecord r)
+        {
+            string cd = (r.Get("CD_ATENDIMENTO") ?? "").Trim();
+            if (cd.Length == 0) return null;
+            var a = new AtendimentoPam();
+            a.Atendimento = cd;
+            a.Paciente = (r.Get("DSP_NM_PACIENTE") ?? "").Trim();
+            a.Medico = (r.Get("DSP_NM_PRESTADOR") ?? "").Trim();
+            a.Destino = (r.Get("DSP_DS_DES_ATE") ?? "").Trim();
+            a.MotivoAlta = (r.Get("DSP_DS_MOT_ALT") ?? "").Trim();
+            // DSP_IDADE vem "79a 8m 29d": a lista só precisa dos anos.
+            string idade = (r.Get("DSP_IDADE") ?? "").Trim();
+            int sp = idade.IndexOf(' ');
+            a.Idade = sp > 0 ? idade.Substring(0, sp) : idade;
+            DateTime d;
+            if (DataHoraMv(r.Get("HR_ATENDIMENTO"), out d) || DataHoraMv(r.Get("DT_ATENDIMENTO"), out d)) a.Entrada = d;
+            if (DataHoraMv(r.Get("HR_ALTA"), out d)) a.Alta = d;
+            if (DataHoraMv(r.Get("HR_ALTA_MEDICA"), out d)) a.AltaMedica = d;
+            return a;
+        }
+
+        // "dd/MM/yyyy HH:mm:ss" ou "dd/MM/yyyy" (como o forms devolve datas e horas).
+        private static bool DataHoraMv(string s, out DateTime val)
+        {
+            val = DateTime.MinValue;
+            if (string.IsNullOrEmpty(s)) return false;
+            return DateTime.TryParseExact(s.Trim(), new[] { "dd/MM/yyyy HH:mm:ss", "dd/MM/yyyy HH:mm", "dd/MM/yyyy" },
+                System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out val);
+        }
+
         // IMPORTANTE (aprendido na engenharia reversa): a consulta com filtro de DATA
         // devolve os registros ESPALHADOS (não pelo índice de número), o que quebra a
         // paginação por janela. Já a consulta SEM filtro de data devolve sempre os 50
@@ -1893,6 +1993,7 @@ namespace SoulmvKit.Core
                     sol.Urgente = Val(v, "SN_URGENTE") == "S";
                     sol.Solicitante = Val(v, "NM_USUARIO_SOLICITACAO").Trim();
                     sol.Atendimento = Val(v, "CD_ATENDIMENTO");
+                    sol.CdPreMed = Val(v, "CD_PRE_MED").Trim();
                     // O nome do paciente vem no campo de EXIBIÇÃO (DSP_NM_PACIENTE);
                     // NM_PACIENTE_INTEGRA volta vazio na listagem (validado ao vivo).
                     sol.Paciente = Val(v, "DSP_NM_PACIENTE").Trim();
