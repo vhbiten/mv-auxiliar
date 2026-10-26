@@ -21,8 +21,14 @@ namespace SoulmvKit.UI
     // PainelPam.Conteudo). Na ponta do item, os ícones abrem no navegador (Cent Browser) a
     // SOLICITAÇÃO (R_SOLSAI_PRO do MV) e a PRESCRIÇÃO MÉDICA (folha oficial do PEP).
     //
-    // Viva em segundo plano: um monitor estático (ver MONITOR) relê o PAM a cada minuto desde a
-    // 1ª visita até o logout, com a aba aberta ou não; a tela só desenha o que ele leu.
+    // Os pacientes ficam em seções (PainelPam.Grupo): Prescrição pendente, Aguardando
+    // prescrição, Atendidos e Alta na última hora — esta começa recolhida. O título da seção
+    // abre e fecha como o acordeão; quem muda de seção numa atualização fica realçado por
+    // alguns segundos no lugar novo.
+    //
+    // Viva em segundo plano: um monitor estático (ver MONITOR) relê o PAM desde a 1ª visita até
+    // o logout — a cada 20 s com a aba na tela, a cada minuto com ela fechada — e a situação dos
+    // pedidos é trocada a cada foto nova das Solicitações (~30 s); a tela só desenha o que ele leu.
     //
     // Fluidez: a grade é montada num modelo (LinhaGrade) uma vez por atualização; a atualização
     // automática só troca o texto das células quando a lista não mudou (sem piscar, sem perder
@@ -52,6 +58,17 @@ namespace SoulmvKit.UI
         // Acordeões abertos, por atendimento: sobrevivem à atualização de 1 min e à troca de
         // aba (estático, apagado no logout).
         private static readonly HashSet<string> _abertos = new HashSet<string>();
+        // Seções recolhidas (mesma vida dos acordeões). A de alta começa recolhida.
+        private static readonly HashSet<GrupoPam> _secoesFechadas = new HashSet<GrupoPam> { GrupoPam.Alta };
+        private static readonly GrupoPam[] Secoes = { GrupoPam.Pendente, GrupoPam.Aguardando, GrupoPam.Atendidos, GrupoPam.Alta };
+        private static readonly Font FonteSecao = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+        // Seção de cada paciente na última montagem e a hora em que ele mudou de seção: a linha
+        // que pulou fica realçada por DestaqueMs, para quem estava olhando achá-la no lugar novo.
+        private const int DestaqueMs = 10000;
+        private static Dictionary<string, GrupoPam> _secaoAnterior = new Dictionary<string, GrupoPam>();
+        private static readonly Dictionary<string, DateTime> _mudouDeSecao = new Dictionary<string, DateTime>();
+        private Timer _fimDestaque;
 
         // Ícone sob o mouse (para o realce do botão) e animação do acordeão em curso.
         private int _hoverLinha = -1, _hoverColuna = -1;
@@ -66,9 +83,13 @@ namespace SoulmvKit.UI
         // e ordenações a cada célula pintada).
         private class LinhaGrade
         {
-            public LinhaPam Linha;          // o paciente (no item, o dono)
-            public ItemPam Item;            // null = linha do paciente
+            public LinhaPam Linha;          // o paciente (no item, o dono; null no título)
+            public ItemPam Item;            // null = linha do paciente (ou título)
             public List<ItemPam> Itens;     // itens do acordeão (só na linha do paciente)
+            public bool Titulo;             // título de seção: Linha, Item e Itens null
+            public GrupoPam Secao;          // a seção do paciente, ou a que o título abre/fecha
+            public string Contagem;         // título: "3", ou "2 · 1 com pedido pendente" na de alta
+            public bool Destaque;           // paciente que acabou de mudar de seção
             public string Chave;            // estável entre atualizações: restaura seleção e rolagem
             public object[] Valores;
             public string[] Dicas;          // tooltip por coluna (null/"" = sem)
@@ -110,6 +131,7 @@ namespace SoulmvKit.UI
             {
                 if (_viva == this) _viva = null;   // o monitor segue sozinho; só para de desenhar aqui
                 if (_anim != null) { _anim.Stop(); _anim.Dispose(); _anim = null; }
+                if (_fimDestaque != null) { _fimDestaque.Stop(); _fimDestaque.Dispose(); _fimDestaque = null; }
             });
         }
 
@@ -178,6 +200,7 @@ namespace SoulmvKit.UI
 
             g.CellFormatting += new DataGridViewCellFormattingEventHandler(Grid_Format);
             g.CellPainting += new DataGridViewCellPaintingEventHandler(Grid_Pintar);
+            g.RowPrePaint += new DataGridViewRowPrePaintEventHandler(Grid_PintarTitulo);
             g.CellMouseClick += new DataGridViewCellMouseEventHandler(Grid_CellMouseClick);
             g.CellMouseEnter += new DataGridViewCellEventHandler(Grid_CellMouseEnter);
             g.CellMouseLeave += new DataGridViewCellEventHandler(Grid_CellMouseLeave);
@@ -232,44 +255,30 @@ namespace SoulmvKit.UI
             bool aberto = g.Itens.Count > 0 && _abertos.Contains(a.Atendimento);
             DateTime ate = a.EmAtendimento ? agora : (a.Saida.HasValue ? a.Saida.Value : agora);
 
+            g.Secao = PainelPam.Grupo(l, g.Itens);
+
+            // O rótulo segue a mesma regra da seção (PainelPam.Grupo). Pedido pendente vem
+            // primeiro; depois, prescrição assinada com medicamento que ainda não virou pedido —
+            // o resumo não pode dizer "atendida" ou "em elaboração" com isso escondido no acordeão.
             string rotulo = PainelPam.Rotulo(estado);
             Color cor = Theme.TextSoft;
-            switch (estado)
-            {
-                case EstadoPrescricaoPam.Pendente: cor = Theme.Warning; break;
-                case EstadoPrescricaoPam.EmElaboracao: cor = Theme.Primary; break;
-                case EstadoPrescricaoPam.Atendida:
-                    cor = Theme.Success;
-                    // Tudo atendido MAS uma prescrição mais nova com medicamento ainda sem pedido:
-                    // o resumo não pode dizer "atendida" em verde com isso escondido no acordeão.
-                    var pior = FarmaciaNaPrescricao.Nada;
-                    foreach (var it in g.Itens)
-                        if (it.Pedido == null && it.Prescricao != null)
-                        {
-                            var fi = PainelPam.Farmacia(it.Prescricao);
-                            if (fi == FarmaciaNaPrescricao.SemPedido) pior = fi;
-                            else if (fi == FarmaciaNaPrescricao.AguardandoPedido && pior != FarmaciaNaPrescricao.SemPedido) pior = fi;
-                        }
-                    if (pior == FarmaciaNaPrescricao.AguardandoPedido) { rotulo = "Aguardando pedido"; cor = CorFarmacia(pior); }
-                    else if (pior == FarmaciaNaPrescricao.SemPedido) { rotulo = "Medicamento sem pedido"; cor = CorFarmacia(pior); }
-                    break;
-                case EstadoPrescricaoPam.SemPedido:
-                    // Paciente sem nenhum pedido: o que as prescrições dele têm para a farmácia.
-                    var f = PainelPam.Farmacia(l);
-                    cor = CorFarmacia(f);
-                    if (f == FarmaciaNaPrescricao.Nada) rotulo = "Sem itens da farmácia";
-                    else if (f == FarmaciaNaPrescricao.AguardandoPedido) rotulo = "Aguardando pedido";
-                    else if (f == FarmaciaNaPrescricao.SemPedido) rotulo = "Medicamento sem pedido";
-                    break;
-            }
+            var semPedido = PainelPam.FarmaciaSemPedido(g.Itens);
+            bool elaboracao = false;    // "Em elaboração" na coluna: a Situação não repete "prescrevendo"
+            if (estado == EstadoPrescricaoPam.Pendente) cor = Theme.Warning;
+            else if (semPedido == FarmaciaNaPrescricao.SemPedido) { rotulo = "Medicamento sem pedido"; cor = CorFarmacia(semPedido); }
+            else if (semPedido == FarmaciaNaPrescricao.AguardandoPedido) { rotulo = "Aguardando pedido"; cor = CorFarmacia(semPedido); }
+            else if (estado == EstadoPrescricaoPam.EmElaboracao) { cor = Theme.Primary; elaboracao = true; }
+            else if (!l.TemPrescricao) rotulo = PainelPam.Rotulo(EstadoPrescricaoPam.SemPrescricao);   // só pedido de material
+            else if (estado == EstadoPrescricaoPam.Atendida) cor = Theme.Success;
+            else if (estado == EstadoPrescricaoPam.SemPedido && semPedido == FarmaciaNaPrescricao.Nada) rotulo = "Sem itens da farmácia";
             // PEP fora e nada da leitura anterior: "Sem prescrição" seria uma afirmação falsa.
             if (!l.PepLido && !l.PepHerdado && a.EmAtendimento
-                && (estado == EstadoPrescricaoPam.SemPrescricao || estado == EstadoPrescricaoPam.SemPedido))
+                && (estado == EstadoPrescricaoPam.SemPrescricao || estado == EstadoPrescricaoPam.SemPedido || !l.TemPrescricao))
             {
                 rotulo = "PEP sem resposta"; cor = Theme.TextSoft;
             }
             g.CorPrescricao = cor;
-            g.SituacaoDestaque = l.MedicoPrescrevendo && estado != EstadoPrescricaoPam.EmElaboracao;
+            g.SituacaoDestaque = l.MedicoPrescrevendo && !elaboracao;
 
             g.Valores = new object[Colunas.Length];
             g.Valores[CAbre] = g.Itens.Count > 0 ? (aberto ? GlifoAberto : GlifoFechado) : "";
@@ -277,7 +286,7 @@ namespace SoulmvKit.UI
             g.Valores[CEntrada] = HoraComDia(a.Entrada, agora);
             g.Valores[CPermanencia] = Duracao(ate - a.Entrada);
             g.Valores[CPrescricao] = rotulo;
-            g.Valores[CSituacao] = TextoSituacao(l);
+            g.Valores[CSituacao] = TextoSituacao(l, elaboracao);
             g.Valores[CSol] = ""; g.Valores[CPresc] = "";   // documentos só nos itens do acordeão
 
             g.Dicas = new string[Colunas.Length];
@@ -330,18 +339,107 @@ namespace SoulmvKit.UI
             return g;
         }
 
+        // Título da seção: o nome é pintado por Grid_PintarTitulo; a célula Paciente leva o mesmo
+        // texto só para leitura (tooltip, testes).
+        private LinhaGrade LinhaDoTitulo(GrupoPam s, List<LinhaGrade> pacientes)
+        {
+            var g = new LinhaGrade();
+            g.Titulo = true; g.Secao = s; g.Chave = "#" + s;
+            g.Contagem = pacientes.Count.ToString();
+            if (s == GrupoPam.Alta)
+            {
+                // A seção de alta fica recolhida: o pedido que ficou pendente não pode sumir com ela.
+                int pend = 0;
+                foreach (var p in pacientes) if (p.Linha.PedidosPendentes > 0) pend++;
+                if (pend > 0) g.Contagem += " · " + pend + " com pedido pendente";
+            }
+            g.Valores = new object[Colunas.Length];
+            for (int c = 0; c < Colunas.Length; c++) g.Valores[c] = "";
+            g.Valores[CPaciente] = TituloSecao(s) + " · " + g.Contagem;
+            g.Dicas = new string[Colunas.Length];
+            string dica = _secoesFechadas.Contains(s) ? "Mostrar a seção (clique)" : "Recolher a seção (clique)";
+            for (int c = 0; c < Colunas.Length; c++) g.Dicas[c] = dica;
+            return g;
+        }
+
         private List<LinhaGrade> Montar()
         {
             var res = new List<LinhaGrade>();
             DateTime agora = DateTime.Now;
+            var porSecao = new Dictionary<GrupoPam, List<LinhaGrade>>();
+            foreach (var s in Secoes) porSecao[s] = new List<LinhaGrade>();
+            var secoes = new Dictionary<string, GrupoPam>();
             foreach (var l in _linhas)
             {
                 var p = LinhaDoPaciente(l, agora);
-                res.Add(p);
-                if (p.Itens.Count == 0 || !_abertos.Contains(p.Chave)) continue;
-                for (int i = 0; i < p.Itens.Count; i++) res.Add(LinhaDoItem(p.Itens[i], i == p.Itens.Count - 1, agora));
+                porSecao[p.Secao].Add(p);   // na ordem do PainelPam.Ordenar dentro da seção
+                GrupoPam antes;
+                if (_secaoAnterior.TryGetValue(p.Chave, out antes) && antes != p.Secao) _mudouDeSecao[p.Chave] = agora;
+                secoes[p.Chave] = p.Secao;
+                p.Destaque = EmDestaque(p.Chave, agora);
+            }
+            _secaoAnterior = secoes;
+            var vencidos = new List<string>();
+            foreach (var kv in _mudouDeSecao)
+                if (!secoes.ContainsKey(kv.Key) || !EmDestaque(kv.Key, agora)) vencidos.Add(kv.Key);
+            foreach (var k in vencidos) _mudouDeSecao.Remove(k);
+
+            foreach (var s in Secoes)
+            {
+                var pacientes = porSecao[s];
+                if (pacientes.Count == 0) continue;   // seção vazia não aparece
+                res.Add(LinhaDoTitulo(s, pacientes));
+                if (_secoesFechadas.Contains(s)) continue;
+                foreach (var p in pacientes)
+                {
+                    res.Add(p);
+                    if (p.Itens.Count == 0 || !_abertos.Contains(p.Chave)) continue;
+                    for (int i = 0; i < p.Itens.Count; i++) res.Add(LinhaDoItem(p.Itens[i], i == p.Itens.Count - 1, agora));
+                }
             }
             return res;
+        }
+
+        private static bool EmDestaque(string atendimento, DateTime agora)
+        {
+            DateTime quando;
+            return _mudouDeSecao.TryGetValue(atendimento, out quando) && (agora - quando).TotalMilliseconds < DestaqueMs;
+        }
+
+        // Apaga o realce de quem mudou de seção quando o tempo dele acaba (a atualização é só a
+        // cada minuto).
+        private void AgendarFimDestaque()
+        {
+            DateTime agora = DateTime.Now;
+            double falta = double.MaxValue;
+            foreach (var kv in _mudouDeSecao)
+            {
+                double ms = DestaqueMs - (agora - kv.Value).TotalMilliseconds;
+                if (ms > 0 && ms < falta) falta = ms;
+            }
+            if (_fimDestaque != null) _fimDestaque.Stop();
+            if (falta == double.MaxValue) return;
+            if (_fimDestaque == null)
+            {
+                _fimDestaque = new Timer();
+                _fimDestaque.Tick += new EventHandler(FimDestaqueTick);
+            }
+            _fimDestaque.Interval = Math.Max(50, (int)falta + 50);
+            _fimDestaque.Start();
+        }
+
+        private void FimDestaqueTick(object sender, EventArgs e)
+        {
+            _fimDestaque.Stop();
+            if (IsDisposed || grid == null) return;
+            DateTime agora = DateTime.Now;
+            foreach (DataGridViewRow row in grid.Rows)
+            {
+                var g = row.Tag as LinhaGrade;
+                if (g == null || g.Titulo || g.Item != null || !g.Destaque) continue;
+                if (!EmDestaque(g.Chave, agora)) { g.Destaque = false; grid.InvalidateRow(row.Index); }
+            }
+            AgendarFimDestaque();
         }
 
         // Valores, tooltips, altura e recuo de uma linha da grade.
@@ -365,6 +463,7 @@ namespace SoulmvKit.UI
 
         private int AlturaPaciente { get { return grid.RowTemplate.Height; } }
         private int AlturaItem { get { return Theme.S(30); } }
+        private int AlturaTitulo { get { return Theme.S(30); } }
 
         // ===== GRADE: montagem e atualização =====
         // Mesma lista (mesmas chaves, na mesma ordem) = atualização no lugar: só o texto que
@@ -392,6 +491,7 @@ namespace SoulmvKit.UI
             lblVazio.Text = "Nenhum paciente em atendimento no PAM agora.";
             grid.Visible = tem; lblVazio.Visible = !tem;
             if (tem) RecalcularMouse();
+            AgendarFimDestaque();
         }
 
         private void Remontar(List<LinhaGrade> modelo)
@@ -413,6 +513,7 @@ namespace SoulmvKit.UI
                 int r = grid.Rows.Add(g.Valores);
                 var row = grid.Rows[r];
                 if (g.Item != null) row.Height = AlturaItem;
+                else if (g.Titulo) row.Height = AlturaTitulo;
                 Aplicar(row, g);
             }
             grid.LimparSelecao();
@@ -449,7 +550,7 @@ namespace SoulmvKit.UI
             if (pai == null || pai.Index < 0) return;
             int indicePaciente = pai.Index;
             var g = pai.Tag as LinhaGrade;
-            if (g == null || g.Item != null || g.Itens.Count == 0) return;
+            if (g == null || g.Titulo || g.Item != null || g.Itens.Count == 0) return;
 
             bool abrir = !_abertos.Contains(g.Chave);
             if (abrir) _abertos.Add(g.Chave); else _abertos.Remove(g.Chave);
@@ -546,6 +647,15 @@ namespace SoulmvKit.UI
             catch { }
         }
 
+        // Abre/fecha uma seção inteira. Sem animação (são linhas de alturas diferentes): remonta,
+        // e o título fica onde estava, selecionado.
+        private void AlternarSecao(GrupoPam s)
+        {
+            TerminarAnimacao();
+            if (!_secoesFechadas.Remove(s)) _secoesFechadas.Add(s);
+            Render();
+        }
+
         // Linha do paciente a que a linha r pertence (ela mesma, se for de paciente).
         private int IndicePaciente(int r)
         {
@@ -559,15 +669,24 @@ namespace SoulmvKit.UI
         }
 
         // Teclado: Enter/Espaço abrem e fecham; → abre; ← fecha (num item, volta ao paciente).
-        // Num item, Enter abre a prescrição (ou a solicitação, se for só ela) e Ctrl+Enter a
-        // solicitação.
+        // Vale também no título da seção. Num item, Enter abre a prescrição (ou a solicitação,
+        // se for só ela) e Ctrl+Enter a solicitação.
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (grid != null && grid.Focused && grid.CurrentRow != null)
             {
                 var atual = grid.CurrentRow;
                 var g = atual.Tag as LinhaGrade;
-                if (g != null)
+                if (g != null && g.Titulo)
+                {
+                    bool fechada = _secoesFechadas.Contains(g.Secao);
+                    if (keyData == Keys.Enter || keyData == Keys.Space
+                        || (keyData == Keys.Right && fechada) || (keyData == Keys.Left && !fechada))
+                    {
+                        AlternarSecao(g.Secao); return true;
+                    }
+                }
+                else if (g != null)
                 {
                     bool aberto = _abertos.Contains(g.Linha.At.Atendimento);
                     bool paciente = g.Item == null;
@@ -605,7 +724,7 @@ namespace SoulmvKit.UI
         {
             if (e.RowIndex < 0 || e.RowIndex >= grid.Rows.Count || e.ColumnIndex < 0) return;
             var g = grid.Rows[e.RowIndex].Tag as LinhaGrade;
-            if (g == null) return;
+            if (g == null || g.Titulo) return;   // o título é pintado inteiro em Grid_PintarTitulo
             string col = Colunas[e.ColumnIndex];
             bool icone = col == "sol" || col == "presc" || col == "abre";
 
@@ -626,6 +745,9 @@ namespace SoulmvKit.UI
                 return;
             }
 
+            // Acabou de mudar de seção: a linha toda no tom da seção nova por alguns segundos
+            // (o hover e a seleção continuam por cima).
+            if (g.Destaque) e.CellStyle.BackColor = FundoSecao(g.Secao);
             if (icone) return;
             if (g.Cinza)
             {
@@ -644,6 +766,83 @@ namespace SoulmvKit.UI
                 e.CellStyle.ForeColor = Theme.Primary;
                 e.CellStyle.SelectionForeColor = Theme.Primary;
             }
+        }
+
+        private static string TituloSecao(GrupoPam s)
+        {
+            switch (s)
+            {
+                case GrupoPam.Pendente: return "PRESCRIÇÃO PENDENTE";
+                case GrupoPam.Aguardando: return "AGUARDANDO PRESCRIÇÃO";
+                case GrupoPam.Atendidos: return "ATENDIDOS";
+                default: return "ALTA NA ÚLTIMA HORA";   // PainelPam.MinutosAltaVisivel
+            }
+        }
+
+        // As mesmas cores da coluna Prescrição: pendente âmbar, aguardando azul, atendido verde.
+        private static Color CorSecao(GrupoPam s)
+        {
+            switch (s)
+            {
+                case GrupoPam.Pendente: return Theme.Warning;
+                case GrupoPam.Aguardando: return Theme.Primary;
+                case GrupoPam.Atendidos: return Theme.Success;
+                default: return Theme.TextSoft;
+            }
+        }
+
+        private static Color FundoSecao(GrupoPam s)
+        {
+            switch (s)
+            {
+                case GrupoPam.Pendente: return Theme.WarningBg;
+                case GrupoPam.Aguardando: return Theme.InfoBg;
+                case GrupoPam.Atendidos: return Theme.SuccessBg;
+                default: return Theme.GridHeaderBg;
+            }
+        }
+
+        // Título de seção: a linha inteira sai daqui (o DataGridView não junta células) — faixa
+        // na cor da seção, a seta na coluna da seta e o nome a partir da coluna Paciente.
+        private void Grid_PintarTitulo(object sender, DataGridViewRowPrePaintEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= grid.Rows.Count) return;
+            var g = grid.Rows[e.RowIndex].Tag as LinhaGrade;
+            if (g == null || !g.Titulo) return;
+
+            var r = e.RowBounds;
+            bool sel = (e.State & DataGridViewElementStates.Selected) != 0;
+            Color fundo = sel ? Theme.SelBg : (e.RowIndex == grid.LinhaHover ? Theme.GridZebra : Theme.GridHeaderBg);
+            using (var b = new SolidBrush(fundo)) e.Graphics.FillRectangle(b, r);
+            using (var b = new SolidBrush(CorSecao(g.Secao))) e.Graphics.FillRectangle(b, r.X, r.Y, Theme.S(4), r.Height);
+            using (var p = new Pen(Theme.BorderSoft)) e.Graphics.DrawLine(p, r.Left, r.Bottom - 1, r.Right - 1, r.Bottom - 1);
+
+            var fmt = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+            var seta = grid.GetCellDisplayRectangle(CAbre, e.RowIndex, false);
+            if (seta.Width > 0)
+                TextRenderer.DrawText(e.Graphics, _secoesFechadas.Contains(g.Secao) ? GlifoFechado : GlifoAberto, Theme.Icon,
+                    new Rectangle(seta.X, r.Y, seta.Width, r.Height), Theme.TextSoft, fmt | TextFormatFlags.HorizontalCenter);
+
+            var nome = grid.GetCellDisplayRectangle(CPaciente, e.RowIndex, false);
+            int x = (nome.Width > 0 ? nome.X : r.X + Theme.S(36)) + Theme.S(6);
+            string titulo = TituloSecao(g.Secao);
+            var area = new Rectangle(x, r.Y, Math.Max(0, r.Right - x), r.Height);
+            TextRenderer.DrawText(e.Graphics, titulo, FonteSecao, area, CorSecao(g.Secao), fmt);
+            x += TextRenderer.MeasureText(e.Graphics, titulo, FonteSecao, Size.Empty, fmt).Width + Theme.S(8);
+
+            // Contagem; na de alta, o aviso do pedido pendente em âmbar.
+            string cont = g.Contagem, aviso = null;
+            int sep = cont.IndexOf(" · ");
+            if (sep > 0) { aviso = cont.Substring(sep); cont = cont.Substring(0, sep); }
+            area = new Rectangle(x, r.Y, Math.Max(0, r.Right - x), r.Height);
+            TextRenderer.DrawText(e.Graphics, cont, FonteSecao, area, Theme.TextSoft, fmt);
+            if (aviso != null)
+            {
+                x += TextRenderer.MeasureText(e.Graphics, cont, FonteSecao, Size.Empty, fmt).Width;
+                area = new Rectangle(x, r.Y, Math.Max(0, r.Right - x), r.Height);
+                TextRenderer.DrawText(e.Graphics, aviso, FonteItem, area, Theme.Warning, fmt);
+            }
+            e.Handled = true;
         }
 
         private static Color CorFarmacia(FarmaciaNaPrescricao f)
@@ -766,6 +965,7 @@ namespace SoulmvKit.UI
             if (e.RowIndex < 0 || e.ColumnIndex < 0 || e.RowIndex >= grid.Rows.Count) return;
             var g = grid.Rows[e.RowIndex].Tag as LinhaGrade;
             if (g == null) return;
+            if (g.Titulo) { AlternarSecao(g.Secao); return; }
             if (g.Item == null)
             {
                 if (g.Itens.Count > 0) Alternar(grid.Rows[e.RowIndex]);
@@ -795,7 +995,8 @@ namespace SoulmvKit.UI
             {
                 var g = grid.Rows[linha].Tag as LinhaGrade;
                 string col = Colunas[coluna];
-                if (g != null && g.Item == null && g.Itens.Count > 0) c = Cursors.Hand;
+                if (g != null && g.Titulo) c = Cursors.Hand;
+                else if (g != null && g.Item == null && g.Itens.Count > 0) c = Cursors.Hand;
                 else if (g != null && g.Item != null
                     && ((col == "sol" && g.Item.Pedido != null) || (col == "presc" && g.Item.Prescricao != null)))
                 {
@@ -925,8 +1126,13 @@ namespace SoulmvKit.UI
             }
             _viva = this;
             IniciarMonitor(_host);   // a partir da 1ª visita, atualiza sozinho até o logout
-            if (_memQuando > DateTime.MinValue) Absorver();
-            else LerAgora(false);
+            if (_memQuando == DateTime.MinValue) { LerAgora(false); return; }
+            // Volta para a aba: mostra na hora o que está em memória e, se a leitura tem mais que
+            // o intervalo da aba na tela (o fundo lê a cada minuto), relê agora.
+            Absorver();
+            double idade = (DateTime.Now - _memQuando).TotalMilliseconds;
+            if (idade >= IntervaloNaTelaMs) LerAgora(false);
+            else Rearmar(Math.Max(1000, IntervaloNaTelaMs - (int)idade));
         }
 
         public void ComandoAtualizar() { LerAgora(true); }
@@ -959,7 +1165,7 @@ namespace SoulmvKit.UI
                     if (!_carregou) lblVazio.Text = "O MV está ocupado com outra consulta. Tentando de novo em instantes...";
                     return;
                 }
-                Rearmar(IntervaloMs);
+                Rearmar(Intervalo);
             }
             catch (SessaoExpiradaException)
             {
@@ -993,7 +1199,11 @@ namespace SoulmvKit.UI
                 return;
             }
             if (_memQuando == DateTime.MinValue) return;
-            string quando = "Atualizado às " + _memQuando.ToString("HH:mm:ss") + " · atualiza sozinho a cada minuto.";
+            // Pacientes e prescrições saem do ciclo do PAM; a situação dos pedidos, da foto das
+            // Solicitações — as duas horas, para ninguém tomar um pedido de 1 min atrás por agora.
+            string quando = "Atualizado às " + _memQuando.ToString("HH:mm:ss")
+                + (_memPedidosQuando > DateTime.MinValue ? " (pedidos às " + _memPedidosQuando.ToString("HH:mm:ss") + ")" : "")
+                + " · atualiza sozinho a cada " + (IntervaloNaTelaMs / 1000) + " s.";
             if (_memAviso != null) banner.SetState(StatusKind.Warning, quando + " " + _memAviso);
             else banner.SetState(StatusKind.Info, quando);
         }
@@ -1007,12 +1217,22 @@ namespace SoulmvKit.UI
         //
         // Custo por ciclo: os pedidos de hoje saem da foto que o monitor das Solicitações tira
         // a cada 30 s (ligado junto, como faz a aba Antimicrobianos); no portão do MV sobra o
-        // CON_ATE de hoje (os dias anteriores têm cache de 5 min). O PEP é outra sessão. O tique
-        // desiste SEM enfileirar se o portão estiver ocupado — nunca atrapalha quem está
-        // produzindo kit ou enviando pedido — e tenta de novo em 8 s.
-        public const int IntervaloMs = 60000;
+        // CON_ATE (< 1 s por dia, medido em 26/10/2026). O PEP é outra sessão. O tique desiste SEM
+        // enfileirar se o portão estiver ocupado — nunca atrapalha quem está produzindo kit ou
+        // enviando pedido — e tenta de novo em 8 s.
+        //
+        // Ritmo (pedido do usuário, 26/10/2026: atualizar mais rápido pacientes e itens):
+        //  - pacientes e prescrições: 20 s com a aba na tela, 1 min com ela fechada; voltar para
+        //    a aba ou restaurar a janela minimizada relê na hora se a leitura passou de 20 s;
+        //  - situação dos pedidos: trocada a CADA foto nova das Solicitações (evento
+        //    FotoAtualizada), sem esperar o ciclo e sem consultar o MV de novo.
+        public const int IntervaloMs = 60000;           // aba fechada (em segundo plano)
+        public const int IntervaloNaTelaMs = 20000;     // aba na tela
         private const int NovaTentativaMs = 8000;
         private const int IdadeMaxFotoSeg = 90;     // foto das Solicitações mais velha que isso: busca aqui
+        private const int LeituraLentaMs = 5000;    // ciclo acima disso vai para o log (MV e PEP separados)
+
+        private static int Intervalo { get { return _viva != null ? IntervaloNaTelaMs : IntervaloMs; } }
 
         private static Timer _monitor;
         private static MainWindow _monitorHost;
@@ -1021,13 +1241,28 @@ namespace SoulmvKit.UI
         private static bool _varrendo;
         private static List<LinhaPam> _memLinhas = new List<LinhaPam>();
         private static DateTime _memQuando = DateTime.MinValue;   // MinValue = nada lido nesta sessão
+        private static DateTime _memPedidosQuando = DateTime.MinValue;   // hora dos pedidos de hoje em _memLinhas
         private static string _memAviso;            // o PEP não respondeu na última leitura
         private static string _memErro;             // a última leitura falhou (null = ok)
+        private static bool _ouvindoFotos;          // inscrito no FotoAtualizada das Solicitações
+        private static MainWindow _janelaOuvida;    // janela cujo Resize avisa a volta de minimizada
+        private static bool _estavaMinimizada;
 
         public static void IniciarMonitor(MainWindow host)
         {
             _monitorHost = host;
             SolicitacoesView.IniciarMonitor(host);   // os pedidos de hoje saem da foto dele
+            if (!_ouvindoFotos)
+            {
+                SolicitacoesView.FotoAtualizada += new Action<int>(FotoNova);
+                _ouvindoFotos = true;
+            }
+            if (_janelaOuvida != host)
+            {
+                if (_janelaOuvida != null) _janelaOuvida.Resize -= new EventHandler(JanelaMudou);
+                host.Resize += new EventHandler(JanelaMudou);
+                _janelaOuvida = host;
+            }
             if (_monitor == null)
             {
                 _monitor = new Timer();
@@ -1035,9 +1270,39 @@ namespace SoulmvKit.UI
                 _monitor.Tick += new EventHandler(MonitorTick);
             }
             if (_monitor.Enabled) return;            // já ligado nesta sessão
-            _monitor.Interval = IntervaloMs;
+            _monitor.Interval = Intervalo;
             _monitor.Start();
-            Logger.Log("Urgência (PAM): monitor em segundo plano ligado (a cada " + (IntervaloMs / 1000) + "s).");
+            Logger.Log("Urgência (PAM): monitor em segundo plano ligado (a cada " + (IntervaloNaTelaMs / 1000)
+                + "s com a aba na tela, " + (IntervaloMs / 1000) + "s fora dela).");
+        }
+
+        // Foto nova das Solicitações: troca a situação dos pedidos de hoje na lista em memória e
+        // redesenha, sem consultar o MV. Com uma leitura do PAM em curso não mexe: ela pega a
+        // foto mais nova ao terminar (VarrerAsync).
+        private static void FotoNova(int estoque)
+        {
+            if (estoque != PainelPam.EstoqueFarmacia || _monitorHost == null || _monitorHost.Session == null) return;
+            if (_varrendo || _memQuando == DateTime.MinValue) return;
+            DateTime quando;
+            var foto = SolicitacoesView.FotoDeHoje(PainelPam.EstoqueFarmacia, IdadeMaxFotoSeg, out quando);
+            if (foto == null || quando <= _memPedidosQuando) return;
+            PainelPam.TrocarPedidosDeHoje(_memLinhas, foto);
+            _memPedidosQuando = quando;
+            var v = _viva;
+            if (v != null && !v.IsDisposed && !v.Disposing) v.Absorver();
+        }
+
+        // Minimizada, o monitor não lê. Ao restaurar, relê na hora se a leitura passou do
+        // intervalo, em vez de mostrar a lista velha até o próximo tique.
+        private static void JanelaMudou(object sender, EventArgs e)
+        {
+            var janela = sender as Form;
+            if (janela == null) return;
+            if (janela.WindowState == FormWindowState.Minimized) { _estavaMinimizada = true; return; }
+            if (!_estavaMinimizada) return;
+            _estavaMinimizada = false;
+            if (_monitorHost == null || _monitorHost.Session == null || _memQuando == DateTime.MinValue) return;
+            if ((DateTime.Now - _memQuando).TotalMilliseconds >= Intervalo) Rearmar(300);
         }
 
         // Fim de sessão (logout, expiração, fechamento): invalida a leitura em voo e APAGA o que
@@ -1050,8 +1315,13 @@ namespace SoulmvKit.UI
             _sessaoId++;
             _memLinhas = new List<LinhaPam>();
             _memQuando = DateTime.MinValue;
+            _memPedidosQuando = DateTime.MinValue;
             _memAviso = null; _memErro = null;
+            _estavaMinimizada = false;
             _abertos.Clear();
+            _secoesFechadas.Clear(); _secoesFechadas.Add(GrupoPam.Alta);
+            _secaoAnterior = new Dictionary<string, GrupoPam>();
+            _mudouDeSecao.Clear();
             if (estava) Logger.Log("Urgência (PAM): monitor em segundo plano desligado.");
         }
 
@@ -1073,7 +1343,7 @@ namespace SoulmvKit.UI
 
             int sessao = _sessaoId;
             _monitor.Stop();   // o intervalo conta do FIM da leitura
-            int proximo = IntervaloMs;
+            int proximo = -1;  // -1 = o intervalo do momento (aba na tela ou não), lido ao rearmar
             try
             {
                 if (!await VarrerAsync(_monitorHost.Session, sessao, 0)) proximo = NovaTentativaMs;
@@ -1099,7 +1369,7 @@ namespace SoulmvKit.UI
             finally
             {
                 // Só rearma se ainda for a mesma sessão (senão o logout já parou de propósito).
-                if (sessao == _sessaoId) Rearmar(proximo);
+                if (sessao == _sessaoId) Rearmar(proximo > 0 ? proximo : Intervalo);
             }
         }
 
@@ -1117,20 +1387,38 @@ namespace SoulmvKit.UI
                     ? await MvGate.EntrarAsync("urgencia-pam", esperaMs)
                     : (!MvGate.Ocupado && MvGate.Entrar("monitor-urgencia-pam"));
                 if (!tenho) return false;
+                DateTime t0 = DateTime.Now;
                 PainelPamResult res;
                 try
                 {
-                    var foto = SolicitacoesView.FotoDeHoje(PainelPam.EstoqueFarmacia, IdadeMaxFotoSeg);
-                    res = await PainelPam.LerMvAsync(s, foto);
+                    DateTime quandoFoto;
+                    var foto = SolicitacoesView.FotoDeHoje(PainelPam.EstoqueFarmacia, IdadeMaxFotoSeg, out quandoFoto);
+                    res = await PainelPam.LerMvAsync(s, foto, quandoFoto);
                 }
                 finally { MvGate.Sair(); }
                 if (sessao != _sessaoId) return true;   // logout no meio: descarta tudo
+                DateTime t1 = DateTime.Now;
                 await PainelPam.CompletarPepAsync(s, res);
                 if (sessao != _sessaoId) return true;
+                DateTime t2 = DateTime.Now;
+                if ((t2 - t0).TotalMilliseconds > LeituraLentaMs)
+                    Logger.Log("Urgência (PAM): leitura lenta — MV " + (int)(t1 - t0).TotalMilliseconds + " ms, PEP "
+                        + (int)(t2 - t1).TotalMilliseconds + " ms, " + res.Linhas.Count + " paciente(s).");
+
+                // Foto nova das Solicitações chegou durante a leitura (o FotoNova não mexe com
+                // leitura em curso): aplica aqui, senão a lista sairia com a situação mais velha.
+                DateTime quandoNova;
+                var nova = SolicitacoesView.FotoDeHoje(PainelPam.EstoqueFarmacia, IdadeMaxFotoSeg, out quandoNova);
+                if (nova != null && quandoNova > res.PedidosQuando)
+                {
+                    PainelPam.TrocarPedidosDeHoje(res.Linhas, nova);
+                    res.PedidosQuando = quandoNova;
+                }
 
                 int semPep = PainelPam.HerdarPrescricoes(res, _memLinhas);
                 _memLinhas = res.Linhas;
                 _memQuando = res.Quando;
+                _memPedidosQuando = res.PedidosQuando;
                 _memErro = null;
                 _memAviso = res.AvisoPep == null ? null
                     : "O PEP não respondeu" + (semPep > 0
@@ -1204,14 +1492,14 @@ namespace SoulmvKit.UI
             return d.ToString("dd/MM HH:mm");
         }
 
-        private static string TextoSituacao(LinhaPam l)
+        private static string TextoSituacao(LinhaPam l, bool elaboracaoNaPrescricao)
         {
             var a = l.At;
             if (!a.EmAtendimento)
                 return ("Alta " + (a.Saida.HasValue ? a.Saida.Value.ToString("HH:mm") : "")).Trim();   // motivo no tooltip
             // "prescrevendo" só quando a coluna Prescrição mostra outro estado (pendente/atendida):
             // com "Em elaboração" lá, repetir aqui é ruído.
-            if (l.MedicoPrescrevendo && l.Estado != EstadoPrescricaoPam.EmElaboracao) return "Médico prescrevendo";
+            if (l.MedicoPrescrevendo && !elaboracaoNaPrescricao) return "Médico prescrevendo";
             return "Em atendimento";
         }
 
@@ -1254,10 +1542,23 @@ namespace SoulmvKit.UI
                 new string[0], new int[0], null, false));
             _linhas.Add(Ex("PACIENTE EXEMPLO SEIS", agora.AddMinutes(-130), agora.AddMinutes(-12), "ALTA APOS MEDICACAO", "MEDICO EXEMPLO A",
                 new[] { "S|PRE|-100" }, new[] { -101 }, null, false));
+            // prescrição com medicamento que não virou pedido: vai para Prescrição pendente
+            _linhas.Add(Ex("PACIENTE EXEMPLO NOVE", agora.AddMinutes(-35), null, "", "MEDICO EXEMPLO A",
+                new string[0], new[] { -10 }, new[] { "MDN:CEFTRIAXONA 1G FA" }, false));
+            // só pedido de material, sem prescrição médica: Aguardando prescrição
+            _linhas.Add(Ex("PACIENTE EXEMPLO DEZ", agora.AddMinutes(-20), null, "", "",
+                new[] { "S|AVU|-12" }, new int[0], null, false));
+            // alta com pedido ainda pendente: fica em Alta, com o pedido no acordeão
+            var oito = Ex("PACIENTE EXEMPLO OITO", agora.AddMinutes(-95), agora.AddMinutes(-5), "ALTA APOS MEDICACAO", "MEDICO EXEMPLO B",
+                new[] { "S|PRE|-70", "P|PRE|-15" }, new[] { -71, -16 },
+                new[] { "MDN:DIPIRONA SODICA 1G/2ML AMP", "MDN:ONDANSETRONA 4MG/2ML AMP" }, false);
+            _linhas.Add(oito); _abertos.Add(oito.At.Atendimento);
             PainelPam.Ordenar(_linhas);
             Render();
             banner.SetState(StatusKind.Info, "Pré-visualização: pacientes fictícios, sem consultar o MV.");
         }
+
+        private static int _exemplos;
 
         // pedidos: "situação|origem|minutos relativos" (ex.: "P|PRE|-6"); assinadas: minutos relativos;
         // itens de cada assinada: "ESQUEMA:NOME[:S]" separados por ";" (S = suspenso).
@@ -1266,7 +1567,7 @@ namespace SoulmvKit.UI
         {
             var l = new LinhaPam();
             l.At = new AtendimentoPam();
-            l.At.Atendimento = (562700 + Math.Abs(nome.GetHashCode() % 99)).ToString();
+            l.At.Atendimento = (562700 + (++_exemplos)).ToString();   // sequencial: dois fictícios nunca dividem o nº
             l.At.Paciente = nome; l.At.Entrada = entrada; l.At.Medico = medico;
             l.At.Alta = alta; l.At.AltaMedica = alta; l.At.MotivoAlta = motivo; l.At.Destino = "SALA DE EMERGENCIA";
             long n = 482900;

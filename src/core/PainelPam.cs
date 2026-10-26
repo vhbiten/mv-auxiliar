@@ -84,6 +84,9 @@ namespace SoulmvKit.Core
 
     public enum EstadoPrescricaoPam { SemPrescricao, SemPedido, EmElaboracao, Pendente, Atendida }
 
+    // Seção da aba Urgência (PAM), na ordem em que aparece: o que pede a farmácia primeiro.
+    public enum GrupoPam { Pendente, Aguardando, Atendidos, Alta }
+
     // Um item do acordeão do paciente: a prescrição médica E o pedido que ela gerou na farmácia
     // (os dois na mesma linha), ou só um pedido (material, transferência), ou só uma prescrição
     // que não gerou pedido à Farmácia Central.
@@ -144,6 +147,18 @@ namespace SoulmvKit.Core
             get { foreach (var p in Prescricoes) if (p.Medica && p.Assinada) return true; return false; }
         }
 
+        // Já tem prescrição médica: assinada no PEP ou, com o PEP sem resposta, um pedido que veio
+        // de prescrição (traz o nº dela). Só pedido de material não conta.
+        public bool TemPrescricao
+        {
+            get
+            {
+                if (TemPrescricaoMedicaAssinada) return true;
+                foreach (var p in Pedidos) if ((p.CdPreMed ?? "").Trim().Length > 0) return true;
+                return false;
+            }
+        }
+
         // Prescrições médicas assinadas (as que rendem folha no PEP), da mais antiga para a mais nova.
         public List<PrescricaoPep> PrescricoesMedicasAssinadas
         {
@@ -176,6 +191,7 @@ namespace SoulmvKit.Core
     {
         public List<LinhaPam> Linhas = new List<LinhaPam>();
         public DateTime Quando;
+        public DateTime PedidosQuando;  // hora em que os pedidos de HOJE foram lidos do MV
         public string AvisoPep;         // != null: o PEP não respondeu (sem a informação "em elaboração")
     }
 
@@ -198,12 +214,18 @@ namespace SoulmvKit.Core
         public const int MinutosGerarPedido = 3;        // assinada há menos que isso: o pedido ainda pode estar a caminho
         private const int ParaleloPep = 6;
         public const int DiasAnteriores = 2;                // quem entrou anteontem à noite e ainda espera leito no PAM
-        public const int MinutosCacheDiasAnteriores = 5;    // dias anteriores mudam pouco: relidos a cada 5 min
+        public const int MinutosCacheDiasAnteriores = 5;    // pedidos de dias anteriores mudam pouco: relidos a cada 5 min
+        // Atendimentos de dias anteriores: o CON_ATE de um dia leva < 1 s (log de 26/10/2026), e é
+        // dali que sai a ALTA de quem virou a noite no PAM — 5 min de atraso era demais.
+        public const int SegundosCacheAtendimentosAnteriores = 60;
+        // Pedidos de hoje sem a foto das Solicitações (aba delas na CAF ou com filtro): a varredura
+        // própria leva ~8 s no portão do MV (6 páginas num dia de 246 pedidos) — no máximo 1 por minuto.
+        public const int SegundosCachePedidosHoje = 60;
 
-        // Dias anteriores só mudam por alta ou por um pedido antigo atendido. Guardados por
-        // MinutosCacheDiasAnteriores, a atualização de 1 min não refaz 2 a 4 consultas pesadas no
-        // servidor de forms (cada varredura de pedidos de um dia leva ~10 s e prende o MvGate).
-        // Hoje é sempre lido. Tem nome de paciente: LimparCache no logout/expiração.
+        // Pedidos de dias anteriores só mudam quando um pedido antigo é atendido. Guardados por
+        // MinutosCacheDiasAnteriores, a atualização curta não refaz consultas pesadas no servidor
+        // de forms (cada varredura de pedidos de um dia leva ~8 s e prende o MvGate). Tem nome de
+        // paciente: LimparCache no logout/expiração.
         private class Lido<T> { public DateTime Quando; public T Valor; }
         private static readonly Dictionary<DateTime, Lido<List<AtendimentoPam>>> _atendimentosDia = new Dictionary<DateTime, Lido<List<AtendimentoPam>>>();
         private static readonly Dictionary<DateTime, Lido<List<Solicitacao>>> _pedidosDia = new Dictionary<DateTime, Lido<List<Solicitacao>>>();
@@ -214,17 +236,18 @@ namespace SoulmvKit.Core
             lock (_pedidosDia) _pedidosDia.Clear();
         }
 
-        private static T DoCache<T>(Dictionary<DateTime, Lido<T>> cache, DateTime dia) where T : class
+        // O guardado há menos de 'segundos' (null = não há ou venceu).
+        private static Lido<T> DoCache<T>(Dictionary<DateTime, Lido<T>> cache, DateTime dia, int segundos)
         {
             lock (cache)
             {
                 Lido<T> l;
-                if (cache.TryGetValue(dia, out l) && (DateTime.Now - l.Quando).TotalMinutes < MinutosCacheDiasAnteriores) return l.Valor;
+                if (cache.TryGetValue(dia, out l) && (DateTime.Now - l.Quando).TotalSeconds < segundos) return l;
                 return null;
             }
         }
 
-        private static void Guardar<T>(Dictionary<DateTime, Lido<T>> cache, DateTime dia, T valor)
+        private static Lido<T> Guardar<T>(Dictionary<DateTime, Lido<T>> cache, DateTime dia, T valor)
         {
             lock (cache)
             {
@@ -234,25 +257,28 @@ namespace SoulmvKit.Core
                 var velhos = new List<DateTime>();
                 foreach (var d in cache.Keys) if (d < DateTime.Today.AddDays(-DiasAnteriores)) velhos.Add(d);
                 foreach (var d in velhos) cache.Remove(d);
+                return l;
             }
         }
 
+        // Hoje é sempre lido (é de onde vêm os pacientes novos e as altas do dia).
         private static async Task<List<AtendimentoPam>> AtendimentosDoDiaAsync(Session s, DateTime dia)
         {
             bool passado = dia < DateTime.Today;
-            if (passado) { var c = DoCache(_atendimentosDia, dia); if (c != null) return c; }
+            if (passado) { var c = DoCache(_atendimentosDia, dia, SegundosCacheAtendimentosAnteriores); if (c != null) return c.Valor; }
             var lista = await MorphisClient.ListarAtendimentosUrgenciaAsync(s, dia);
             if (passado) Guardar(_atendimentosDia, dia, lista);
             return lista;
         }
 
-        private static async Task<List<Solicitacao>> PedidosDoDiaAsync(Session s, DateTime dia)
+        // A lista e a hora em que ela foi lida do MV (a do cache, se veio dele).
+        private static async Task<Lido<List<Solicitacao>>> PedidosDoDiaAsync(Session s, DateTime dia)
         {
-            bool passado = dia < DateTime.Today;
-            if (passado) { var c = DoCache(_pedidosDia, dia); if (c != null) return c; }
+            int validade = dia < DateTime.Today ? MinutosCacheDiasAnteriores * 60 : SegundosCachePedidosHoje;
+            var c = DoCache(_pedidosDia, dia, validade);
+            if (c != null) return c;
             var lista = (await MorphisClient.ListarDiaAsync(s, EstoqueFarmacia, "", "", dia)).Itens;
-            if (passado) Guardar(_pedidosDia, dia, lista);
-            return lista;
+            return Guardar(_pedidosDia, dia, lista);
         }
 
         // Parte do servidor de forms (chamar DENTRO do MvGate): atendimentos de hoje e dos
@@ -260,13 +286,13 @@ namespace SoulmvKit.Core
         // cada um, desde o dia da entrada mais antiga da lista.
         public static Task<PainelPamResult> LerMvAsync(Session s)
         {
-            return LerMvAsync(s, null);
+            return LerMvAsync(s, null, DateTime.MinValue);
         }
 
         // pedidosDeHoje: a foto recente que o monitor da aba Solicitações já tirou dos pedidos
-        // de hoje do estoque da farmácia (null = busca aqui). Poupa a varredura mais pesada do
-        // ciclo — sobra o CON_ATE de hoje.
-        public static async Task<PainelPamResult> LerMvAsync(Session s, List<Solicitacao> pedidosDeHoje)
+        // de hoje do estoque da farmácia, tirada às quandoFoto (null = busca aqui). Poupa a
+        // varredura mais pesada do ciclo — sobra o CON_ATE.
+        public static async Task<PainelPamResult> LerMvAsync(Session s, List<Solicitacao> pedidosDeHoje, DateTime quandoFoto)
         {
             var res = new PainelPamResult();
             DateTime hoje = DateTime.Today;
@@ -286,21 +312,57 @@ namespace SoulmvKit.Core
 
             DateTime desde = hoje;
             foreach (var l in porAt.Values) if (l.At.Entrada.Date < desde) desde = l.At.Entrada.Date;
-            for (DateTime d = desde; d <= hoje; d = d.AddDays(1))
+            for (DateTime d = desde; d < hoje; d = d.AddDays(1))
+                Distribuir(porAt, (await PedidosDoDiaAsync(s, d)).Valor);
+            if (pedidosDeHoje != null)
             {
-                var doDia = (d == hoje && pedidosDeHoje != null) ? pedidosDeHoje : await PedidosDoDiaAsync(s, d);
-                foreach (var sol in doDia)
-                {
-                    if (sol.OrigemEfetiva == "DEV") continue;   // devolução não é entrega
-                    LinhaPam l;
-                    if (porAt.TryGetValue((sol.Atendimento ?? "").Trim(), out l)) l.Pedidos.Add(sol);
-                }
+                Distribuir(porAt, pedidosDeHoje);
+                res.PedidosQuando = quandoFoto;
+            }
+            else
+            {
+                var lidos = await PedidosDoDiaAsync(s, hoje);
+                Distribuir(porAt, lidos.Valor);
+                res.PedidosQuando = lidos.Quando;
             }
 
             res.Linhas = new List<LinhaPam>(porAt.Values);
             Ordenar(res.Linhas);
             res.Quando = DateTime.Now;
             return res;
+        }
+
+        // Põe cada pedido na linha do atendimento dele (devolução não é entrega).
+        private static void Distribuir(Dictionary<string, LinhaPam> porAt, IEnumerable<Solicitacao> pedidos)
+        {
+            foreach (var sol in pedidos)
+            {
+                if (sol.OrigemEfetiva == "DEV") continue;
+                LinhaPam l;
+                if (porAt.TryGetValue((sol.Atendimento ?? "").Trim(), out l)) l.Pedidos.Add(sol);
+            }
+        }
+
+        // Foto nova dos pedidos de HOJE (monitor das Solicitações, a cada ~30 s): troca a situação
+        // dos pedidos de cada paciente na hora, sem consultar o MV e sem esperar o ciclo do PAM.
+        // Os pedidos de dias anteriores ficam como estavam. Troca a LISTA (não mexe na antiga):
+        // a grade continua lendo a anterior até redesenhar.
+        public static void TrocarPedidosDeHoje(List<LinhaPam> linhas, List<Solicitacao> pedidosDeHoje)
+        {
+            DateTime hoje = DateTime.Today;
+            var porAt = new Dictionary<string, LinhaPam>();
+            foreach (var l in linhas)
+            {
+                var antigos = new List<Solicitacao>();
+                foreach (var p in l.Pedidos)
+                {
+                    DateTime d;
+                    if (DataHoraPedido(p, out d) && d.Date < hoje) antigos.Add(p);
+                }
+                l.Pedidos = antigos;
+                porAt[l.At.Atendimento] = l;
+            }
+            Distribuir(porAt, pedidosDeHoje);
         }
 
         // Parte do PEP (fora do MvGate): prescrições de cada paciente da lista (também de quem
@@ -385,18 +447,37 @@ namespace SoulmvKit.Core
             return FarmaciaNaPrescricao.Nada;
         }
 
-        // A da linha do paciente sem nenhum pedido: o pior caso entre as prescrições dele.
-        public static FarmaciaNaPrescricao Farmacia(LinhaPam l)
+        // O pior caso entre as prescrições do paciente que NÃO geraram pedido (as que ficam
+        // sozinhas no acordeão; itens = PainelPam.Itens). Sem nenhum pedido, são todas.
+        public static FarmaciaNaPrescricao FarmaciaSemPedido(List<ItemPam> itens)
         {
             var r = FarmaciaNaPrescricao.Nada;
-            foreach (var p in l.PrescricoesMedicasAssinadas)
+            foreach (var it in itens)
             {
-                var f = Farmacia(p);
+                if (it.Pedido != null || it.Prescricao == null) continue;
+                var f = Farmacia(it.Prescricao);
                 if (f == FarmaciaNaPrescricao.SemPedido) return f;
                 if (f == FarmaciaNaPrescricao.AguardandoPedido) r = f;
                 else if (f == FarmaciaNaPrescricao.Desconhecido && r == FarmaciaNaPrescricao.Nada) r = f;
             }
             return r;
+        }
+
+        // Seção do paciente na aba (regras do usuário, 26/10/2026):
+        //  - Alta: teve alta. Pedido que ficou pendente aparece no acordeão dele;
+        //  - Prescrição pendente: pedido à farmácia não atendido, ou prescrição assinada com
+        //    medicamento que ainda não virou pedido. Quem estava em Atendidos (só exames, por
+        //    exemplo) volta para cá quando ganha prescrição de medicamento;
+        //  - Aguardando prescrição: nenhuma prescrição médica ainda, ou médico prescrevendo;
+        //  - Atendidos: todos os pedidos atendidos, ou prescrição só com exames/cuidados.
+        public static GrupoPam Grupo(LinhaPam l, List<ItemPam> itens)
+        {
+            if (!l.At.EmAtendimento) return GrupoPam.Alta;
+            if (l.PedidosPendentes > 0) return GrupoPam.Pendente;
+            var f = FarmaciaSemPedido(itens);
+            if (f == FarmaciaNaPrescricao.SemPedido || f == FarmaciaNaPrescricao.AguardandoPedido) return GrupoPam.Pendente;
+            if (l.MedicoPrescrevendo || !l.TemPrescricao) return GrupoPam.Aguardando;
+            return GrupoPam.Atendidos;
         }
 
         private static readonly string[] OrdemCategorias = {
@@ -548,6 +629,7 @@ namespace SoulmvKit.Core
 
         // Ordem estável (as linhas não pulam a cada atualização): quem está em atendimento, por
         // hora de entrada (há mais tempo no PAM primeiro); depois as altas, a mais recente primeiro.
+        // A aba separa por seção (Grupo) e mantém esta ordem dentro de cada uma.
         public static void Ordenar(List<LinhaPam> linhas)
         {
             linhas.Sort(delegate(LinhaPam a, LinhaPam b)

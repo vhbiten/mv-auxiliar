@@ -468,6 +468,13 @@ namespace SoulmvKit.UI
         // O resultado vai para o snapshot/cache do estoque; se a aba estiver aberta, cai direto
         // na grade. Assim ninguém perde uma solicitação por estar em outra tela.
         public const int IntervaloMonitorMs = 30000;
+        // Portão do MV ocupado na hora do tique (outra tela, a leitura curta da Urgência (PAM)):
+        // tenta de novo em 5 s em vez de esperar mais 30 — a aba do PAM vive desta foto.
+        private const int NovaTentativaMs = 5000;
+
+        // Foto de hoje renovada (o estoque vai no argumento): a aba Urgência (PAM) troca na hora
+        // a situação dos pedidos dos pacientes dela, sem esperar o próprio ciclo.
+        public static event Action<int> FotoAtualizada;
         // A varredura de 30s cobre só HOJE (1 consulta, barata). De tempos em tempos refaz o
         // período inteiro — é o que pega mudança de situação em solicitação de dias anteriores.
         private const int TicksParaVarreduraCompleta = 10;   // 10 x 30s = 5 min
@@ -512,14 +519,14 @@ namespace SoulmvKit.UI
         private static async void MonitorTick(object sender, EventArgs e)
         {
             if (_monitorHost == null || _monitorHost.Session == null) return;
-            if (MvGate.Ocupado) return;                        // usuário (ou a varredura anterior) no MV
+            if (MvGate.Ocupado) { TentarEmBreve(); return; }   // usuário (ou outra leitura) no MV
             if (_viva != null && (_viva.IsDisposed || _viva.Disposing)) _viva = null;
             // Preview de kit aberto = há um form vivo no servidor esperando o "Confirmar":
             // não é hora de abrir outro. Janela minimizada também não precisa de 30s.
             if (ProduzirView.OcupadoNoMv) return;
             if (_monitorHost.WindowState == FormWindowState.Minimized) return;
 
-            if (!MvGate.Entrar("monitor-solicitacoes")) return;
+            if (!MvGate.Entrar("monitor-solicitacoes")) { TentarEmBreve(); return; }
 
             // O intervalo passa a contar a partir do FIM da varredura (a da Farmácia Central
             // leva ~10s): sem isso o monitor ficaria 1/3 do tempo falando com o servidor.
@@ -545,8 +552,20 @@ namespace SoulmvKit.UI
             {
                 MvGate.Sair();
                 // Só rearma se ainda for a mesma sessão (senão o logout já parou de propósito).
-                if (sessao == _sessaoId && _monitor != null && _monitorHost != null) _monitor.Start();
+                if (sessao == _sessaoId && _monitor != null && _monitorHost != null)
+                {
+                    _monitor.Interval = IntervaloMonitorMs;   // volta do "tentar em breve"
+                    _monitor.Start();
+                }
             }
+        }
+
+        private static void TentarEmBreve()
+        {
+            if (_monitor == null) return;
+            _monitor.Stop();
+            _monitor.Interval = NovaTentativaMs;
+            _monitor.Start();
         }
 
         // Consulta o servidor e atualiza o snapshot do estoque (e a grade, se a aba estiver
@@ -619,6 +638,12 @@ namespace SoulmvKit.UI
             itens.Sort(delegate(Solicitacao a, Solicitacao b) { return b.Numero.CompareTo(a.Numero); });
             GravarSnapshot(estoque, itens, maxNumero, agora, chave, anterior);
             _diaDaUltimaVarredura = hoje;
+            var aviso = FotoAtualizada;
+            if (aviso != null)
+            {
+                try { aviso(estoque); }
+                catch (Exception ex) { Logger.Log("Solicitações: erro ao avisar a foto nova: " + ex.Message); }
+            }
 
             if (_viva != null && !_viva.IsDisposed && !_viva.Disposing && _viva._estoque == estoque)
                 _viva.AbsorverAtualizacao(itens, maxNumero, agora, res.AtingiuTeto);
@@ -716,11 +741,15 @@ namespace SoulmvKit.UI
         // A mesma foto, só se for RECENTE: quem precisa da SITUAÇÃO de cada pedido quase em
         // tempo real (a aba Urgência (PAM)) não pode usar uma foto de minutos atrás — o monitor
         // pode estar parado, minimizado ou varrendo outro estoque. null = faça a própria busca.
-        public static List<Solicitacao> FotoDeHoje(int estoque, int segundosMax)
+        // quando = hora em que a foto foi tirada (MinValue se não houver).
+        public static List<Solicitacao> FotoDeHoje(int estoque, int segundosMax, out DateTime quando)
         {
+            quando = DateTime.MinValue;
             var s = SnapshotEstatico(estoque);
             if (s == null || (DateTime.Now - s.Quando).TotalSeconds > segundosMax) return null;
-            return FotoDeHoje(estoque);
+            var foto = FotoDeHoje(estoque);
+            if (foto != null) quando = s.Quando;
+            return foto;
         }
 
         // Grava em memória sempre; em DISCO só quando o conteúdo mudou de verdade — a varredura
