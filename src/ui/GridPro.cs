@@ -71,12 +71,18 @@ namespace SoulmvKit.UI
         // cor DELA vale; senão vale o SelBg do tema — e TODAS as camadas recebem a MESMA.
         private Color _corEdicao = Theme.SelBg;   // cor unificada da célula em edição
 
+        // Cor fixa do editor para a view que pinta a célula em edição por conta própria (aba
+        // Atender: editor BRANCO dentro da moldura da célula atual — o branco escolhido no
+        // handler era trocado pelo SelBg da regra abaixo). Empty = a regra abaixo.
+        public Color CorEditor = Color.Empty;
+
         protected override void OnEditingControlShowing(DataGridViewEditingControlShowingEventArgs e)
         {
             base.OnEditingControlShowing(e);   // os handlers das views rodam primeiro
             var tb = e.Control as TextBox;
             Color cor = Theme.SelBg;
-            if (tb != null && tb.BackColor != Color.White && tb.BackColor != SystemColors.Window)
+            if (CorEditor != Color.Empty) cor = CorEditor;
+            else if (tb != null && tb.BackColor != Color.White && tb.BackColor != SystemColors.Window)
                 cor = tb.BackColor;            // a view escolheu: respeita
             _corEdicao = cor;
             e.CellStyle.BackColor = cor;

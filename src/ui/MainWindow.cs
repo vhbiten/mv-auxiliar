@@ -34,6 +34,15 @@ namespace SoulmvKit.UI
             this.Font = Theme.Body;
             if (_lembrarJanela) RestaurarJanela();
 
+            // Reserva de solicitação que ficou presa da última vez (o programa caiu, o PC
+            // desligou): solta no MV pela sessão antiga, sem precisar de login.
+            this.Shown += async delegate
+            {
+                SoulmvKit.Core.ReservaAtendimento.Iniciar();
+                try { await SoulmvKit.Core.ReservaAtendimento.RecuperarAsync(); }
+                catch (Exception ex) { SoulmvKit.Core.Logger.Log("Reserva: recuperação falhou: " + ex.Message); }
+            };
+
             ShowView(new LoginView(this));
         }
 
@@ -111,6 +120,17 @@ namespace SoulmvKit.UI
             catch { }
         }
 
+        // O app voltou ao primeiro plano (Alt+Tab, barra de tarefas). A tela que precisa pode
+        // devolver o foco ao campo onde o usuário estava (a aba Atender volta à célula da grade).
+        public event EventHandler VoltouAoPrimeiroPlano;
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x001C && m.WParam != IntPtr.Zero && VoltouAoPrimeiroPlano != null)   // WM_ACTIVATEAPP, ativando
+                VoltouAoPrimeiroPlano(this, EventArgs.Empty);
+        }
+
         // Atalhos globais: F5 atualiza e Ctrl+F foca a busca da tela ativa.
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
@@ -128,6 +148,14 @@ namespace SoulmvKit.UI
         // para não deixar o kit em estado indefinido nem derrubar a finalização em curso).
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            // Baixa de solicitação sendo gravada no MV: fechar no meio deixaria a gravação sem
+            // resposta. Só o Windows desligando passa (aí não há escolha).
+            if (AtenderView.GravacaoEmAndamento && e.CloseReason != CloseReason.WindowsShutDown)
+            {
+                e.Cancel = true;
+                StyledDialog.Aviso(this, "Gravação em andamento", "Uma baixa de solicitação está sendo gravada no MV. Aguarde terminar para fechar o programa.", "Entendi");
+                return;
+            }
             if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
             {
                 e.Cancel = true;
@@ -136,7 +164,47 @@ namespace SoulmvKit.UI
                         : "Um pedido à CAF está sendo gravado no servidor. Aguarde terminar para fechar o programa.", "Entendi");
                 return;
             }
+            // Solicitação reservada na aba Atender: solta no MV antes de fechar. Windows desligando
+            // ou Gerenciador de Tarefas não esperam: tenta por até 4 s e segue (se não der, o
+            // arquivo de recuperação solta na próxima abertura).
+            if (!_reservaSolta && SoulmvKit.Core.ReservaAtendimento.Atual != null)
+            {
+                if (e.CloseReason == CloseReason.WindowsShutDown || e.CloseReason == CloseReason.TaskManagerClosing)
+                {
+                    SoulmvKit.Core.ReservaAtendimento.LiberarAgora(Session, 4000);
+                    _reservaSolta = true;
+                }
+                else
+                {
+                    e.Cancel = true;
+                    FecharSoltandoReserva();
+                    return;
+                }
+            }
             base.OnFormClosing(e);
+        }
+
+        private bool _reservaSolta, _soltandoReserva;
+
+        // Fecha depois de soltar a reserva (até 10 s; sem resposta, fecha assim mesmo — o arquivo
+        // de recuperação fica e a próxima abertura do programa termina o serviço).
+        private async void FecharSoltandoReserva()
+        {
+            if (_soltandoReserva) return;
+            _soltandoReserva = true;
+            this.Enabled = false;
+            this.Text = SoulmvKit.AppConfig.AppName + " — liberando a solicitação no MV...";
+            bool tenho = false;
+            try
+            {
+                tenho = await SoulmvKit.Core.MvGate.EntrarAsync("fechar-reserva", 5000);
+                var t = SoulmvKit.Core.ReservaAtendimento.LiberarAsync(Session, "programa fechado");
+                await System.Threading.Tasks.Task.WhenAny(t, System.Threading.Tasks.Task.Delay(10000));
+            }
+            catch (Exception ex) { SoulmvKit.Core.Logger.Log("Reserva: liberar ao fechar falhou: " + ex.Message); }
+            finally { if (tenho) SoulmvKit.Core.MvGate.Sair(); }
+            _reservaSolta = true;
+            Close();
         }
 
         // Fechou: para o monitor de solicitações antes que o loop de mensagens morra (senão a
@@ -183,6 +251,7 @@ namespace SoulmvKit.UI
                 // Urgência (PAM): atendimentos/pedidos de dias anteriores e itens das prescrições
                 // lidas ficam em cache — têm dado de paciente, não passam para o próximo login.
                 SoulmvKit.Core.PainelPam.LimparCache();
+                SoulmvKit.Core.AtenderSolicitacao.LimparCache();
                 SoulmvKit.Core.PepClient.LimparFolhas();
             }
             else if (Session != null)

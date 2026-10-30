@@ -78,12 +78,15 @@ namespace SoulmvKit.Core
             if (_emCurso || _sessaoAtual == null) return;
             Session s = _sessaoAtual();
             if (s == null) return;
+            // Alguém falando com o MV (consulta, gravação de uma baixa) já mantém a sessão viva; e
+            // duas conversas ao mesmo tempo na mesma sessão atrapalham a outra. Pula esta rodada.
+            if (!MvGate.Entrar("keepalive")) return;
             _emCurso = true;
             try
             {
                 await ManterAsync(s);
             }
-            finally { _emCurso = false; }
+            finally { _emCurso = false; MvGate.Sair(); }
         }
 
         private static async Task ManterAsync(Session s)

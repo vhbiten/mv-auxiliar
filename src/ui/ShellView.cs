@@ -17,6 +17,7 @@ namespace SoulmvKit.UI
         private NavButton _navConsulta;
         private NavButton _navSolic;
         private NavButton _navPam;
+        private NavButton _navAtender;
         private NavButton _navPedido;
         private NavButton _navAtb;
         private NavButton _navJust;
@@ -92,6 +93,10 @@ namespace SoulmvKit.UI
             _navSolic = new NavButton("Solicitações");
             _navSolic.Selected += new EventHandler(delegate { Selecionar(_navSolic, "Solicitações", new SolicitacoesView(_host)); });
 
+            // Atender uma solicitação: bipa o nº, os itens pedidos vêm prontos; lote e quantidade.
+            _navAtender = new NavButton("Atender");
+            _navAtender.Selected += new EventHandler(delegate { Selecionar(_navAtender, "Atender solicitação", new AtenderView(_host)); });
+
             // Pacientes do PAM e a situação da prescrição de cada um (para levar tudo de uma vez).
             _navPam = new NavButton("Urgência (PAM)");
             _navPam.Selected += new EventHandler(delegate { Selecionar(_navPam, "Urgência (PAM)", new EntregasPamView(_host)); });
@@ -115,13 +120,13 @@ namespace SoulmvKit.UI
                 _navEstoque.Selected += new EventHandler(delegate { Selecionar(_navEstoque, "Compras CAF", new EstoqueView(_host)); });
             }
 
-            _navs.Add(_navKits); _navs.Add(_navConf); _navs.Add(_navConsulta); _navs.Add(_navSolic); _navs.Add(_navPam); _navs.Add(_navAtb); _navs.Add(_navJust);
+            _navs.Add(_navKits); _navs.Add(_navConf); _navs.Add(_navConsulta); _navs.Add(_navAtender); _navs.Add(_navSolic); _navs.Add(_navPam); _navs.Add(_navAtb); _navs.Add(_navJust);
             if (_navPedido != null) _navs.Add(_navPedido);
             if (_navEstoque != null) _navs.Add(_navEstoque);
 
             // Menu em grupos recolhíveis (o estado aberto/fechado fica em dados\menu.txt):
             //   KITS: produzir e consultar;
-            //   SOLICITAÇÕES;
+            //   SOLICITAÇÕES: Atender primeiro (é o que o atendente mais usa);
             //   ANTIMICROBIANOS: a lista de uso e as justificativas se leem em par;
             //   ESTOQUE: Conferência de Lotes (físico x eletrônico) e o par de reposição —
             //   Previsão de Consumo (Central pede à CAF) e Compras CAF (a CAF decide o que comprar;
@@ -129,7 +134,7 @@ namespace SoulmvKit.UI
             // Para o atendente o grupo ESTOQUE fica só com a Conferência (ver Permissoes).
             _recolhidos = CarregarRecolhidos();
             AdicionarGrupo(nav, "kits", "Kits", "\uE7B8", _navKits, _navConsulta);              // caixa
-            AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navSolic, _navPam);     // prancheta
+            AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navAtender, _navSolic, _navPam);     // prancheta
             AdicionarGrupo(nav, "antimicrobianos", "Antimicrobianos", null, _navAtb, _navJust);    // cápsula (desenhada)
             AdicionarGrupo(nav, "estoque", "Estoque", "\uE81E", _navConf, _navPedido, _navEstoque);  // camadas
             AjustarLarguras(nav);
@@ -175,6 +180,11 @@ namespace SoulmvKit.UI
 
             EventHandler sair = new EventHandler(delegate
             {
+                if (AtenderView.GravacaoEmAndamento)
+                {
+                    StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", "Aguarde a baixa da solicitação terminar de ser gravada no MV antes de sair.", "Entendi");
+                    return;
+                }
                 if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
                 {
                     StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", ProduzirView.ProducaoEmAndamento
@@ -182,6 +192,7 @@ namespace SoulmvKit.UI
                             : "Aguarde o pedido à CAF terminar de ser enviado antes de sair.", "Entendi");
                     return;
                 }
+                if (!PodeSairDoModulo()) return;
                 // O pré-pedido em memória é do usuário que está saindo — não pode reaparecer
                 // (pronto para enviar) no login do próximo. A trava do pedido enviado FICA.
                 PedidoCafView.LimparMemoria();
@@ -248,6 +259,11 @@ namespace SoulmvKit.UI
         // Configurações: página no lugar do módulo atual; nenhuma aba fica ativa.
         public void AbrirConfiguracoes()
         {
+            if (AtenderView.GravacaoEmAndamento)
+            {
+                StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", "Aguarde a baixa da solicitação terminar de ser gravada no MV antes de trocar de tela.", "Entendi");
+                return;
+            }
             if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
             {
                 StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", ProduzirView.ProducaoEmAndamento
@@ -255,9 +271,18 @@ namespace SoulmvKit.UI
                         : "Aguarde o pedido à CAF terminar de ser enviado antes de trocar de tela.", "Entendi");
                 return;
             }
+            if (!PodeSairDoModulo()) return;
             foreach (var nb in _navs) nb.Active = false;
             foreach (var g in _grupos) g.Titulo.ContemAtivo = false;
             ShowModule("Configurações", new ConfiguracoesView(_host));
+        }
+
+        // A aba Atender com lotes digitados pergunta antes de descartar (sair dela solta a
+        // solicitação reservada no MV).
+        private bool PodeSairDoModulo()
+        {
+            var atender = _viewAtual as AtenderView;
+            return atender == null || atender.PodeSair();
         }
 
         // Ícone (glifo Segoe MDL2) do rodapé da sidebar.
@@ -364,6 +389,12 @@ namespace SoulmvKit.UI
             Selecionar(_navSolic, "Solicitações", new SolicitacoesView(_host));
         }
 
+        // usado por flag de desenvolvimento (--atender-preview)
+        public void IrParaAtender()
+        {
+            Selecionar(_navAtender, "Atender solicitação", new AtenderView(_host));
+        }
+
         // usado por flag de desenvolvimento (--pam-preview)
         public void IrParaEntregasPam()
         {
@@ -401,6 +432,12 @@ namespace SoulmvKit.UI
             // Trava de segurança: não trocar de módulo (nem descartar a view) enquanto
             // uma produção está sendo gravada no servidor — evita criar kit duplicado
             // e o crash por descartar a view durante o await da finalização.
+            if (AtenderView.GravacaoEmAndamento)
+            {
+                view.Dispose();
+                StyledDialog.Aviso(this.FindForm(), "Gravação em andamento", "Aguarde a baixa da solicitação terminar de ser gravada no MV antes de trocar de módulo.", "Entendi");
+                return;
+            }
             if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
             {
                 view.Dispose();
@@ -409,6 +446,7 @@ namespace SoulmvKit.UI
                         : "Aguarde o pedido à CAF terminar de ser enviado antes de trocar de módulo.", "Entendi");
                 return;
             }
+            if (!PodeSairDoModulo()) { view.Dispose(); return; }
             foreach (var nb in _navs) nb.Active = (nb == nav);
             foreach (var g in _grupos)
             {

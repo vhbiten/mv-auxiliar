@@ -57,13 +57,23 @@ namespace SoulmvKit
             bool estoquePrev = args != null && Array.IndexOf(args, "--estoque-preview") >= 0;
             bool cfgPrev = args != null && Array.IndexOf(args, "--config-preview") >= 0;
             bool pamPrev = args != null && Array.IndexOf(args, "--pam-preview") >= 0;
-            bool algumPreview = shellPrev || confPrev || consPrev || solicPrev || pedidoPrev || atbPrev || justPrev || estoquePrev || cfgPrev || pamPrev;
+            bool atenderPrev = args != null && Array.IndexOf(args, "--atender-preview") >= 0;
+            bool algumPreview = shellPrev || confPrev || consPrev || solicPrev || pedidoPrev || atbPrev || justPrev || estoquePrev || cfgPrev || pamPrev || atenderPrev;
 
             // A janela só lembra o estado (maximizada/tamanho) na abertura NORMAL, sem
             // argumento nenhum: preview e captura de tela precisam de tamanho controlado.
             var win = new MainWindow(args == null || args.Length == 0);
+
+            // Solicitação reservada na aba Atender: erro fatal ou processo encerrando ainda tentam
+            // soltá-la no MV; se não der, o arquivo de recuperação solta na próxima abertura.
+            AppDomain.CurrentDomain.UnhandledException += delegate { SoulmvKit.Core.ReservaAtendimento.LiberarAgora(win.Session, 4000); };
+            AppDomain.CurrentDomain.ProcessExit += delegate { SoulmvKit.Core.ReservaAtendimento.LiberarAgora(win.Session, 1500); };
+
             if (algumPreview)
             {
+                // Pré-visualização nunca reserva nada no MV: o atendimento usa o MV simulado.
+                SoulmvKit.Core.ReservaAtendimento.Mv = new SoulmvKit.Core.BaixaMvSimulada();
+                SoulmvKit.Core.ReservaAtendimento.Pasta = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dados", "reservas-preview");
                 SoulmvKit.UI.ConferenciaView.PreviewCaf = args != null && Array.IndexOf(args, "--caf") >= 0;
                 win.Usuario = "PREVIEW";
                 var shell = new SoulmvKit.UI.ShellView(win);
@@ -73,6 +83,7 @@ namespace SoulmvKit
                 else if (consPrev) shell.IrParaConsulta();
                 else if (solicPrev) shell.IrParaSolicitacoes();
                 else if (pamPrev) shell.IrParaEntregasPam();
+                else if (atenderPrev) shell.IrParaAtender();
                 else if (pedidoPrev) shell.IrParaPedidoCaf();
                 else if (atbPrev) shell.IrParaAntimicrobianos();
                 else if (justPrev) shell.IrParaJustificativas();

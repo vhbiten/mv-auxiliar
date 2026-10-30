@@ -302,7 +302,7 @@ namespace SoulmvKit.UI
 
         private async void OnInstalar(object sender, EventArgs e)
         {
-            if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento)
+            if (ProduzirView.ProducaoEmAndamento || PedidoCafView.EnvioEmAndamento || AtenderView.GravacaoEmAndamento)
             {
                 StyledDialog.Aviso(this.FindForm(), "Gravação em andamento",
                     "Aguarde a gravação terminar antes de instalar a atualização.", "Entendi");

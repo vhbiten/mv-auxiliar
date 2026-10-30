@@ -114,6 +114,7 @@ namespace SoulmvKit.Core
 
                 res.Success = true;
                 res.Session = new Session(http, host, user);
+                res.Session.Cookies = handler.CookieContainer;
                 res.Session.Empresa = company;
                 res.Session.NomeCompleto = await ObterNomeCompleto(http, host, user);   // best-effort
                 res.Message = "Conectado.";
@@ -190,6 +191,31 @@ namespace SoulmvKit.Core
                 Logger.Log("Sessão: reconexão sem senha falhou: " + ex.Message);
                 return false;
             }
+        }
+
+        // Sessão refeita a partir de cookies guardados (nome, valor, caminho, domínio) — sem senha
+        // e sem login novo: fala com a MESMA sessão do servidor, se ela ainda existir. Usada para
+        // liberar a reserva de uma solicitação depois que o programa caiu (ReservaAtendimento).
+        // Sessão que já morreu cai no login do CAS: o MorphisClient lança SessaoExpiradaException.
+        public static Session SessaoSalva(string host, string user, System.Collections.Generic.IEnumerable<string[]> cookies)
+        {
+            var handler = new HttpClientHandler
+            {
+                CookieContainer = new CookieContainer(),
+                AllowAutoRedirect = true,
+                MaxAutomaticRedirections = 20,
+                UseCookies = true,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+            };
+            foreach (var c in cookies)
+                if (c != null && c.Length >= 4) handler.CookieContainer.Add(new Cookie(c[0], c[1], c[2], c[3]));
+            var http = new HttpClient(handler);
+            http.Timeout = TimeSpan.FromSeconds(20);
+            http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", UserAgent);
+            http.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "pt-BR,pt;q=0.9");
+            var s = new Session(http, host, user);
+            s.Cookies = handler.CookieContainer;
+            return s;
         }
 
         // Nome completo do usuário: contextInfo do integrated-services (exige o header

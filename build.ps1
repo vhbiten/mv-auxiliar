@@ -24,6 +24,7 @@ $refs = @(
     "System.Net.Http.dll",
     "System.Xml.dll",
     "System.Xml.Linq.dll",
+    "System.Security.dll",
     "System.IO.Compression.dll",
     "System.IO.Compression.FileSystem.dll"
 )

@@ -9,6 +9,10 @@ namespace SoulmvKit.Core
         public readonly HttpClient Http;
         public readonly string Host;
         public readonly string User;
+        // Cookies da sessão (o JSESSIONID do forms é a identidade dela no servidor). A reserva
+        // da aba Atender os guarda protegidos em disco para liberar a solicitação depois de uma
+        // queda do programa (ReservaAtendimento).
+        public System.Net.CookieContainer Cookies;
         public string NomeCompleto;   // nome completo do usuário (do contextInfo); pode ser null
         public int Empresa = AppConfig.Company;   // empresa do login (refeita na renovação)
 

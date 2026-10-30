@@ -1234,6 +1234,552 @@ namespace SoulmvKit.Core
             return res;
         }
 
+        // ===== SOLICITAÇÃO PARA ATENDER (form C_SOLSAI_PRO, consulta) — READ-ONLY =====
+        // "Consultas > Solicitações de Produtos ao Estoque": abre em modo consulta e o critério
+        // CD_SOLSAI_PRO funciona (validado ao vivo em 28/10/2026: 484416, 20 itens em 470 ms).
+        // Cabeçalho no bloco SOLSAI_PRO — com paciente, leito, unidade e prestador quando é
+        // pedido de paciente — e itens pedidos no ITSOLSAI_PRO, 5 por página. A tela de
+        // atendimento (M_BAIXASOL) não mostra os itens pedidos; por isso a aba Atender lê daqui.
+        // null = a solicitação não existe (ou o usuário não a enxerga).
+        public static async Task<SolicitacaoAtender> LerSolicitacaoParaAtenderAsync(Session s, long numero)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("C_SOLSAI_PRO", "MV.12.01.05.06.#");
+            var blk = cf.Block_("SOLSAI_PRO");
+            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
+            if (recId == null)
+                throw new Exception("A consulta de solicitações do MV (Consultas > Solicitações de Produtos ao Estoque) não abriu para este usuário.");
+
+            string body = "<body><block selected=\"" + recId + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + recId + "\">" +
+                "<item name=\"CD_SOLSAI_PRO\">" + numero + "</item></record></block></body>";
+            var q = await m.PostAsync(AcaoBlocoHdr("SOLSAI_PRO", "TP_SOLSAI_PRO", m.FormTask, "EXECUTE_QUERY") + body);
+
+            // Sem resultado, o bloco volta só com o critério digitado: vale o registro que trouxe o estoque.
+            MorphisRecord r = null;
+            var cab = q.Block_("SOLSAI_PRO");
+            if (cab != null)
+                foreach (var x in cab.Records)
+                    if ((x.Get("CD_SOLSAI_PRO") ?? "").Trim() == numero.ToString() && !string.IsNullOrEmpty((x.Get("CD_ESTOQUE") ?? "").Trim())) { r = x; break; }
+            if (r == null) return null;
+
+            var sol = new SolicitacaoAtender();
+            sol.Numero = numero;
+            sol.Tipo = (r.Get("TP_SOLSAI_PRO") ?? "").Trim();
+            sol.Situacao = (r.Get("TP_SITUACAO") ?? "").Trim();
+            int est; int.TryParse((r.Get("CD_ESTOQUE") ?? "").Trim(), out est); sol.Estoque = est;
+            sol.DsEstoque = (r.Get("DSP_DS_ESTOQUE") ?? "").Trim();
+            sol.Setor = (r.Get("DSP_NM_SETOR") ?? "").Trim();
+            sol.UnidadeInternacao = (r.Get("DSP_DS_UNID_INT") ?? "").Trim();
+            sol.Leito = (r.Get("DSP_DS_LEITO") ?? "").Trim();
+            sol.Paciente = (r.Get("DSP_NM_PACIENTE") ?? "").Trim();
+            sol.Prestador = (r.Get("DSP_NM_MNEMONICO") ?? "").Trim();
+            sol.Atendimento = (r.Get("CD_ATENDIMENTO") ?? "").Trim();
+            sol.Solicitante = (r.Get("CD_USUARIO") ?? "").Trim();
+            sol.Urgente = (r.Get("SN_URGENTE") ?? "").Trim() == "S";
+            DateTime d;
+            if (DataHoraMv(r.Get("HR_SOLSAI_PRO"), out d) || DataHoraMv(r.Get("DT_SOLSAI_PRO"), out d)) sol.Data = d;
+
+            var vistos = new System.Collections.Generic.HashSet<string>();
+            int pagina = 0;
+            while (true)
+            {
+                pagina++;
+                var bi = q.Block_("ITSOLSAI_PRO");
+                if (bi != null)
+                    foreach (var it in bi.Records)
+                    {
+                        int cod;
+                        if (!int.TryParse((it.Get("CD_PRODUTO") ?? "").Trim(), out cod) || cod <= 0) continue;
+                        if (!vistos.Add(string.IsNullOrEmpty(it.Id) ? pagina + "|" + cod : it.Id)) continue;
+                        var item = new ItemSolicitado();
+                        item.Produto = cod;
+                        item.Descricao = (it.Get("DSP_DS_PRODUTO") ?? "").Trim();
+                        item.Unidade = (it.Get("DSP_DS_UNIDADE") ?? "").Trim();
+                        var qs = AtenderSolicitacao.LerNumero(it.Get("QT_SOLICITADO")); item.Solicitado = qs.HasValue ? qs.Value : 0;
+                        var qa = AtenderSolicitacao.LerNumero(it.Get("QT_ATENDIDA")); item.Atendido = qa.HasValue ? qa.Value : 0;
+                        sol.Itens.Add(item);
+                    }
+                int pageNumber, totalPages;
+                LerPaginacaoBloco(q.Raw, "ITSOLSAI_PRO", out pageNumber, out totalPages);
+                if (pageNumber >= totalPages) break;
+                if (pagina >= 100) break;   // trava anti-loop (500 itens)
+                q = await m.PostAsync(AcaoBlocoHdr("ITSOLSAI_PRO", "CD_PRODUTO", m.FormTask, "NEXT_PAGE") + "<body></body>");
+            }
+            AtenderSolicitacao.OrdenarComoImpressa(sol);
+            Logger.Log("Atender: solicitação " + numero + " lida (tipo " + sol.Tipo + ", situação " + sol.Situacao +
+                ", estoque " + sol.Estoque + ", " + sol.Itens.Count + " itens).");
+            return sol;
+        }
+
+        // Nomes de quem pediu e de quem atendeu, pela tela de atendimento (M_BAIXASOL, bloco
+        // SOLSAI_PRO): a consulta C_SOLSAI_PRO só traz o login. Só EXECUTE_QUERY pelo número
+        // (~100 ms em 28/10/2026), a mesma consulta da aba Solicitações; não confirma produtos.
+        // Preenche sol.SolicitanteNome e sol.Atendente; não achou = deixa como estão.
+        public static async Task LerNomesDaBaixaAsync(Session s, SolicitacaoAtender sol)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("M_BAIXASOL", "MV.12.01.02.01.#");
+            var blk = cf.Block_("SOLSAI_PRO");
+            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
+            if (recId == null) return;
+            string body = "<body><block selected=\"" + recId + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + recId + "\">" +
+                "<item name=\"CD_SOLSAI_PRO\">" + sol.Numero + "</item></record></block></body>";
+            var q = await m.PostAsync(AcaoBlocoHdr("SOLSAI_PRO", "CD_SOLSAI_PRO", m.FormTask, "EXECUTE_QUERY") + body);
+            var cab = q.Block_("SOLSAI_PRO");
+            if (cab == null) return;
+            foreach (var r in cab.Records)
+            {
+                if ((r.Get("CD_SOLSAI_PRO") ?? "").Trim() != sol.Numero.ToString()) continue;
+                sol.SolicitanteNome = SemNulo(r.Get("NM_USUARIO_SOLICITACAO"));
+                sol.Atendente = SemNulo(r.Get("NM_USUARIO_MVTO"));
+                return;
+            }
+        }
+
+        // Campo vazio chega como o texto "xsi:nil".
+        private static string SemNulo(string v)
+        {
+            v = (v ?? "").Trim();
+            return v == "xsi:nil" ? "" : v;
+        }
+
+        // ===== RESERVA DA SOLICITAÇÃO PARA ATENDER (form M_BAIXASOL) — GRAVA NO MV =====
+        // "Confirmar produtos" é o 1º passo do atendimento no MV: cria a movimentação
+        // (CD_MVTO_ESTOQUE) e prende a solicitação a ESTA sessão. Outra sessão que tentar recebe
+        // "Esta solicitação já está sendo confirmada neste momento por outro usuário." — sem
+        // gravar nada e sem dizer quem (HAR de 28/10/2026, 484610). A trava só sai pelo
+        // "Retornar solicitação" (RetornarSolicitacaoAsync) ou quando a sessão do servidor morre
+        // (~60 min sem uso; 14/10/2026). Quem chama segura o MvGate e GUARDA a reserva devolvida.
+        public static async Task<TentativaReserva> ReservarSolicitacaoAsync(Session s, long numero)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            var cf = await m.CallFormAsync("M_BAIXASOL", "MV.12.01.02.01.#");
+            var blk = cf.Block_("SOLSAI_PRO");
+            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
+            if (recId == null) throw new Exception("A tela de atendimento de solicitações do MV não abriu para este usuário.");
+            string body = "<body><block selected=\"" + recId + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + recId + "\">" +
+                "<item name=\"CD_SOLSAI_PRO\">" + numero + "</item></record></block></body>";
+            var q = await m.PostAsync(AcaoBlocoHdr("SOLSAI_PRO", "CD_SOLSAI_PRO", m.FormTask, "EXECUTE_QUERY") + body);
+
+            // Só confirma a solicitação certa e ainda aberta (pedido ou parcial).
+            string sit = null;
+            var cab = q.Block_("SOLSAI_PRO");
+            if (cab != null)
+                foreach (var r in cab.Records)
+                    if ((r.Get("CD_SOLSAI_PRO") ?? "").Trim() == numero.ToString()) { sit = SemNulo(r.Get("TP_SITUACAO")); break; }
+            var t = new TentativaReserva();
+            if (sit == null) { t.Resultado = ResultadoReserva.Recusada; t.Mensagem = "A solicitação " + numero + " não foi encontrada na tela de atendimento do MV."; return t; }
+            if (sit != "P" && sit != "C")
+            {
+                t.Resultado = ResultadoReserva.Recusada;
+                t.Mensagem = "A solicitação " + numero + " está " + AtenderSolicitacao.DescreverSituacao(sit).ToLowerInvariant() + " no MV.";
+                return t;
+            }
+
+            var c = await m.PostAsync(AcaoBotaoHdr("SOLSAI_PRO", "BTN_CONFIRMA_PRODUTOS", m.FormTask, "btnConfirmaProdutos_click") + "<body></body>");
+            t = AnalisarConfirmar(c);
+            string task = !string.IsNullOrEmpty(c.Task) ? c.Task : m.FormTask;
+            var alerta = c.Command("SHOW_ALERT");
+            if (alerta != null && t.Resultado != ResultadoReserva.Reservada)
+            {
+                // "OK" do aviso (ocupada ou outro motivo do MV): nada foi gravado.
+                try { await m.FecharAlertaAsync(task, "SOLSAI_PRO", "BTN_CONFIRMA_PRODUTOS", NomeAlerta(c), 0); } catch { }
+            }
+            if (t.Resultado == ResultadoReserva.Reservada)
+            {
+                t.Reserva = new ReservaAberta();
+                t.Reserva.Numero = numero; t.Reserva.Usuario = s.User; t.Reserva.Host = s.Host;
+                t.Reserva.FormTask = task; t.Reserva.Mvto = t.Mvto; t.Reserva.Desde = DateTime.Now; t.Reserva.Visto = DateTime.Now;
+                t.Reserva.Cookies = CookiesDoForms(s);
+                if (alerta != null)
+                {
+                    // Aviso informativo junto da tela de lançamento (1 botão): só fecha.
+                    try { await m.FecharAlertaAsync(task, "ITMVTO_ESTOQUE", "DSP_SN_MESTRE", NomeAlerta(c), 0); } catch { }
+                }
+            }
+            else if (c.Raw != null && c.Raw.Contains("WIN_PRINCIPAL1_2"))
+            {
+                // Abriu o lançamento MAS com pergunta que não sabemos responder: não fica com
+                // nada preso — retorna na hora.
+                Logger.Log("Reserva: " + numero + " abriu o lançamento com aviso inesperado (" + t.Mensagem + ") — retornando.");
+                try { await RetornarSolicitacaoAsync(s, task); } catch (Exception ex) { Logger.Log("Reserva: retorno após aviso falhou: " + ex.Message); }
+            }
+            Logger.Log("Reserva: " + numero + " -> " + t.Resultado + (t.Reserva != null ? " (mvto " + t.Reserva.Mvto + ", task " + task + ")" : "") +
+                (t.Mensagem.Length > 0 ? " — " + t.Mensagem : ""));
+            return t;
+        }
+
+        // O que a resposta do "Confirmar produtos" quer dizer. Separado para testar com as
+        // respostas guardadas: livre -> janela de lançamento (WIN_PRINCIPAL1_2) com a MVTO;
+        // ocupada -> alerta "já está sendo confirmada"; o resto -> recusada com o texto do MV.
+        public static TentativaReserva AnalisarConfirmar(MorphisResponse c)
+        {
+            var t = new TentativaReserva();
+            string alerta = TextoAlerta(c);
+            string raw = c != null ? (c.Raw ?? "") : "";
+            if (alerta.IndexOf("sendo confirmada", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                t.Resultado = ResultadoReserva.OcupadaPorOutro;
+                t.Mensagem = alerta;
+                return t;
+            }
+            bool lancamento = raw.Contains("WIN_PRINCIPAL1_2");
+            bool pergunta = c != null && c.Command("SHOW_ALERT") != null && System.Text.RegularExpressions.Regex.Matches(raw, "<button ").Count > 1;
+            if (lancamento && !pergunta)
+            {
+                t.Resultado = ResultadoReserva.Reservada;
+                var mv = c.Block_("MVTO_ESTOQUE");
+                if (mv != null) foreach (var r in mv.Records) { string v = SemNulo(r.Get("CD_MVTO_ESTOQUE")); if (v.Length > 0) { t.Mvto = v; break; } }
+                t.Mensagem = alerta;
+                return t;
+            }
+            t.Resultado = ResultadoReserva.Recusada;
+            t.Mensagem = alerta.Length > 0 ? alerta : "O MV não abriu o atendimento da solicitação.";
+            return t;
+        }
+
+        // "Retornar solicitação" (sai do lançamento sem gravar e solta a trava). O MV pergunta
+        // "...com o retorno, tudo o que foi digitado será perdido. Deseja continuar?" — Sim (1).
+        // true = voltou para a tela inicial (liberou). Sessão morta = SessaoExpiradaException
+        // (nesse caso o servidor já soltou a trava).
+        public static async Task<bool> RetornarSolicitacaoAsync(Session s, string formTask)
+        {
+            var m = new MorphisClient(s);
+            m.FormTask = formTask;
+            var r = await m.PostAsync(AcaoBotaoHdr("ITMVTO_ESTOQUE", "BTN_RETORNA_SOLICITACAO", formTask, "btnRetornaSolicitacao_click") + "<body></body>");
+            // Sessão que o servidor já descartou responde OK vazio com o comando SESSION_END
+            // (testado em 28/10/2026 com um JSESSIONID inexistente): a trava morreu junto.
+            if (r.Command("SESSION_END") != null) throw new SessaoExpiradaException();
+            for (int i = 0; i < 3 && r.Command("SHOW_ALERT") != null; i++)
+            {
+                string texto = TextoAlerta(r);
+                int resposta = PerguntaDoRetorno(texto) ? 1 : 0;
+                Logger.Log("Reserva: retorno perguntou \"" + texto + "\" -> " + (resposta == 1 ? "Sim" : "OK/Não"));
+                r = await m.FecharAlertaAsync(formTask, "ITMVTO_ESTOQUE", "DSP_SN_MESTRE", NomeAlerta(r), resposta);
+            }
+            bool voltou = AnalisarRetorno(r);
+            Logger.Log("Reserva: retorno do task " + formTask + " -> " + (voltou ? "liberou" : "NÃO voltou para a tela inicial (outcome " + r.Outcome + ")"));
+            return voltou;
+        }
+
+        public static bool PerguntaDoRetorno(string texto)
+        {
+            return (texto ?? "").IndexOf("Deseja continuar", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                   (texto ?? "").IndexOf("retorno", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Liberou = a tela voltou para a janela inicial (WIN_PRINCIPAL1, sem o "_2" do lançamento).
+        public static bool AnalisarRetorno(MorphisResponse r)
+        {
+            string raw = r != null ? (r.Raw ?? "") : "";
+            return System.Text.RegularExpressions.Regex.IsMatch(raw, "windowCtrl [^>]*name=\"WIN_PRINCIPAL1\"") ||
+                   raw.Contains("views/ViewWinPrincipal1?");
+        }
+
+        private async Task<MorphisResponse> FecharAlertaAsync(string task, string block, string item, string nome, int resposta)
+        {
+            string act = "<action name=\"CLOSE_ALERT\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            return await PostAsync(MsgT(block, item, task, act, "<alert name=\"" + Xml(nome) + "\"><selected>" + resposta + "</selected></alert>"));
+        }
+
+        private static string NomeAlerta(MorphisResponse r)
+        {
+            var c = r != null ? r.Command("SHOW_ALERT") : null;
+            string n;
+            return c != null && c.Params.TryGetValue("name", out n) && !string.IsNullOrEmpty(n) ? n : "CFG_INFORMATION";
+        }
+
+        private static string AcaoBotaoHdr(string block, string item, string task, string acao)
+        {
+            return "<header><control block=\"" + block + "\" item=\"" + item + "\" task=\"" + task +
+                "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
+                "<action name=\"" + acao + "\" kind=\"Action\" validation=\"true\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
+        }
+
+        // ===== FECHAR A BAIXA (form M_BAIXASOL, na tela já reservada) — GRAVA NO MV =====
+        // Protocolo dos HARs de 28/10/2026 (484357, 3 itens; 484399, item a mais e fora do pedido):
+        //   btnCdProduto_click — digitação por código (sem ele o código é ignorado: falha de 14/10);
+        //   por linha: GOTOITEM CD_PRODUTO->CD_LOTE com o código [alerta "não foi solicitado neste
+        //     pedido" -> Sim só se a linha é fora do pedido] -> LIST_VALUES (LV_LOTE) -> LOV_OK no
+        //     índice do lote ESCOLHIDO (achado pelo código na lista do MV) -> NEXT_ITEM (unidade) ->
+        //     NEXT_ITEM com QT_MOVIMENTACAO ["Quantidade Atendida é maior" -> Sim só se o produto vai
+        //     a mais] -> o MV abre a linha seguinte;
+        //   btnFecharSolicitacao_click GRAVA (ConcluirFechamentoAsync).
+        // Cada resposta é conferida (produto, unidade, lote, saldo, quantidade). Fora do roteiro
+        // ANTES do Fechar: para e devolve o problema — quem chama faz o Retornar (nada foi gravado).
+        // Do Fechar em diante, falha de rede = INCERTA: quem chama confere a situação e NUNCA
+        // repete o Fechar.
+        public static async Task<ResultadoBaixa> GravarBaixaAsync(Session s, string formTask,
+            System.Collections.Generic.List<LinhaBaixa> linhas, Action<string> progresso)
+        {
+            var m = new MorphisClient(s);
+            m.FormTask = formTask;
+            var res = new ResultadoBaixa();
+            var totais = new System.Collections.Generic.Dictionary<int, decimal>();
+            var usoLote = new System.Collections.Generic.Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+            foreach (var l in linhas)
+            {
+                decimal t; totais.TryGetValue(l.Produto, out t); totais[l.Produto] = t + l.Quantidade;
+            }
+
+            // Digitação por código
+            var r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
+                AcaoXml("MVTO_ESTOQUE", "BTN_CD_PRODUTO", "btnCdProduto_click", true), ""));
+            if (r.Command("SESSION_END") != null) return Falha(res, -1, "A sessão do MV que segurava a reserva acabou. Abra a solicitação de novo.");
+            if ((r.Raw ?? "").IndexOf("WIN_PRINCIPAL1_2", StringComparison.Ordinal) < 0)
+                return Falha(res, -1, "A tela de lançamento do MV não está aberta (a reserva pode ter caído). Abra a solicitação de novo.");
+            if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, -1, "O MV não liberou a digitação por código");
+            string rec = SelecionadoItens(r);
+            if (rec == null) return Falha(res, -1, "O MV não abriu a primeira linha do lançamento.");
+
+            for (int i = 0; i < linhas.Count; i++)
+            {
+                var l = linhas[i];
+                if (progresso != null) progresso("Lançando " + (i + 1) + " de " + linhas.Count + ": " + l.Produto + " " + l.Descricao);
+
+                // 1) produto
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_PRODUTO", GotoXml("ITMVTO_ESTOQUE", "CD_PRODUTO", "CD_LOTE", rec, ""),
+                    RegistroXml("ITMVTO_ESTOQUE", rec, "CD_PRODUTO", l.Produto.ToString())));
+                if (r.Command("SHOW_ALERT") != null)
+                {
+                    string al = TextoAlerta(r);
+                    if (l.ForaDoPedido && al.IndexOf("não foi solicitado", StringComparison.OrdinalIgnoreCase) >= 0)
+                        r = await m.FecharAlertaAsync(m.FormTask, r.Block ?? "ITMVTO_ESTOQUE", r.Item ?? "CD_PRODUTO", NomeAlerta(r), 1);
+                    else return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou o produto " + l.Produto);
+                    if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou o produto " + l.Produto);
+                }
+                var reg = Registro(r, rec);
+                if (reg == null || SemNulo(reg.Get("CD_PRODUTO")) != l.Produto.ToString())
+                    return Falha(res, l.Indice, "O MV não aceitou o produto " + l.Produto + " na linha.");
+                string unidadeMv = SemNulo(reg.Get("DSP_DS_UNIDADE"));
+                if (l.Unidade.Length > 0 && unidadeMv.Length > 0 && UnidadeNormal(l.Unidade) != UnidadeNormal(unidadeMv))
+                    return Falha(res, l.Indice, "O MV lança o produto " + l.Produto + " em " + unidadeMv + ", e o pedido está em " + l.Unidade +
+                        ". Para não errar a quantidade, atenda este item pelo MV.");
+
+                // 2) lote: a lista do MV, com o saldo de agora
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_LOTE", AcaoXml(null, null, "LIST_VALUES", false), ""));
+                var lov = r.List_("LV_LOTE");
+                if (lov == null)
+                {
+                    if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV não mostrou os lotes do produto " + l.Produto);
+                    return Falha(res, l.Indice, "O MV não mostrou os lotes do produto " + l.Produto + ".");
+                }
+                int indice = -1; decimal saldo = 0;
+                for (int k = 0; k < lov.Records.Count; k++)
+                    if (string.Equals(SemNulo(lov.Records[k].Get("CD_LOTE")), l.Lote, StringComparison.OrdinalIgnoreCase))
+                    {
+                        int id;
+                        indice = int.TryParse(lov.Records[k].Id, out id) ? id : k;
+                        var sq = AtenderSolicitacao.LerNumero(SemNulo(lov.Records[k].Get("QT_ESTOQUE_ATUAL"))); saldo = sq.HasValue ? sq.Value : 0;
+                        break;
+                    }
+                if (indice < 0) return Falha(res, l.Indice, "O lote " + l.Lote + " não aparece no MV para o produto " + l.Produto + " (sem saldo agora?).");
+                string chave = l.Produto + "|" + l.Lote;
+                decimal usado; usoLote.TryGetValue(chave, out usado); usado += l.Quantidade; usoLote[chave] = usado;
+                if (usado > saldo)
+                    return Falha(res, l.Indice, "O lote " + l.Lote + " do produto " + l.Produto + " tem " + AtenderSolicitacao.Num(saldo) +
+                        " no MV agora; a baixa pede " + AtenderSolicitacao.Num(usado) + ".");
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_LOTE", AcaoXml(null, null, "LOV_OK", false),
+                    "<list name=\"LV_LOTE\"><item name=\"searchText\">%</item><data selected=\"" + indice + "\"></data></list>"));
+                if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou o lote " + l.Lote);
+                reg = Registro(r, rec);
+                if (reg == null || !string.Equals(SemNulo(reg.Get("CD_LOTE")), l.Lote, StringComparison.OrdinalIgnoreCase))
+                    return Falha(res, l.Indice, "O MV não ficou com o lote " + l.Lote + " na linha do produto " + l.Produto + ".");
+
+                // 3) unidade (a do MV) -> quantidade
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "DSP_DS_UNIDADE", AcaoXml("ITMVTO_ESTOQUE", "DSP_DS_UNIDADE", "NEXT_ITEM", true), ""));
+                if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou a unidade do produto " + l.Produto);
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "QT_MOVIMENTACAO", AcaoXml("ITMVTO_ESTOQUE", "QT_MOVIMENTACAO", "NEXT_ITEM", true),
+                    RegistroXml("ITMVTO_ESTOQUE", rec, "QT_MOVIMENTACAO", AtenderSolicitacao.Num(l.Quantidade))));
+                if (r.Command("SHOW_ALERT") != null)
+                {
+                    string al = TextoAlerta(r);
+                    if (l.AMais && al.IndexOf("maior que a solicitada", StringComparison.OrdinalIgnoreCase) >= 0)
+                        r = await m.FecharAlertaAsync(m.FormTask, r.Block ?? "ITMVTO_ESTOQUE", r.Item ?? "QT_MOVIMENTACAO", NomeAlerta(r), 1);
+                    else return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou a quantidade do produto " + l.Produto);
+                    if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou a quantidade do produto " + l.Produto);
+                }
+                reg = Registro(r, rec);
+                var qMv = reg != null ? AtenderSolicitacao.LerNumero(SemNulo(reg.Get("QT_MOVIMENTACAO"))) : null;
+                if (reg == null || SemNulo(reg.Get("CD_PRODUTO")) != l.Produto.ToString() ||
+                    !string.Equals(SemNulo(reg.Get("CD_LOTE")), l.Lote, StringComparison.OrdinalIgnoreCase) || !qMv.HasValue || qMv.Value != l.Quantidade)
+                    return Falha(res, l.Indice, "A linha do produto " + l.Produto + " não ficou como digitada no MV.");
+                string novo = SelecionadoItens(r);
+                if (novo == null || novo == rec) return Falha(res, l.Indice, "O MV não abriu a linha seguinte depois do produto " + l.Produto + ".");
+                rec = novo;
+                Logger.Log("Baixa: " + l.Produto + " lote " + l.Lote + " qtd " + AtenderSolicitacao.Num(l.Quantidade) + " lançado.");
+            }
+
+            // Fechar: daqui em diante, o MV pode ter gravado.
+            if (progresso != null) progresso("Fechando a baixa no MV...");
+            res.AntesDoFechar = false;
+            try
+            {
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_PRODUTO", AcaoXml("ITMVTO_ESTOQUE", "BTN_FECHAR_SOLICITACAO", "btnFecharSolicitacao_click", true), ""));
+                return await m.ConcluirFechamentoAsync(r, res, totais);
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("Baixa: sem resposta clara no Fechar (" + ex.Message + ") — resultado INCERTO.");
+                res.Incerta = true;
+                res.Mensagem = "O MV não respondeu ao fechar a baixa (" + ex.Message + ").";
+                return res;
+            }
+        }
+
+        // Depois do btnFecharSolicitacao_click: quadro de divergência (se houver) -> sucesso ->
+        // pergunta de impressão (Não) -> tela de etiquetas (Sair). Separado para testar com as
+        // respostas guardadas dos HARs.
+        public async Task<ResultadoBaixa> ConcluirFechamentoAsync(MorphisResponse r, ResultadoBaixa res,
+            System.Collections.Generic.Dictionary<int, decimal> totais)
+        {
+            res.AntesDoFechar = false;
+            var quadro = r.Block_("PRODUTOS_CONFIRMADOS");
+            if (quadro != null && (r.Raw ?? "").IndexOf("RESULTADO", StringComparison.Ordinal) >= 0)
+            {
+                // O quadro tem que bater com o que foi lançado; senão, não confirma.
+                foreach (var rq in quadro.Records)
+                {
+                    int cod;
+                    if (!int.TryParse(SemNulo(rq.Get("CD_PRODUTO")), out cod)) continue;
+                    var qa = AtenderSolicitacao.LerNumero(SemNulo(rq.Get("QTD_ATENDIDA")));
+                    decimal esperado; totais.TryGetValue(cod, out esperado);
+                    if (!qa.HasValue || qa.Value != esperado)
+                    {
+                        res.Incerta = true;
+                        res.Mensagem = "O quadro de divergência do MV mostra " + (qa.HasValue ? AtenderSolicitacao.Num(qa.Value) : "?") + " atendido(s) do produto " + cod +
+                            ", e a baixa lançou " + AtenderSolicitacao.Num(esperado) + ". A baixa NÃO foi confirmada; confira a solicitação no MV.";
+                        Logger.Log("Baixa: " + res.Mensagem);
+                        return res;
+                    }
+                }
+                if (r.Command("SHOW_ALERT") != null)
+                    r = await FecharAlertaAsync(FormTask, "PRODUTOS_CONFIRMADOS", "CD_PRODUTO", NomeAlerta(r), 0);
+                // Sem marcar nada no quadro: a diferença fica como atendimento parcial.
+                r = await PostAsync(Msg("PRODUTOS_CONFIRMADOS", "CD_PRODUTO", AcaoXml("SOLSAI_PRO", "BTN_OK", "btnOk_click", true), ""));
+            }
+
+            for (int i = 0; i < 4 && r.Command("SHOW_ALERT") != null; i++)
+            {
+                string t = TextoAlerta(r);
+                if (t.IndexOf("atendida com sucesso", StringComparison.OrdinalIgnoreCase) >= 0) res.Gravada = true;
+                else if (t.IndexOf("Deseja Imprimir", StringComparison.OrdinalIgnoreCase) < 0 && !res.Gravada)
+                {
+                    try { await FecharAlertaAsync(FormTask, r.Block ?? "SOLSAI_PRO", r.Item ?? "CD_SOLSAI_PRO", NomeAlerta(r), 0); } catch { }
+                    res.Incerta = true;
+                    res.Mensagem = "O MV respondeu ao fechar: " + t;
+                    Logger.Log("Baixa: " + res.Mensagem);
+                    return res;
+                }
+                r = await FecharAlertaAsync(FormTask, r.Block ?? "SOLSAI_PRO", r.Item ?? "CD_SOLSAI_PRO", NomeAlerta(r), 0);   // OK / Não imprimir
+            }
+
+            // Tela de etiquetas: sai sem imprimir (etiquetas ficam para depois).
+            var abriu = r.Command("TASK_OPEN");
+            string tarefa;
+            if (abriu != null && abriu.Params.TryGetValue("task", out tarefa) && !string.IsNullOrEmpty(tarefa))
+            {
+                try
+                {
+                    r = await PostAsync(MsgT("QUANT_ETIQUETAS", "NR_COPIAS", tarefa, GotoXml("QUANT_ETIQUETAS", "NR_COPIAS", "BTN_SAIR", "", "btnSair_click"), ""));
+                }
+                catch (Exception ex) { Logger.Log("Baixa: sair da tela de etiquetas falhou (" + ex.Message + ")."); }
+            }
+            var sol = r.Block_("SOLSAI_PRO");
+            if (sol != null) foreach (var x in sol.Records) { string v = SemNulo(x.Get("TP_SITUACAO")); if (v.Length > 0) { res.Situacao = v; break; } }
+            if (!res.Gravada)
+            {
+                res.Incerta = true;
+                if (res.Mensagem.Length == 0) res.Mensagem = "O MV não confirmou a gravação da baixa.";
+            }
+            Logger.Log("Baixa: fechamento -> " + (res.Gravada ? "GRAVADA (situação " + res.Situacao + ")" : "incerta: " + res.Mensagem));
+            return res;
+        }
+
+        private static ResultadoBaixa Falha(ResultadoBaixa res, int linha, string msg)
+        {
+            res.LinhaComProblema = linha;
+            res.Mensagem = msg;
+            Logger.Log("Baixa: parou antes de gravar — " + msg);
+            return res;
+        }
+
+        // Fecha o alerta inesperado (OK/Não) e devolve a falha com o texto do MV.
+        private static async Task<ResultadoBaixa> FalhaComAlerta(MorphisClient m, MorphisResponse r, ResultadoBaixa res, int linha, string contexto)
+        {
+            string t = TextoAlerta(r);
+            try { await m.FecharAlertaAsync(m.FormTask, r.Block ?? "ITMVTO_ESTOQUE", r.Item ?? "CD_PRODUTO", NomeAlerta(r), 0); } catch { }
+            return Falha(res, linha, contexto + (t.Length > 0 ? ": " + t : "."));
+        }
+
+        private static string UnidadeNormal(string u)
+        {
+            return System.Text.RegularExpressions.Regex.Replace((u ?? "").Trim().ToUpperInvariant(), "\\s+", " ");
+        }
+
+        // Linha selecionada (a que está sendo digitada) do bloco de itens da movimentação.
+        private static string SelecionadoItens(MorphisResponse r)
+        {
+            var b = r.Block_("ITMVTO_ESTOQUE");
+            if (b == null) return null;
+            if (!string.IsNullOrEmpty(b.Selected)) return b.Selected;
+            return b.Records.Count > 0 ? b.Records[b.Records.Count - 1].Id : null;
+        }
+
+        private static MorphisRecord Registro(MorphisResponse r, string id)
+        {
+            var b = r.Block_("ITMVTO_ESTOQUE");
+            if (b == null) return null;
+            foreach (var x in b.Records) if (x.Id == id) return x;
+            return null;
+        }
+
+        private static string AcaoXml(string block, string item, string nome, bool validacao)
+        {
+            return "<action" + (block != null ? " block=\"" + block + "\" item=\"" + item + "\"" : "") + " name=\"" + nome +
+                "\" kind=\"Action\" validation=\"" + (validacao ? "true" : "false") + "\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+        }
+
+        private static string GotoXml(string block, string deItem, string paraItem, string rec, string acaoDoItem)
+        {
+            return "<action block=\"" + block + "\" item=\"" + deItem + "\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", deItem) + Param("previousBlock", block) + Param("previousRecord", rec) +
+                Param("item", paraItem) + Param("block", block) + Param("record", rec) +
+                Param("actionValue", "") + Param("fireItemAction", acaoDoItem) + "</action>";
+        }
+
+        private static string RegistroXml(string block, string rec, string item, string valor)
+        {
+            return "<block selected=\"" + rec + "\" name=\"" + block + "\"><record status=\"C\" id=\"" + rec + "\"><item name=\"" + item + "\">" + Xml(valor) + "</item></record></block>";
+        }
+
+        // Cookies que identificam a sessão do forms (nome, valor, caminho, domínio).
+        private static System.Collections.Generic.List<string[]> CookiesDoForms(Session s)
+        {
+            var res = new System.Collections.Generic.List<string[]>();
+            if (s == null || s.Cookies == null) return res;
+            foreach (System.Net.Cookie ck in s.Cookies.GetCookies(new Uri(s.Host + "/soul-product-forms/services/message/message")))
+                res.Add(new[] { ck.Name, ck.Value, ck.Path, ck.Domain });
+            return res;
+        }
+
+        // Lotes com saldo de vários produtos num estoque, pelo relatório Conferência de Lotes
+        // (R_CONF_LOTE — só gera PDF). 20 produtos em ~2 s (28/10/2026). Produto sem saldo não
+        // sai no relatório e fica fora do dicionário.
+        public static async Task<System.Collections.Generic.Dictionary<int, LotesProduto>> LerLotesDoEstoqueAsync(
+            Session s, int estoque, System.Collections.Generic.List<int> produtos)
+        {
+            string url = await GerarConferenciaAsync(s, estoque, produtos);
+            var m = new MorphisClient(s);
+            byte[] pdf = await m.BaixarBytesAsync(url);
+            var res = PdfConferenciaLotes.Interpretar(pdf);
+            Logger.Log("Atender: lotes de " + produtos.Count + " produto(s) no estoque " + estoque + " -> " + res.Count + " com saldo.");
+            return res;
+        }
+
         private static string AcaoBlocoHdr(string block, string item, string task, string acao)
         {
             return "<header><control block=\"" + block + "\" item=\"" + item + "\" task=\"" + task +
