@@ -96,6 +96,31 @@ namespace SoulmvKit.Core
         public string Lote;
         public DateTime? Validade;
         public decimal? Quantidade;
+        public string Kit;               // etiqueta do kit bipado (null = linha comum): lote e quantidade travados
+        public bool KitInteiro;          // o pedido é do próprio produto kit: a linha é 1 kit (Lote = etiqueta)
+    }
+
+    // Um kit produzido na farmácia (etiqueta 2000000...), como a consulta do MV o devolve pelo
+    // código de barras (MorphisClient.LerKitAsync): o kit e os componentes com lote e quantidade —
+    // exatamente as linhas que o MV abre ao bipar a etiqueta na baixa.
+    public class KitBipado
+    {
+        public string Barras = "";
+        public int CdKit;                // produto do kit (ex.: 13490 KIT SONDA VESICAL DE DEMORA)
+        public string Nome = "";
+        public int Estoque;
+        public DateTime? Validade;
+        public List<ComponenteKit> Componentes = new List<ComponenteKit>();
+    }
+
+    public class ComponenteKit
+    {
+        public int Produto;
+        public string Descricao = "";
+        public string Unidade = "";
+        public string Lote = "";
+        public DateTime? Validade;
+        public decimal Quantidade;
     }
 
     // O que o "Preencher automaticamente" fez.
@@ -121,6 +146,7 @@ namespace SoulmvKit.Core
         public bool ForaDoPedido;        // o MV pergunta "não foi solicitado neste pedido" -> Sim
         public bool AMais;               // o produto vai a mais -> "maior que a solicitada" -> Sim
         public decimal Pendente;         // o que faltava atender do PRODUTO na solicitação (0 = fora do pedido)
+        public KitBipado Kit;            // não nulo = bipar esta etiqueta (o MV abre as linhas do kit); o resto não vale
     }
 
     // O que a gravação deu.
@@ -244,6 +270,33 @@ namespace SoulmvKit.Core
         {
             lock (_lotes) _lotes.Clear();
             lock (_produtos) _produtos.Clear();
+            lock (_kitsEmEstoque) _kitsEmEstoque.Clear();
+        }
+
+        // Etiquetas de kit em estoque, pela Consulta de Kits (R_KIT_PROD) de um produto que o kit
+        // tem: a consulta por etiqueta acha também kit já baixado, e o MV só recusa na hora de bipar
+        // ("não foi produzido ou já foi movimentado"). ~1–2 s; vale 2 minutos.
+        private static readonly Dictionary<string, Lido<HashSet<string>>> _kitsEmEstoque = new Dictionary<string, Lido<HashSet<string>>>();
+
+        public static async Task<bool> KitEmEstoqueAsync(Session s, KitBipado kit, int estoque, bool forcar)
+        {
+            if (kit.Componentes.Count == 0) return false;
+            int produto = kit.Componentes[0].Produto;
+            string chave = Chave(estoque, produto);
+            HashSet<string> codigos = null;
+            lock (_kitsEmEstoque)
+            {
+                Lido<HashSet<string>> l;
+                if (!forcar && _kitsEmEstoque.TryGetValue(chave, out l) && (DateTime.Now - l.Quando).TotalMinutes < 2) codigos = l.Valor;
+            }
+            if (codigos == null)
+            {
+                var res = await MorphisClient.ConsultarKitsCompletoAsync(s, estoque, produto);
+                codigos = new HashSet<string>();
+                foreach (var k in res.Kits) foreach (var u in k.Unidades) if (!string.IsNullOrEmpty(u.CodBarras)) codigos.Add(u.CodBarras.Trim());
+                lock (_kitsEmEstoque) { var l = new Lido<HashSet<string>>(); l.Quando = DateTime.Now; l.Valor = codigos; _kitsEmEstoque[chave] = l; }
+            }
+            return codigos.Contains(kit.Barras);
         }
 
         private static string Chave(int estoque, int produto) { return estoque + ":" + produto; }
@@ -334,16 +387,21 @@ namespace SoulmvKit.Core
             var r = new ResultadoPreencher();
             if (sol == null) return r;
 
-            // Produtos na ordem da grade, com as linhas de cada um.
+            // Produtos na ordem da grade, com as linhas de cada um. Linha de kit bipado não é
+            // reaproveitada nem conta como digitada: o que o kit já cobre sai do que falta.
             var ordem = new List<int>();
             var linhasDo = new Dictionary<int, List<int>>();
+            var comunsDo = new Dictionary<int, List<int>>();
+            var doKit = new Dictionary<int, decimal>();
             for (int i = 0; i < linhas.Count; i++)
             {
                 int p = linhas[i].Produto;
                 if (p <= 0) continue;
                 List<int> ls;
-                if (!linhasDo.TryGetValue(p, out ls)) { ls = new List<int>(); linhasDo[p] = ls; ordem.Add(p); }
+                if (!linhasDo.TryGetValue(p, out ls)) { ls = new List<int>(); linhasDo[p] = ls; comunsDo[p] = new List<int>(); ordem.Add(p); }
                 ls.Add(i);
+                if (linhas[i].Kit == null) comunsDo[p].Add(i);
+                else { decimal k; doKit.TryGetValue(p, out k); doKit[p] = k + (linhas[i].Quantidade ?? 0); }
             }
 
             // Quanto de cada lote vai em cada produto (sem mexer na lista ainda).
@@ -353,9 +411,11 @@ namespace SoulmvKit.Core
                 var it = sol.Item(p);
                 if (it == null || it.Pendente <= 0) continue;
                 bool digitado = false;
-                foreach (int i in linhasDo[p])
+                foreach (int i in comunsDo[p])
                     if (linhas[i].Quantidade.HasValue || !string.IsNullOrEmpty(linhas[i].Lote)) digitado = true;
                 if (digitado) { r.JaDigitados++; continue; }
+                decimal cobertoPorKit; doKit.TryGetValue(p, out cobertoPorKit);
+                if (cobertoPorKit >= it.Pendente) continue;
 
                 var lp = lotes(p);
                 var livres = new List<LoteDisponivel>();
@@ -372,7 +432,8 @@ namespace SoulmvKit.Core
                 if (livres.Count == 0) { r.SemSaldo.Add(p); continue; }
 
                 var uso = new List<KeyValuePair<LoteDisponivel, decimal>>();
-                decimal falta = it.Pendente;
+                decimal alvo = it.Pendente - cobertoPorKit;
+                decimal falta = alvo;
                 foreach (var lo in livres)
                 {
                     if (falta <= 0) break;
@@ -383,7 +444,7 @@ namespace SoulmvKit.Core
                 plano[p] = uso;
                 r.Preenchidos++;
                 if (uso.Count > 1) r.ComMaisDeUmLote++;
-                if (falta > 0) r.Parciais.Add(p + " (" + Num(it.Pendente - falta) + " de " + Num(it.Pendente) + ")");
+                if (falta > 0) r.Parciais.Add(p + " (" + Num(alvo - falta) + " de " + Num(alvo) + ")");
             }
 
             // Aplica de baixo para cima: linha inserida não desloca as de produtos acima.
@@ -391,9 +452,10 @@ namespace SoulmvKit.Core
             {
                 List<KeyValuePair<LoteDisponivel, decimal>> uso;
                 if (!plano.TryGetValue(ordem[k], out uso)) continue;
-                var ls = linhasDo[ordem[k]];
-                var modelo = linhas[ls[0]];
-                int depois = ls[ls.Count - 1] + 1;
+                var ls = comunsDo[ordem[k]];
+                var todas = linhasDo[ordem[k]];
+                var modelo = linhas[todas[0]];
+                int depois = todas[todas.Count - 1] + 1;
                 for (int j = 0; j < uso.Count; j++)
                 {
                     LinhaAtender l;
@@ -401,7 +463,7 @@ namespace SoulmvKit.Core
                     else
                     {
                         l = new LinhaAtender();
-                        l.Produto = modelo.Produto; l.Descricao = modelo.Descricao; l.Unidade = modelo.Unidade;
+                        l.Produto = modelo.Produto; l.Descricao = modelo.Descricao; l.Unidade = modelo.Unidade; l.ForaDoPedido = modelo.ForaDoPedido;
                         linhas.Insert(depois++, l);
                     }
                     l.Lote = uso[j].Key.Lote; l.Validade = uso[j].Key.Validade; l.Quantidade = uso[j].Value;
@@ -414,6 +476,74 @@ namespace SoulmvKit.Core
 
         // Saldo do lote que não está montado em kit.
         public static decimal Livre(LoteDisponivel lo) { return lo.Quantidade > lo.EmKit ? lo.Quantidade - lo.EmKit : 0; }
+
+        // ===== KIT BIPADO (etiqueta 2000000...) =====
+        // Pedido do usuário (01/11/2026): bipar a etiqueta do kit num campo ao lado do "Preencher
+        // automaticamente"; os itens do kit entram SOB cada produto, como outro lote, travados.
+        // Dois jeitos de pedir um kit (vistos no MV): o pedido do próprio produto kit (486025: 13490
+        // KIT SONDA VESICAL DE DEMORA) -> UMA linha do kit sob ele (Lote = etiqueta, Atender 1); ou
+        // o pedido dos componentes (485945: seringa, agulha, água...) -> cada componente sob o
+        // produto dele. Componente fora do pedido entra no fim, como fora do pedido. Kit que não
+        // tem nada a ver com a solicitação não entra. null = incluído; senão, o motivo.
+        public static string IncluirKit(SolicitacaoAtender sol, List<LinhaAtender> linhas, KitBipado kit)
+        {
+            if (sol == null || kit == null) return "Nenhuma solicitação aberta.";
+            foreach (var l in linhas) if (l.Kit == kit.Barras) return "Esse kit já foi bipado.";
+            if (kit.Estoque > 0 && sol.Estoque > 0 && kit.Estoque != sol.Estoque) return "Esse kit é de outro estoque.";
+            if (kit.Componentes.Count == 0) return "O MV não trouxe os itens desse kit.";
+
+            var pedidoKit = sol.Item(kit.CdKit);
+            if (pedidoKit != null)
+            {
+                var l = new LinhaAtender();
+                l.Produto = kit.CdKit; l.Descricao = pedidoKit.Descricao; l.Unidade = pedidoKit.Unidade;
+                l.Lote = kit.Barras; l.Validade = kit.Validade; l.Quantidade = 1;
+                l.Kit = kit.Barras; l.KitInteiro = true;
+                linhas.Insert(PosicaoSob(linhas, kit.CdKit), l);
+                return null;
+            }
+            bool algum = false;
+            foreach (var c in kit.Componentes) if (sol.Item(c.Produto) != null) algum = true;
+            if (!algum) return "Esse kit (" + kit.Nome + ") não faz parte desta solicitação.";
+            foreach (var c in kit.Componentes)
+            {
+                var it = sol.Item(c.Produto);
+                var l = new LinhaAtender();
+                l.Produto = c.Produto;
+                l.Descricao = it != null ? it.Descricao : c.Descricao;
+                l.Unidade = it != null ? it.Unidade : c.Unidade;
+                l.Lote = c.Lote; l.Validade = c.Validade; l.Quantidade = c.Quantidade;
+                l.Kit = kit.Barras; l.ForaDoPedido = it == null;
+                linhas.Insert(PosicaoSob(linhas, c.Produto), l);
+            }
+            return null;
+        }
+
+        // Logo abaixo da última linha do produto; sem linha dele, antes da linha vazia do fim.
+        private static int PosicaoSob(List<LinhaAtender> linhas, int produto)
+        {
+            int pos = -1;
+            for (int i = 0; i < linhas.Count; i++) if (linhas[i].Produto == produto) pos = i + 1;
+            if (pos >= 0) return pos;
+            int fim = linhas.Count;
+            if (fim > 0 && linhas[fim - 1].Produto <= 0) fim--;
+            return fim;
+        }
+
+        // Tira todas as linhas de um kit. Devolve quantas saíram.
+        public static int RemoverKit(List<LinhaAtender> linhas, string barras)
+        {
+            return linhas.RemoveAll(delegate(LinhaAtender l) { return l.Kit != null && l.Kit == barras; });
+        }
+
+        // Etiqueta interna do MV (kits e produtos): 13 dígitos começando com 2.
+        public static bool PareceEtiqueta(string codigo)
+        {
+            string c = (codigo ?? "").Trim();
+            if (c.Length < 8 || c.Length > 14 || c[0] != '2') return false;
+            foreach (char ch in c) if (!char.IsDigit(ch)) return false;
+            return true;
+        }
 
         // ===== CONFERÊNCIA ANTES DE FECHAR =====
         // lotes(produto) devolve os lotes lidos (null = não lidos). Linhas sem lote e sem
@@ -435,6 +565,24 @@ namespace SoulmvKit.Core
                 string onde = "Linha " + (i + 1) + (l.Produto > 0 ? " (" + l.Produto + ")" : "") + ": ";
 
                 if (l.Produto <= 0) { Erro(r, i, onde + "escolha o produto (F9)."); continue; }
+                if (temQtd && temLote && l.Kit != null)
+                {
+                    // Linha de kit bipado: lote e saldo o MV confere ao bipar a etiqueta (o saldo
+                    // desses lotes está "em kit"). Conta no atendido do produto como as outras.
+                    // Na conferência o "lote" de item de kit é o kit (fim da etiqueta): é o que o atendente tem na mão.
+                    string nomeLote = "kit " + (l.Kit.Length > 6 ? l.Kit.Substring(l.Kit.Length - 6) : l.Kit);
+                    string chaveKit = l.Produto + "|" + nomeLote;
+                    decimal usadoKit; usadoPorLote.TryGetValue(chaveKit, out usadoKit);
+                    usadoPorLote[chaveKit] = usadoKit + l.Quantidade.Value;
+                    decimal totKit; totalPorProduto.TryGetValue(l.Produto, out totKit);
+                    if (totKit == 0 && sol.Item(l.Produto) == null) foraDoPedido.Add(l);
+                    totalPorProduto[l.Produto] = totKit + l.Quantidade.Value;
+                    List<string> lsKit;
+                    if (!lotesPorProduto.TryGetValue(l.Produto, out lsKit)) { lsKit = new List<string>(); lotesPorProduto[l.Produto] = lsKit; }
+                    if (!lsKit.Contains(nomeLote)) lsKit.Add(nomeLote);
+                    r.Linhas++;
+                    continue;
+                }
                 if (!temQtd) { Erro(r, i, onde + "digite a quantidade a atender."); continue; }
                 if (!temLote) { Erro(r, i, onde + "escolha o lote (F9)."); continue; }
 
@@ -485,12 +633,31 @@ namespace SoulmvKit.Core
         // quantidade. A conferência diz quais produtos vão a mais (o MV pergunta e a aba confirma).
         public static List<LinhaBaixa> LinhasParaGravar(SolicitacaoAtender sol, List<LinhaAtender> linhas, ResumoAtender conferencia)
         {
+            return LinhasParaGravar(sol, linhas, conferencia, null);
+        }
+
+        // kits: as etiquetas bipadas (o que a consulta devolveu). Cada kit vira UMA LinhaBaixa
+        // (bipar a etiqueta), na posição da 1ª linha dele; o MV abre as linhas do kit sozinho.
+        public static List<LinhaBaixa> LinhasParaGravar(SolicitacaoAtender sol, List<LinhaAtender> linhas, ResumoAtender conferencia,
+            Dictionary<string, KitBipado> kits)
+        {
             var aMais = new HashSet<int>();
             foreach (var it in conferencia.Itens) if (it.Situacao == SituacaoConferida.AMais) aMais.Add(it.Produto);
             var res = new List<LinhaBaixa>();
+            var kitsVistos = new HashSet<string>();
             for (int i = 0; i < linhas.Count; i++)
             {
                 var l = linhas[i];
+                if (l.Kit != null)
+                {
+                    KitBipado kit;
+                    if (!kitsVistos.Add(l.Kit)) continue;
+                    if (kits == null || !kits.TryGetValue(l.Kit, out kit)) throw new InvalidOperationException("O kit " + l.Kit + " da linha " + (i + 1) + " não foi lido.");
+                    var bk = new LinhaBaixa();
+                    bk.Indice = i; bk.Kit = kit; bk.Produto = kit.CdKit; bk.Descricao = kit.Nome; bk.Lote = kit.Barras; bk.Quantidade = 1;
+                    res.Add(bk);
+                    continue;
+                }
                 if (l.Produto <= 0 || !l.Quantidade.HasValue || l.Quantidade.Value <= 0 || string.IsNullOrEmpty((l.Lote ?? "").Trim())) continue;
                 var b = new LinhaBaixa();
                 b.Indice = i; b.Produto = l.Produto; b.Descricao = l.Descricao ?? ""; b.Unidade = l.Unidade ?? "";
@@ -514,6 +681,17 @@ namespace SoulmvKit.Core
         // lancado e pendente: por produto, das linhas lançadas (LinhaBaixa.Quantidade/Pendente).
         public static string ConferirQuadro(List<MorphisRecord> quadro, Dictionary<int, decimal> lancado, Dictionary<int, decimal> pendente)
         {
+            return ConferirQuadro(quadro, lancado, pendente, null);
+        }
+
+        // porKit: o que os kits bipados lançaram de cada componente. No quadro o MV NÃO conta o
+        // que veio por kit (01/11/2026: no HAR da 485945 e no teste da 486025 todos os componentes
+        // do kit apareceram com 0 atendido; depois do OK a 485945 ficou confirmada). Aceita também a
+        // conta com o kit, se um dia o MV passar a mostrá-lo.
+        public static string ConferirQuadro(List<MorphisRecord> quadro, Dictionary<int, decimal> lancado, Dictionary<int, decimal> pendente,
+            Dictionary<int, decimal> porKit)
+        {
+            if (porKit == null) porKit = new Dictionary<int, decimal>();
             var diferenca = new Dictionary<int, decimal>();
             var atendido = new Dictionary<int, decimal>();
             foreach (var rq in quadro)
@@ -527,14 +705,18 @@ namespace SoulmvKit.Core
                 decimal a; atendido.TryGetValue(cod, out a); atendido[cod] = a + qa.Value;
             }
             foreach (var kv in atendido)
-                if (!lancado.ContainsKey(kv.Key) && kv.Value != 0)
+            {
+                decimal k; porKit.TryGetValue(kv.Key, out k);
+                if (!lancado.ContainsKey(kv.Key) && kv.Value != 0 && kv.Value != k)
                     return "o MV mostra " + Num(kv.Value) + " atendido(s) do produto " + kv.Key + ", que a baixa não lançou";
+            }
             foreach (var kv in lancado)
             {
                 decimal p; pendente.TryGetValue(kv.Key, out p);
                 decimal d; diferenca.TryGetValue(kv.Key, out d);
+                decimal k; porKit.TryGetValue(kv.Key, out k);
                 decimal esperado = p - kv.Value;
-                if (d != esperado)
+                if (d != esperado && !(k > 0 && d == esperado - k))
                     return "no produto " + kv.Key + " o MV mostra diferença de " + Num(d) + " e a baixa esperava " + Num(esperado) +
                         " (pendente " + Num(p) + ", lançado " + Num(kv.Value) + ")";
             }

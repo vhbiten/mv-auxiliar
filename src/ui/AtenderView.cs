@@ -61,9 +61,12 @@ namespace SoulmvKit.UI
         private IconButton btnExcluir, btnLimpar;
         private PrimaryButton btnFechar;
         private PrimaryButton btnPreencher;
+        private TextBox txtBarras;                      // etiqueta de kit (ao lado do "Preencher automaticamente")
+        private FieldHost hostBarras;
 
         private SolicitacaoAtender _sol;
         private readonly List<LinhaAtender> _linhas = new List<LinhaAtender>();
+        private readonly Dictionary<string, KitBipado> _kits = new Dictionary<string, KitBipado>();   // etiqueta -> kit lido
         private readonly Dictionary<int, LotesProduto> _lotes = new Dictionary<int, LotesProduto>();
         private bool _ocupado;                          // lendo a solicitação/lotes no MV
         private bool _buscando;                         // F9 esperando lotes ou produtos
@@ -723,9 +726,10 @@ namespace SoulmvKit.UI
 
             var tl = new TableLayoutPanel();
             tl.Dock = DockStyle.Fill; tl.AutoSize = true; tl.BackColor = Theme.CardBg;
-            tl.ColumnCount = 4; tl.RowCount = 1;
+            tl.ColumnCount = 5; tl.RowCount = 1;
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -743,6 +747,27 @@ namespace SoulmvKit.UI
             lblDica.Margin = new Padding(Theme.S(12), 0, Theme.S(12), 0);
             tl.Controls.Add(lblDica, 1, 0);
 
+            // Etiqueta de kit (pedido do usuário, 01/11/2026: "um campo ao lado de 'Preencher
+            // automaticamente'"): bipa e tecla Enter (o leitor já manda o Enter); o cursor fica aqui
+            // para o próximo kit.
+            hostBarras = new FieldHost();
+            hostBarras.Width = Theme.S(190); hostBarras.Height = Theme.S(30);
+            hostBarras.Padding = new Padding(Theme.S(8), Theme.S(6), Theme.S(6), Theme.S(4));
+            hostBarras.Margin = new Padding(0, 0, Theme.S(10), 0);
+            txtBarras = new TextBox();
+            txtBarras.BorderStyle = BorderStyle.None;
+            txtBarras.Font = new Font("Segoe UI", 10f); txtBarras.ForeColor = Theme.TextDark; txtBarras.BackColor = Color.White;
+            txtBarras.Dock = DockStyle.Fill;
+            txtBarras.KeyDown += new KeyEventHandler(delegate(object s, KeyEventArgs ke)
+            {
+                if (ke.KeyCode == Keys.Enter) { ke.SuppressKeyPress = true; BiparEtiqueta(); }
+            });
+            txtBarras.HandleCreated += new EventHandler(delegate { SendMessage(txtBarras.Handle, 0x1501, (IntPtr)1, "Código de barras"); });
+            txtBarras.Enter += new EventHandler(delegate { AtualizarDica(); });
+            hostBarras.Controls.Add(txtBarras);
+            new ToolTip().SetToolTip(txtBarras, "Etiqueta do kit (2000000...): os itens do kit entram na tabela com lote e quantidade.");
+            tl.Controls.Add(hostBarras, 2, 0);
+
             // Secundário (contorno), à esquerda do "Fechar a Baixa": não grava nada.
             btnPreencher = new PrimaryButton();
             btnPreencher.Ghost = true;
@@ -752,7 +777,7 @@ namespace SoulmvKit.UI
             btnPreencher.Margin = new Padding(0, 0, Theme.S(10), 0);
             btnPreencher.Click += new EventHandler(delegate { PreencherAutomaticamente(); });
             new ToolTip().SetToolTip(btnPreencher, "Preenche lote e quantidade dos itens ainda sem digitação: lote de maior saldo fora de kit; se não bastar, completa com o próximo.");
-            tl.Controls.Add(btnPreencher, 2, 0);
+            tl.Controls.Add(btnPreencher, 3, 0);
 
             btnFechar = new PrimaryButton();
             btnFechar.Text = "Fechar a Baixa";
@@ -760,7 +785,7 @@ namespace SoulmvKit.UI
             btnFechar.Margin = new Padding(0);
             btnFechar.Click += new EventHandler(delegate { FecharBaixa(); });
             new ToolTip().SetToolTip(btnFechar, "F12 — confere lotes e quantidades e fecha a baixa no MV.");
-            tl.Controls.Add(btnFechar, 3, 0);
+            tl.Controls.Add(btnFechar, 4, 0);
 
             card.Controls.Add(tl);
             return card;
@@ -777,11 +802,14 @@ namespace SoulmvKit.UI
             else if (_sol == null) dica = _preview ? "Pré-visualização: sem consultar o MV." : "Bipe ou digite o nº da solicitação e tecle Enter.";
             else if (_gravacaoIncerta) dica = "Confira a solicitação no MV antes de tentar de novo.";
             else if (!Atendivel()) dica = "Solicitação aberta só para consulta.";
+            else if (txtBarras != null && txtBarras.Focused) dica = "Bipe a etiqueta do kit.";
             else if (cc == null || !naGrade) dica = "F12 confere e fecha a baixa.";
             else
             {
                 bool vazia = cc.RowIndex >= 0 && cc.RowIndex < _linhas.Count && _linhas[cc.RowIndex].Produto <= 0;
-                if (vazia) dica = cc.ColumnIndex == CProduto ? "Produto: F9 mostra os produtos do estoque (ou digite o código)." : "Para incluir um produto, vá à coluna Produto e tecle F9.";
+                string kit = cc.RowIndex >= 0 && cc.RowIndex < _linhas.Count ? _linhas[cc.RowIndex].Kit : null;
+                if (kit != null) dica = "Item de kit · Del tira o kit inteiro.";
+                else if (vazia) dica = cc.ColumnIndex == CProduto ? "Produto: F9 mostra os produtos do estoque (ou digite o código)." : "Para incluir um produto, vá à coluna Produto e tecle F9.";
                 else if (cc.ColumnIndex == CLote) dica = "Lote: F9 mostra os lotes do produto · Enter vai para Atender.";
                 else if (cc.ColumnIndex == CAtender) dica = "Atender: digite a quantidade · Enter vai para a linha de baixo · Shift+Tab volta.";
                 else dica = "Enter vai para o Lote · Del exclui a linha · F12 fecha a baixa.";
@@ -1022,6 +1050,7 @@ namespace SoulmvKit.UI
         private void MontarLinhas()
         {
             _linhas.Clear();
+            _kits.Clear();
             bool jaAtendido = false;
             if (_sol != null)
                 foreach (var it in _sol.Itens)
@@ -1130,6 +1159,20 @@ namespace SoulmvKit.UI
                 }
                 return;
             }
+            // Linha de kit: lote e quantidade vêm da etiqueta (o saldo desses lotes está "em kit";
+            // o MV confere ao bipar). Só a validade ganha a cor de vencimento.
+            if (l.Kit != null)
+            {
+                // Espaço do selo "kit" no fim da Descrição: o nome comprido corta antes dele.
+                if (e.ColumnIndex == CDescricao) { var pd = e.CellStyle.Padding; e.CellStyle.Padding = new Padding(pd.Left, pd.Top, Theme.S(48), pd.Bottom); }
+                if (e.ColumnIndex == CDescricao || e.ColumnIndex == CLote || e.ColumnIndex == CAtender || e.ColumnIndex == CProduto)
+                {
+                    KitBipado kb;
+                    cel.ToolTipText = (_kits.TryGetValue(l.Kit, out kb) ? kb.Nome : "Kit") + " · etiqueta " + l.Kit +
+                        (l.ForaDoPedido ? " · produto fora do pedido" : "");
+                }
+                if (e.ColumnIndex != CValidade || !l.Validade.HasValue) return;
+            }
             // Produto fora do pedido aparece igual aos outros (Solicitado em branco); a conferência
             // do F12 mostra a situação.
             if ((e.ColumnIndex == CDescricao || e.ColumnIndex == CProduto) && l.ForaDoPedido)
@@ -1184,11 +1227,20 @@ namespace SoulmvKit.UI
         private void OnPintar(object sender, DataGridViewCellPaintingEventArgs e)
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            // Item de kit: selo "kit" no fim da Descrição (em qualquer linha, atual ou não).
+            bool seloKit = e.ColumnIndex == CDescricao && e.RowIndex < _linhas.Count && _linhas[e.RowIndex].Kit != null;
             var cc = grid.CurrentCell;
-            if (cc == null || cc.RowIndex != e.RowIndex) return;
-            bool celula = cc.ColumnIndex == e.ColumnIndex;
-            bool primeira = e.ColumnIndex == PrimeiraColunaVisivel();
-            if (!celula && !primeira) return;
+            bool atual = cc != null && cc.RowIndex == e.RowIndex;
+            bool celula = atual && cc.ColumnIndex == e.ColumnIndex;
+            bool primeira = atual && e.ColumnIndex == PrimeiraColunaVisivel();
+            if (!celula && !primeira && !seloKit) return;
+            if (!celula && !primeira)
+            {
+                e.Paint(e.ClipBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.Focus);
+                DesenharSeloKit(e.Graphics, e.CellBounds);
+                e.Handled = true;
+                return;
+            }
             bool foco = grid.ContainsFocus;
             Color cor = foco ? Theme.Primary : Theme.Border;
 
@@ -1203,7 +1255,29 @@ namespace SoulmvKit.UI
             else e.Paint(e.ClipBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.Focus);
             if (primeira)
                 using (var b = new SolidBrush(cor)) e.Graphics.FillRectangle(b, e.CellBounds.X, e.CellBounds.Y, Theme.S(4), e.CellBounds.Height - 1);
+            if (seloKit) DesenharSeloKit(e.Graphics, e.CellBounds);
             e.Handled = true;
+        }
+
+        // Pílula "kit" encostada à direita da célula (a Descrição é larga; o texto fica à esquerda).
+        private static void DesenharSeloKit(Graphics g, Rectangle celula)
+        {
+            const string texto = "kit";
+            Size t = TextRenderer.MeasureText(g, texto, FonteSelo, Size.Empty, TextFormatFlags.NoPadding);
+            int h = Math.Min(celula.Height - Theme.S(8), t.Height + Theme.S(4));
+            int w = t.Width + Theme.S(14);
+            var r = new Rectangle(celula.Right - w - Theme.S(8), celula.Y + (celula.Height - h) / 2, w, h);
+            var modo = g.SmoothingMode;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var path = Theme.RoundedRect(r, h / 2))
+            using (var b = new SolidBrush(Theme.InfoBg))
+            using (var p = new Pen(Theme.BorderSoft))
+            {
+                g.FillPath(b, path);
+                g.DrawPath(p, path);
+            }
+            g.SmoothingMode = modo;
+            TextRenderer.DrawText(g, texto, FonteSelo, r, Theme.Primary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
         private int PrimeiraColunaVisivel()
@@ -1216,6 +1290,7 @@ namespace SoulmvKit.UI
         {
             if (!Atendivel() || _ocupado || linha < 0 || linha >= _linhas.Count) return false;
             if (_linhas[linha].Produto <= 0) return coluna == CProduto;
+            if (_linhas[linha].Kit != null) return false;   // item de kit: travado (Del tira o kit)
             return coluna == CLote || coluna == CAtender;
         }
 
@@ -1334,6 +1409,7 @@ namespace SoulmvKit.UI
         {
             if (!Atendivel() || _ocupado || _buscando) return;
             if (linha < 0 || linha >= _linhas.Count) return;
+            if (_linhas[linha].Kit != null) return;   // lote do kit não se troca
             bool vazia = _linhas[linha].Produto <= 0;
             bool lotes = !vazia && coluna == CLote;
             bool produtos = vazia && (coluna == CProduto || (clique && coluna == CDescricao));
@@ -1363,7 +1439,8 @@ namespace SoulmvKit.UI
 
             if (lp.Lotes.Count == 0)
             {
-                avisos.SetState(StatusKind.Warning, l.Produto + " " + l.Descricao + " não tem lote com saldo em " + _sol.DsEstoque + ".");
+                avisos.SetState(StatusKind.Warning, l.Produto + " " + l.Descricao + " não tem lote com saldo em " + _sol.DsEstoque +
+                    ". Se for kit, bipe a etiqueta no campo Código de barras.");
                 return;
             }
             var linhas = new List<string[]>();
@@ -1479,6 +1556,98 @@ namespace SoulmvKit.UI
             avisos.SetState(StatusKind.Info, "Itens preenchidos. Confira antes de fechar a baixa.");
         }
 
+        // ===== ETIQUETA DE KIT =====
+        // Lê o kit pela etiqueta (consulta do MV, só leitura), confere se ainda está em estoque e
+        // põe os itens sob os produtos da solicitação (AtenderSolicitacao.IncluirKit). Não grava:
+        // o "Fechar a Baixa" bipa a etiqueta no MV antes das outras linhas.
+        private async void BiparEtiqueta()
+        {
+            string cod = (txtBarras.Text ?? "").Trim();
+            if (cod.Length == 0) return;
+            if (_sol == null) { avisos.SetState(StatusKind.Warning, "Abra a solicitação antes de bipar o kit."); return; }
+            if (!Atendivel() || _ocupado || _buscando || CarregandoAgora) return;
+            Tocar();
+            if (grid.IsCurrentCellInEditMode) grid.EndEdit();
+            txtBarras.SelectAll();
+            if (!AtenderSolicitacao.PareceEtiqueta(cod)) { avisos.SetState(StatusKind.Warning, "\"" + cod + "\" não é um código de barras de etiqueta."); return; }
+            foreach (var l in _linhas) if (l.Kit == cod) { avisos.SetState(StatusKind.Warning, "Esse kit já foi bipado."); return; }
+
+            long numero = _sol.Numero;
+            KitBipado kit = null;
+            bool emEstoque = false;
+            bool tenho = false;
+            avisos.SetState(StatusKind.Busy, "Lendo a etiqueta " + cod + "...");
+            _buscando = true; AtualizarBotoes();
+            try
+            {
+                if (_preview) { await Task.Delay(300); kit = KitDeExemplo(cod); emEstoque = kit != null && cod != "2000000000002"; }
+                else
+                {
+                    tenho = await MvGate.EntrarAsync("atender-kit", 30000);
+                    if (IsDisposed) return;
+                    if (!tenho) { avisos.SetState(StatusKind.Warning, "O MV está respondendo outra consulta. Bipe de novo em instantes."); return; }
+                    kit = await MorphisClient.LerKitAsync(_host.Session, cod);
+                    if (kit != null && !IsDisposed && _sol != null) emEstoque = await AtenderSolicitacao.KitEmEstoqueAsync(_host.Session, kit, _sol.Estoque, false);
+                }
+            }
+            catch (SessaoExpiradaException) { if (!IsDisposed) _host.SessaoExpirou(); return; }
+            catch (Exception ex)
+            {
+                Logger.Log("Atender: etiqueta " + cod + " não lida: " + ex.Message);
+                if (!IsDisposed) avisos.SetState(StatusKind.Error, "Não foi possível ler a etiqueta: " + ex.Message);
+                return;
+            }
+            finally
+            {
+                if (tenho) MvGate.Sair();
+                _buscando = false;
+                if (!IsDisposed) AtualizarBotoes();
+            }
+            if (IsDisposed || _sol == null || _sol.Numero != numero) return;
+            if (kit == null) { avisos.SetState(StatusKind.Warning, "O código " + cod + " não é etiqueta de kit."); return; }
+            if (!emEstoque)
+            {
+                Logger.Log("Atender: kit " + cod + " fora da Consulta de Kits do estoque " + _sol.Estoque + ".");
+                avisos.SetState(StatusKind.Warning, "Esse kit não está mais em estoque (já foi baixado?).");
+                return;
+            }
+            string erro = AtenderSolicitacao.IncluirKit(_sol, _linhas, kit);
+            if (erro != null) { avisos.SetState(StatusKind.Warning, erro); return; }
+            _kits[kit.Barras] = kit;
+            Logger.Log("Atender: kit " + cod + " (" + kit.CdKit + " " + kit.Nome + ") incluído na " + _sol.Numero + ".");
+            Renderizar();
+            int primeira = _linhas.FindIndex(delegate(LinhaAtender l) { return l.Kit == kit.Barras; });
+            if (primeira >= 0)
+            {
+                _montando = true;
+                try { grid.CurrentCell = grid.Rows[primeira].Cells[CLote]; } catch { }
+                _montando = false;
+            }
+            txtBarras.Text = "";
+            txtBarras.Focus();   // pronto para o próximo kit
+            avisos.SetState(StatusKind.Info, "Kit incluído.");
+        }
+
+        // Pré-visualização: 2000000000001 = kit de exemplo com 2 itens da 484416; 2000000000002 = já baixado.
+        private KitBipado KitDeExemplo(string cod)
+        {
+            if (cod != "2000000000001" && cod != "2000000000002") return null;
+            var k = new KitBipado();
+            k.Barras = cod; k.CdKit = 99999; k.Nome = "KIT DE EXEMPLO"; k.Estoque = _sol != null ? _sol.Estoque : 0; k.Validade = DateTime.Today.AddYears(2);
+            int n = 0;
+            if (_sol != null)
+                foreach (var it in _sol.Itens)
+                {
+                    if (n == 2) break;
+                    var c = new ComponenteKit();
+                    c.Produto = it.Produto; c.Descricao = it.Descricao; c.Unidade = it.Unidade;
+                    c.Lote = "KIT-L" + (n + 1); c.Validade = DateTime.Today.AddYears(1); c.Quantidade = 1;
+                    k.Componentes.Add(c);
+                    n++;
+                }
+            return k;
+        }
+
         // ===== EXCLUIR, LIMPAR =====
         private void ExcluirLinha()
         {
@@ -1489,6 +1658,17 @@ namespace SoulmvKit.UI
             var l = _linhas[r];
             if (l.Produto <= 0) return;   // a linha vazia do fim fica
             if (grid.IsCurrentCellInEditMode) grid.CancelEdit();
+            if (l.Kit != null)
+            {
+                // Item de kit: sai o kit inteiro (o MV não baixa meio kit).
+                string barras = l.Kit;
+                AtenderSolicitacao.RemoverKit(_linhas, barras);
+                _kits.Remove(barras);
+                Renderizar();
+                IrPara(Math.Min(r, _linhas.Count - 1), CLote, false);
+                avisos.SetState(StatusKind.Info, "Kit " + barras + " retirado.");
+                return;
+            }
             _linhas.RemoveAt(r);
             _montando = true;
             grid.Rows.RemoveAt(r);
@@ -1526,6 +1706,7 @@ namespace SoulmvKit.UI
             _sol = null;
             _reserva = EstadoReserva.Nenhuma; _reservando = false; _avisouInatividade = false; _gravacaoIncerta = false;
             _linhas.Clear();
+            _kits.Clear();
             _lotes.Clear();
             MostrarCabecalho();
             Renderizar();
@@ -1582,7 +1763,7 @@ namespace SoulmvKit.UI
         // reenvio até a solicitação ser aberta de novo.
         private async void Gravar(ResumoAtender conferencia)
         {
-            var linhas = AtenderSolicitacao.LinhasParaGravar(_sol, _linhas, conferencia);
+            var linhas = AtenderSolicitacao.LinhasParaGravar(_sol, _linhas, conferencia, _kits);
             if (linhas.Count == 0) return;
             long numero = _sol.Numero;
             decimal atendidoAntes = 0;
@@ -1765,6 +1946,8 @@ namespace SoulmvKit.UI
         {
             bool pode = Atendivel() && !_ocupado && !_buscando && !CarregandoAgora;
             btnExcluir.Enabled = pode; btnFechar.Enabled = pode; btnPreencher.Enabled = pode;
+            // O campo da etiqueta não apaga enquanto o kit é lido: o cursor fica nele para o próximo.
+            if (txtBarras != null) txtBarras.Enabled = Atendivel() && !_ocupado && !CarregandoAgora;
             btnLimpar.Enabled = !_ocupado;
             btnAbrir.Enabled = !_ocupado;
             txtNumero.Enabled = !_ocupado;

@@ -1051,6 +1051,65 @@ namespace SoulmvKit.Core
             return it + mv;
         }
 
+        // ===== KIT PELO CÓDIGO DE BARRAS (M_PRODUZIR_KIT em modo CONSULTA) — READ-ONLY =====
+        // Os passos 1–3 da reimpressão (SEARCH -> GOTOITEM DSP_CD_BARRAS -> EXECUTE_QUERY), sem
+        // o "Imprimir etiqueta": devolve o kit (CD_KIT, DS_KIT, estoque, validade) e os itens da
+        // produção (produto, lote, validade, quantidade) — as mesmas linhas que o MV abre ao bipar a
+        // etiqueta na baixa (conferido em 01/11/2026 com 2000000218120 e 2000000219271). A consulta
+        // acha também kit já baixado: quem chama confere o estoque (KitsEmEstoqueAsync).
+        // null = o código não é de kit.
+        public static async Task<KitBipado> LerKitAsync(Session s, string codBarras)
+        {
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            await m.CallFormAsync("M_PRODUZIR_KIT", "MV.12.01.01.06.01.#");
+            string searchAct = "<action name=\"SEARCH\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            var rSearch = await m.PostAsync(m.Msg("MVTO_ESTOQUE", "CD_ESTOQUE", searchAct, ""));
+            string mvtoRec = SelectedOf(rSearch, "MVTO_ESTOQUE");
+            string itRec = SelectedOf(rSearch, "ITMVTO_ESTOQUE");
+            if (mvtoRec == null) throw new Exception("A consulta de kits do MV não entrou em modo de pesquisa.");
+            string gotoAct = "<action block=\"MVTO_ESTOQUE\" item=\"CD_MVTO_ESTOQUE\" name=\"PROC:GOTOITEM\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\">" +
+                Param("previousItem", "CD_MVTO_ESTOQUE") + Param("previousBlock", "MVTO_ESTOQUE") + Param("previousRecord", mvtoRec) +
+                Param("item", "DSP_CD_BARRAS") + Param("block", "MVTO_ESTOQUE") + Param("record", mvtoRec) +
+                Param("actionValue", "") + Param("fireItemAction", "") + "</action>";
+            await m.PostAsync(m.Msg("MVTO_ESTOQUE", "CD_MVTO_ESTOQUE", gotoAct, m.ReimpQueryBody(itRec, mvtoRec, null)));
+            string execAct = "<action name=\"EXECUTE_QUERY\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action>";
+            var r = await m.PostAsync(m.Msg("MVTO_ESTOQUE", "DSP_CD_BARRAS", execAct, m.ReimpQueryBody(itRec, mvtoRec, codBarras)));
+
+            KitBipado kit = null;
+            var cab = r.Block_("MVTO_ESTOQUE");
+            if (cab != null)
+                foreach (var rec in cab.Records)
+                {
+                    int cd;
+                    if (!int.TryParse(SemNulo(rec.Get("CD_KIT")), out cd) || cd <= 0) continue;
+                    if (SemNulo(rec.Get("DSP_CD_BARRAS")) != codBarras.Trim()) continue;
+                    kit = new KitBipado();
+                    kit.Barras = codBarras.Trim(); kit.CdKit = cd; kit.Nome = SemNulo(rec.Get("DS_KIT"));
+                    int est; if (int.TryParse(SemNulo(rec.Get("CD_ESTOQUE")), out est)) kit.Estoque = est;
+                    DateTime v; if (DataHoraMv(rec.Get("DT_VALIDADE"), out v)) kit.Validade = v.Date;
+                    break;
+                }
+            if (kit == null) { Logger.Log("Kit: " + codBarras + " não é etiqueta de kit."); return null; }
+            var itens = r.Block_("ITMVTO_ESTOQUE");
+            if (itens != null)
+                foreach (var rec in itens.Records)
+                {
+                    int cod;
+                    if (!int.TryParse(SemNulo(rec.Get("CD_PRODUTO")), out cod) || cod <= 0) continue;
+                    var c = new ComponenteKit();
+                    c.Produto = cod;
+                    c.Descricao = SemNulo(rec.Get("DSP_DS_PRODUTO"));
+                    c.Unidade = SemNulo(rec.Get("DSP_DS_UNIDADE"));
+                    c.Lote = SemNulo(rec.Get("CD_LOTE"));
+                    DateTime v; if (DataHoraMv(rec.Get("DT_VALIDADE"), out v)) c.Validade = v.Date;
+                    var q = AtenderSolicitacao.LerNumero(SemNulo(rec.Get("QT_MOVIMENTACAO"))); c.Quantidade = q.HasValue ? q.Value : 0;
+                    kit.Componentes.Add(c);
+                }
+            Logger.Log("Kit: " + codBarras + " = " + kit.CdKit + " " + kit.Nome + " (estoque " + kit.Estoque + ", " + kit.Componentes.Count + " itens).");
+            return kit;
+        }
+
         // Alto nível: reimprime a etiqueta de um kit pelo código de barras (devolve o ZPL).
         public static async Task<EtiquetaZpl> GerarReimpressaoAsync(Session s, string codBarras)
         {
@@ -1684,20 +1743,58 @@ namespace SoulmvKit.Core
             var res = new ResultadoBaixa();
             var totais = new System.Collections.Generic.Dictionary<int, decimal>();
             var pendentes = new System.Collections.Generic.Dictionary<int, decimal>();
+            var porKit = new System.Collections.Generic.Dictionary<int, decimal>();
             var usoLote = new System.Collections.Generic.Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+            var kits = new System.Collections.Generic.List<LinhaBaixa>();
+            var comuns = new System.Collections.Generic.List<LinhaBaixa>();
+            foreach (var l in linhas) { if (l.Kit != null) kits.Add(l); else comuns.Add(l); }
+            linhas = comuns;
             foreach (var l in linhas)
             {
                 decimal t; totais.TryGetValue(l.Produto, out t); totais[l.Produto] = t + l.Quantidade;
                 pendentes[l.Produto] = l.Pendente;
             }
+            foreach (var k in kits)
+                foreach (var c in k.Kit.Componentes) { decimal t; porKit.TryGetValue(c.Produto, out t); porKit[c.Produto] = t + c.Quantidade; }
+
+            MorphisResponse r;
+            // Kits: a etiqueta vai no campo de código de barras automático (o modo em que a tela
+            // abre), como no MV (HAR atendendo-kits, 01/11/2026): NEXT_ITEM em
+            // ITMVTO_ESTOQUE_AUTO_CTRL.DSP_CODIGO_DE_BARRAS_AUTO -> o MV abre uma linha por item
+            // do kit, com DSP_CODIGO_DE_BARRAS = etiqueta. Kit já baixado -> aviso "não foi
+            // produzido ou já foi movimentado"; código desconhecido -> nada (por isso confere as linhas).
+            for (int i = 0; i < kits.Count; i++)
+            {
+                var k = kits[i];
+                if (progresso != null) progresso("Bipando o kit " + (i + 1) + " de " + kits.Count + ": " + k.Kit.Barras + " " + k.Kit.Nome);
+                string corpo = "<block name=\"ITMVTO_ESTOQUE_AUTO_CTRL\"><record status=\"C\" id=\"\"><item name=\"DSP_CODIGO_DE_BARRAS_AUTO\">" + Xml(k.Kit.Barras) + "</item></record></block>";
+                r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
+                    AcaoXml("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO", "NEXT_ITEM", true), corpo));
+                if (r.Command("SESSION_END") != null) return Falha(res, -1, "A sessão do MV que segurava a reserva acabou. Abra a solicitação de novo.");
+                if ((r.Raw ?? "").IndexOf("WIN_PRINCIPAL1_2", StringComparison.Ordinal) < 0)
+                    return Falha(res, -1, "A tela de lançamento do MV não está aberta (a reserva pode ter caído). Abra a solicitação de novo.");
+                if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, k.Indice, "O MV recusou o kit " + k.Kit.Barras);
+                string dif = ConferirLinhasDoKit(r, k.Kit);
+                if (dif != null) return Falha(res, k.Indice, "O kit " + k.Kit.Barras + " abriu no MV diferente do lido: " + dif + ". Atenda esta solicitação pelo MV.");
+                Logger.Log("Baixa: kit " + k.Kit.Barras + " (" + k.Kit.CdKit + ") bipado — " + k.Kit.Componentes.Count + " itens conferidos.");
+            }
 
             // Digitação por código
-            var r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
+            r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
                 AcaoXml("MVTO_ESTOQUE", "BTN_CD_PRODUTO", "btnCdProduto_click", true), ""));
             if (r.Command("SESSION_END") != null) return Falha(res, -1, "A sessão do MV que segurava a reserva acabou. Abra a solicitação de novo.");
             if ((r.Raw ?? "").IndexOf("WIN_PRINCIPAL1_2", StringComparison.Ordinal) < 0)
                 return Falha(res, -1, "A tela de lançamento do MV não está aberta (a reserva pode ter caído). Abra a solicitação de novo.");
             if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, -1, "O MV não liberou a digitação por código");
+            if (kits.Count > 0)
+            {
+                // A troca de modo não pode ter mexido nas linhas dos kits.
+                foreach (var k in kits)
+                {
+                    string dif = ConferirLinhasDoKit(r, k.Kit);
+                    if (dif != null) return Falha(res, k.Indice, "O kit " + k.Kit.Barras + " mudou no MV: " + dif + ".");
+                }
+            }
             string rec = SelecionadoItens(r);
             if (rec == null) return Falha(res, -1, "O MV não abriu a primeira linha do lançamento.");
 
@@ -1802,7 +1899,7 @@ namespace SoulmvKit.Core
             try
             {
                 r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_PRODUTO", AcaoXml("ITMVTO_ESTOQUE", "BTN_FECHAR_SOLICITACAO", "btnFecharSolicitacao_click", true), ""));
-                return await m.ConcluirFechamentoAsync(r, res, totais, pendentes);
+                return await m.ConcluirFechamentoAsync(r, res, totais, pendentes, porKit);
             }
             catch (Exception ex)
             {
@@ -1816,8 +1913,15 @@ namespace SoulmvKit.Core
         // Depois do btnFecharSolicitacao_click: quadro de divergência (se houver) -> sucesso ->
         // pergunta de impressão (Não) -> tela de etiquetas (Sair). Separado para testar com as
         // respostas guardadas dos HARs.
-        public async Task<ResultadoBaixa> ConcluirFechamentoAsync(MorphisResponse r, ResultadoBaixa res,
+        public Task<ResultadoBaixa> ConcluirFechamentoAsync(MorphisResponse r, ResultadoBaixa res,
             System.Collections.Generic.Dictionary<int, decimal> totais, System.Collections.Generic.Dictionary<int, decimal> pendentes)
+        {
+            return ConcluirFechamentoAsync(r, res, totais, pendentes, null);
+        }
+
+        public async Task<ResultadoBaixa> ConcluirFechamentoAsync(MorphisResponse r, ResultadoBaixa res,
+            System.Collections.Generic.Dictionary<int, decimal> totais, System.Collections.Generic.Dictionary<int, decimal> pendentes,
+            System.Collections.Generic.Dictionary<int, decimal> porKit)
         {
             res.AntesDoFechar = false;
             var quadro = r.Block_("PRODUTOS_CONFIRMADOS");
@@ -1825,7 +1929,7 @@ namespace SoulmvKit.Core
             {
                 // O quadro tem que bater com o que foi lançado; senão, não confirma: "Reabrir
                 // Baixa" volta ao lançamento sem gravar e quem chama faz o Retornar.
-                string problema = AtenderSolicitacao.ConferirQuadro(quadro.Records, totais, pendentes);
+                string problema = AtenderSolicitacao.ConferirQuadro(quadro.Records, totais, pendentes, porKit);
                 if (problema != null)
                 {
                     Logger.Log("Baixa: o quadro de divergência não bate com a baixa: " + problema + ". Quadro: " + DescreverQuadro(quadro));
@@ -1906,9 +2010,36 @@ namespace SoulmvKit.Core
             return voltou;
         }
 
+        // Com kit bipado, o MV volta com o foco no campo de código de barras automático
+        // (ITMVTO_ESTOQUE_AUTO_CTRL; teste da 486025, 01/11/2026); sem kit, na linha (ITMVTO_ESTOQUE).
         public static bool VoltouAoLancamento(MorphisResponse r)
         {
-            return r != null && r.IsOk && string.Equals(r.Block, "ITMVTO_ESTOQUE", StringComparison.OrdinalIgnoreCase);
+            return r != null && r.IsOk && r.Command("SHOW_ALERT") == null &&
+                (string.Equals(r.Block, "ITMVTO_ESTOQUE", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(r.Block, "ITMVTO_ESTOQUE_AUTO_CTRL", StringComparison.OrdinalIgnoreCase));
+        }
+
+        // As linhas que o MV abriu com a etiqueta (DSP_CODIGO_DE_BARRAS) têm que ser os itens do
+        // kit lido na consulta: mesmo produto, lote e quantidade. null = bate; senão, a diferença.
+        public static string ConferirLinhasDoKit(MorphisResponse r, KitBipado kit)
+        {
+            var b = r.Block_("ITMVTO_ESTOQUE");
+            if (b == null) return "o MV não mostrou as linhas";
+            var noMv = new System.Collections.Generic.List<string>();
+            foreach (var rec in b.Records)
+            {
+                if (SemNulo(rec.Get("DSP_CODIGO_DE_BARRAS")) != kit.Barras) continue;
+                var q = AtenderSolicitacao.LerNumero(SemNulo(rec.Get("QT_MOVIMENTACAO")));
+                noMv.Add(SemNulo(rec.Get("CD_PRODUTO")) + " lote " + SemNulo(rec.Get("CD_LOTE")).ToUpperInvariant() + " qtd " + (q.HasValue ? AtenderSolicitacao.Num(q.Value) : "?"));
+            }
+            if (noMv.Count == 0) return "nenhuma linha do kit no lançamento";
+            var esperado = new System.Collections.Generic.List<string>();
+            foreach (var c in kit.Componentes) esperado.Add(c.Produto + " lote " + (c.Lote ?? "").ToUpperInvariant() + " qtd " + AtenderSolicitacao.Num(c.Quantidade));
+            noMv.Sort(StringComparer.Ordinal); esperado.Sort(StringComparer.Ordinal);
+            if (noMv.Count != esperado.Count) return noMv.Count + " linha(s) no MV, " + esperado.Count + " no kit lido";
+            for (int i = 0; i < noMv.Count; i++)
+                if (noMv[i] != esperado[i]) return "no MV \"" + noMv[i] + "\", no kit lido \"" + esperado[i] + "\"";
+            return null;
         }
 
         // O quadro no log, só com produto e quantidades (sem paciente).
