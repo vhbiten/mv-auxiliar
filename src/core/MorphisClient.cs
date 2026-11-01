@@ -1280,36 +1280,188 @@ namespace SoulmvKit.Core
             DateTime d;
             if (DataHoraMv(r.Get("HR_SOLSAI_PRO"), out d) || DataHoraMv(r.Get("DT_SOLSAI_PRO"), out d)) sol.Data = d;
 
+            // Itens, página a página. O MV ordena só pelo código do produto e refaz a consulta a
+            // cada página: itens EMPATADOS (o mesmo produto pedido em vários itens — agulha e
+            // seringa de cada medicamento da prescrição) que cruzam a virada da página podem vir
+            // repetidos numa página e faltar na outra (485907, 01/11/2026: 3 itens da seringa
+            // 12091 no MV e na impressa; a consulta trouxe um deles 2 vezes e pulou o terceiro).
+            // Repetido = faltou item daquele produto: relê o produto sozinho (LerItensDoProdutoAsync).
+            var lidos = new System.Collections.Generic.List<ItemLido>();
             var vistos = new System.Collections.Generic.HashSet<string>();
-            int pagina = 0;
+            var repetidos = new System.Collections.Generic.List<int>();
+            int total = -1, pagina = 0;
             while (true)
             {
                 pagina++;
-                var bi = q.Block_("ITSOLSAI_PRO");
-                if (bi != null)
-                    foreach (var it in bi.Records)
-                    {
-                        int cod;
-                        if (!int.TryParse((it.Get("CD_PRODUTO") ?? "").Trim(), out cod) || cod <= 0) continue;
-                        if (!vistos.Add(string.IsNullOrEmpty(it.Id) ? pagina + "|" + cod : it.Id)) continue;
-                        var item = new ItemSolicitado();
-                        item.Produto = cod;
-                        item.Descricao = (it.Get("DSP_DS_PRODUTO") ?? "").Trim();
-                        item.Unidade = (it.Get("DSP_DS_UNIDADE") ?? "").Trim();
-                        var qs = AtenderSolicitacao.LerNumero(it.Get("QT_SOLICITADO")); item.Solicitado = qs.HasValue ? qs.Value : 0;
-                        var qa = AtenderSolicitacao.LerNumero(it.Get("QT_ATENDIDA")); item.Atendido = qa.HasValue ? qa.Value : 0;
-                        sol.Itens.Add(item);
-                    }
-                int pageNumber, totalPages;
-                LerPaginacaoBloco(q.Raw, "ITSOLSAI_PRO", out pageNumber, out totalPages);
+                int pageNumber, totalPages, totalRegistros;
+                LerPaginacaoBloco(q.Raw, "ITSOLSAI_PRO", out pageNumber, out totalPages, out totalRegistros);
+                if (totalRegistros >= 0) total = totalRegistros;
+                foreach (var x in ItensDaPagina(q, pagina))
+                {
+                    if (vistos.Add(x.Id)) lidos.Add(x);
+                    else if (!repetidos.Contains(x.Produto)) repetidos.Add(x.Produto);
+                }
                 if (pageNumber >= totalPages) break;
                 if (pagina >= 100) break;   // trava anti-loop (500 itens)
                 q = await m.PostAsync(AcaoBlocoHdr("ITSOLSAI_PRO", "CD_PRODUTO", m.FormTask, "NEXT_PAGE") + "<body></body>");
             }
+            if (lidos.Count == 0 && repetidos.Count == 0) total = 0;   // sem itens: o bloco só ecoa o critério
+            if (repetidos.Count > 0 || (total >= 0 && lidos.Count != total))
+            {
+                Logger.Log("Atender: a consulta da " + numero + " trouxe " + lidos.Count + " de " + total + " itens (repetidos: " +
+                    string.Join(", ", repetidos.ConvertAll(delegate(int p) { return p.ToString(); }).ToArray()) + ") — relendo por produto.");
+                foreach (int p in repetidos)
+                {
+                    var doProduto = await m.LerItensDoProdutoAsync(p, sol.Situacao);
+                    lidos.RemoveAll(delegate(ItemLido x) { return x.Produto == p; });
+                    lidos.AddRange(doProduto);
+                }
+                if (total >= 0 && lidos.Count != total)
+                    throw new Exception("O MV não devolveu todos os itens da solicitação " + numero + " (" + lidos.Count + " de " + total +
+                        "). Atenda esta solicitação pelo MV.");
+            }
+
+            // Uma linha por produto: o produto pedido em vários itens soma solicitado e atendido.
+            // A baixa do MV também é por produto (e o MV reparte entre os itens).
+            var porProduto = new System.Collections.Generic.Dictionary<int, ItemSolicitado>();
+            foreach (var x in lidos)
+            {
+                ItemSolicitado item;
+                if (!porProduto.TryGetValue(x.Produto, out item))
+                {
+                    item = new ItemSolicitado();
+                    item.Produto = x.Produto; item.Descricao = x.Descricao; item.Unidade = x.Unidade; item.ItensNoMv = 0;
+                    porProduto[x.Produto] = item;
+                    sol.Itens.Add(item);
+                }
+                item.Solicitado += x.Solicitado;
+                item.Atendido += x.Atendido;
+                item.ItensNoMv++;
+            }
             AtenderSolicitacao.OrdenarComoImpressa(sol);
             Logger.Log("Atender: solicitação " + numero + " lida (tipo " + sol.Tipo + ", situação " + sol.Situacao +
-                ", estoque " + sol.Estoque + ", " + sol.Itens.Count + " itens).");
+                ", estoque " + sol.Estoque + ", " + sol.Itens.Count + " produtos em " + lidos.Count + " itens).");
             return sol;
+        }
+
+        // Um registro do bloco de itens da consulta, antes de juntar por produto.
+        private class ItemLido
+        {
+            public string Id;
+            public int Produto;
+            public string Descricao = "";
+            public string Unidade = "";
+            public string QtTexto = "";      // QT_SOLICITADO como o MV escreve (critério de pesquisa)
+            public decimal Solicitado;
+            public decimal Atendido;
+        }
+
+        private static System.Collections.Generic.List<ItemLido> ItensDaPagina(MorphisResponse q, int pagina)
+        {
+            var res = new System.Collections.Generic.List<ItemLido>();
+            var bi = q.Block_("ITSOLSAI_PRO");
+            if (bi == null) return res;
+            int n = 0;
+            foreach (var it in bi.Records)
+            {
+                n++;
+                // Pesquisa sem resultado devolve o próprio critério como registro (id gerado pelo
+                // Morphis, sem descrição) e totalRecords=1 — não é item.
+                if ((it.Id ?? "").StartsWith("MORPHIS.", StringComparison.Ordinal)) continue;
+                int cod;
+                if (!int.TryParse((it.Get("CD_PRODUTO") ?? "").Trim(), out cod) || cod <= 0) continue;
+                var x = new ItemLido();
+                x.Id = string.IsNullOrEmpty(it.Id) ? "p" + pagina + "|" + n : it.Id;
+                x.Produto = cod;
+                x.Descricao = SemNulo(it.Get("DSP_DS_PRODUTO"));
+                x.Unidade = SemNulo(it.Get("DSP_DS_UNIDADE"));
+                x.QtTexto = SemNulo(it.Get("QT_SOLICITADO"));
+                var qs = AtenderSolicitacao.LerNumero(x.QtTexto); x.Solicitado = qs.HasValue ? qs.Value : 0;
+                var qa = AtenderSolicitacao.LerNumero(SemNulo(it.Get("QT_ATENDIDA"))); x.Atendido = qa.HasValue ? qa.Value : 0;
+                res.Add(x);
+            }
+            return res;
+        }
+
+        // Pesquisa no bloco de itens da consulta já aberta: SEARCH (modo de pesquisa do bloco) e
+        // EXECUTE_QUERY com o código (e a quantidade, se dada). A ligação com a solicitação do
+        // cabeçalho continua valendo (testado ao vivo em 01/11/2026: a 485907 devolveu as 3
+        // seringas 12091, inclusive a que a paginação pulou). Sem o SEARCH, o critério é ignorado.
+        private async Task<MorphisResponse> PesquisarItensAsync(int produto, string qtTexto)
+        {
+            var sr = await PostAsync(AcaoBlocoHdr("ITSOLSAI_PRO", "CD_PRODUTO", FormTask, "SEARCH") + "<body></body>");
+            var b = sr.Block_("ITSOLSAI_PRO");
+            string sel = b != null ? (b.Selected ?? (b.Records.Count > 0 ? b.Records[0].Id : null)) : null;
+            if (sel == null) throw new Exception("A consulta do MV não entrou em modo de pesquisa nos itens da solicitação.");
+            string body = "<body><block selected=\"" + sel + "\" name=\"ITSOLSAI_PRO\"><record status=\"C\" id=\"" + sel + "\">" +
+                "<item name=\"CD_PRODUTO\">" + produto + "</item>" +
+                (qtTexto != null ? "<item name=\"QT_SOLICITADO\">" + Xml(qtTexto) + "</item>" : "") +
+                "</record></block></body>";
+            return await PostAsync(AcaoBlocoHdr("ITSOLSAI_PRO", "CD_PRODUTO", FormTask, "EXECUTE_QUERY") + body);
+        }
+
+        // Todos os itens de um produto na solicitação. Até 5 itens cabem numa página: leitura
+        // exata. Mais que isso, a paginação pode repetir e pular de novo (todos empatam no
+        // código); aí, em pedido ainda não atendido (P, nada atendido), basta CONTAR os itens de
+        // cada quantidade (totalRecords da pesquisa por código + quantidade). Não fechou a conta
+        // = exceção (atender pelo MV).
+        private async Task<System.Collections.Generic.List<ItemLido>> LerItensDoProdutoAsync(int produto, string situacao)
+        {
+            var q = await PesquisarItensAsync(produto, null);
+            var lidos = new System.Collections.Generic.List<ItemLido>();
+            var vistos = new System.Collections.Generic.HashSet<string>();
+            bool repetiu = false;
+            int total = -1, pagina = 0;
+            while (true)
+            {
+                pagina++;
+                int pageNumber, totalPages, totalRegistros;
+                LerPaginacaoBloco(q.Raw, "ITSOLSAI_PRO", out pageNumber, out totalPages, out totalRegistros);
+                if (totalRegistros >= 0) total = totalRegistros;
+                foreach (var x in ItensDaPagina(q, pagina))
+                {
+                    if (x.Produto != produto) throw new Exception("A pesquisa do produto " + produto + " na solicitação trouxe outro produto (" + x.Produto + ").");
+                    if (vistos.Add(x.Id)) lidos.Add(x); else repetiu = true;
+                }
+                if (pageNumber >= totalPages || pagina >= 100) break;
+                q = await PostAsync(AcaoBlocoHdr("ITSOLSAI_PRO", "CD_PRODUTO", FormTask, "NEXT_PAGE") + "<body></body>");
+            }
+            if (!repetiu && total >= 0 && lidos.Count == total)
+            {
+                Logger.Log("Atender: produto " + produto + " relido: " + total + " itens.");
+                return lidos;
+            }
+
+            string falha = "O MV não devolveu todos os itens do produto " + produto + " na solicitação (" + lidos.Count + " de " + total + "). Atenda esta solicitação pelo MV.";
+            if (situacao != "P" || total < 0) throw new Exception(falha);
+            var qtds = new System.Collections.Generic.List<string>();
+            foreach (var x in lidos)
+            {
+                if (x.Atendido != 0) throw new Exception(falha);
+                if (!qtds.Contains(x.QtTexto)) qtds.Add(x.QtTexto);
+            }
+            var res = new System.Collections.Generic.List<ItemLido>();
+            foreach (string qt in qtds)
+            {
+                var rq = await PesquisarItensAsync(produto, qt);
+                int pn, tp, n;
+                LerPaginacaoBloco(rq.Raw, "ITSOLSAI_PRO", out pn, out tp, out n);
+                var reais = ItensDaPagina(rq, 1);
+                foreach (var x in reais)
+                    if (x.Produto != produto || x.QtTexto != qt) throw new Exception(falha);
+                if (n <= 0 || reais.Count == 0) throw new Exception(falha);   // só o eco do critério: nada achado
+                var modelo = lidos.Find(delegate(ItemLido x) { return x.QtTexto == qt; });
+                for (int i = 0; i < n; i++)
+                {
+                    var c = new ItemLido();
+                    c.Id = "contado|" + produto + "|" + qt + "|" + i; c.Produto = produto; c.Descricao = modelo.Descricao; c.Unidade = modelo.Unidade;
+                    c.QtTexto = qt; c.Solicitado = modelo.Solicitado; c.Atendido = 0;
+                    res.Add(c);
+                }
+            }
+            if (res.Count != total) throw new Exception(falha);
+            Logger.Log("Atender: produto " + produto + " contado por quantidade: " + total + " itens.");
+            return res;
         }
 
         // Nomes de quem pediu e de quem atendeu, pela tela de atendimento (M_BAIXASOL, bloco
@@ -1449,16 +1601,27 @@ namespace SoulmvKit.Core
         {
             var m = new MorphisClient(s);
             m.FormTask = formTask;
-            var r = await m.PostAsync(AcaoBotaoHdr("ITMVTO_ESTOQUE", "BTN_RETORNA_SOLICITACAO", formTask, "btnRetornaSolicitacao_click") + "<body></body>");
-            // Sessão que o servidor já descartou responde OK vazio com o comando SESSION_END
-            // (testado em 28/10/2026 com um JSESSIONID inexistente): a trava morreu junto.
-            if (r.Command("SESSION_END") != null) throw new SessaoExpiradaException();
-            for (int i = 0; i < 3 && r.Command("SHOW_ALERT") != null; i++)
+            MorphisResponse r = null;
+            for (int tentativa = 0; tentativa < 2; tentativa++)
             {
-                string texto = TextoAlerta(r);
-                int resposta = PerguntaDoRetorno(texto) ? 1 : 0;
-                Logger.Log("Reserva: retorno perguntou \"" + texto + "\" -> " + (resposta == 1 ? "Sim" : "OK/Não"));
-                r = await m.FecharAlertaAsync(formTask, "ITMVTO_ESTOQUE", "DSP_SN_MESTRE", NomeAlerta(r), resposta);
+                r = await m.PostAsync(AcaoBotaoHdr("ITMVTO_ESTOQUE", "BTN_RETORNA_SOLICITACAO", formTask, "btnRetornaSolicitacao_click") + "<body></body>");
+                // Sessão que o servidor já descartou responde OK vazio com o comando SESSION_END
+                // (testado em 28/10/2026 com um JSESSIONID inexistente): a trava morreu junto.
+                if (r.Command("SESSION_END") != null) throw new SessaoExpiradaException();
+                bool quadroAberto = false;
+                for (int i = 0; i < 3 && r.Command("SHOW_ALERT") != null; i++)
+                {
+                    string texto = TextoAlerta(r);
+                    if (texto.IndexOf("Reabrir a Baixa", StringComparison.OrdinalIgnoreCase) >= 0) quadroAberto = true;
+                    int resposta = PerguntaDoRetorno(texto) ? 1 : 0;
+                    Logger.Log("Reserva: retorno perguntou \"" + texto + "\" -> " + (resposta == 1 ? "Sim" : "OK/Não"));
+                    r = await m.FecharAlertaAsync(formTask, "ITMVTO_ESTOQUE", "DSP_SN_MESTRE", NomeAlerta(r), resposta);
+                }
+                // O quadro de divergência ficou aberto (Fechar que parou nele): o MV só deixa
+                // retornar depois do "Reabrir Baixa", que volta ao lançamento sem gravar.
+                if (!quadroAberto || AnalisarRetorno(r) || tentativa > 0) break;
+                Logger.Log("Reserva: o quadro de divergência estava aberto — Reabrir a Baixa e retornar de novo.");
+                if (!await m.ReabrirBaixaAsync(null)) break;
             }
             bool voltou = AnalisarRetorno(r);
             Logger.Log("Reserva: retorno do task " + formTask + " -> " + (voltou ? "liberou" : "NÃO voltou para a tela inicial (outcome " + r.Outcome + ")"));
@@ -1520,10 +1683,12 @@ namespace SoulmvKit.Core
             m.FormTask = formTask;
             var res = new ResultadoBaixa();
             var totais = new System.Collections.Generic.Dictionary<int, decimal>();
+            var pendentes = new System.Collections.Generic.Dictionary<int, decimal>();
             var usoLote = new System.Collections.Generic.Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
             foreach (var l in linhas)
             {
                 decimal t; totais.TryGetValue(l.Produto, out t); totais[l.Produto] = t + l.Quantidade;
+                pendentes[l.Produto] = l.Pendente;
             }
 
             // Digitação por código
@@ -1637,7 +1802,7 @@ namespace SoulmvKit.Core
             try
             {
                 r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "CD_PRODUTO", AcaoXml("ITMVTO_ESTOQUE", "BTN_FECHAR_SOLICITACAO", "btnFecharSolicitacao_click", true), ""));
-                return await m.ConcluirFechamentoAsync(r, res, totais);
+                return await m.ConcluirFechamentoAsync(r, res, totais, pendentes);
             }
             catch (Exception ex)
             {
@@ -1652,27 +1817,31 @@ namespace SoulmvKit.Core
         // pergunta de impressão (Não) -> tela de etiquetas (Sair). Separado para testar com as
         // respostas guardadas dos HARs.
         public async Task<ResultadoBaixa> ConcluirFechamentoAsync(MorphisResponse r, ResultadoBaixa res,
-            System.Collections.Generic.Dictionary<int, decimal> totais)
+            System.Collections.Generic.Dictionary<int, decimal> totais, System.Collections.Generic.Dictionary<int, decimal> pendentes)
         {
             res.AntesDoFechar = false;
             var quadro = r.Block_("PRODUTOS_CONFIRMADOS");
             if (quadro != null && (r.Raw ?? "").IndexOf("RESULTADO", StringComparison.Ordinal) >= 0)
             {
-                // O quadro tem que bater com o que foi lançado; senão, não confirma.
-                foreach (var rq in quadro.Records)
+                // O quadro tem que bater com o que foi lançado; senão, não confirma: "Reabrir
+                // Baixa" volta ao lançamento sem gravar e quem chama faz o Retornar.
+                string problema = AtenderSolicitacao.ConferirQuadro(quadro.Records, totais, pendentes);
+                if (problema != null)
                 {
-                    int cod;
-                    if (!int.TryParse(SemNulo(rq.Get("CD_PRODUTO")), out cod)) continue;
-                    var qa = AtenderSolicitacao.LerNumero(SemNulo(rq.Get("QTD_ATENDIDA")));
-                    decimal esperado; totais.TryGetValue(cod, out esperado);
-                    if (!qa.HasValue || qa.Value != esperado)
+                    Logger.Log("Baixa: o quadro de divergência não bate com a baixa: " + problema + ". Quadro: " + DescreverQuadro(quadro));
+                    string msg = "O MV mostrou uma divergência diferente da esperada: " + problema + ".";
+                    bool reabriu = false;
+                    try { reabriu = await ReabrirBaixaAsync(r); }
+                    catch (Exception ex) { Logger.Log("Baixa: Reabrir a Baixa falhou (" + ex.Message + ")."); }
+                    if (reabriu)
                     {
-                        res.Incerta = true;
-                        res.Mensagem = "O quadro de divergência do MV mostra " + (qa.HasValue ? AtenderSolicitacao.Num(qa.Value) : "?") + " atendido(s) do produto " + cod +
-                            ", e a baixa lançou " + AtenderSolicitacao.Num(esperado) + ". A baixa NÃO foi confirmada; confira a solicitação no MV.";
-                        Logger.Log("Baixa: " + res.Mensagem);
+                        res.AntesDoFechar = true;   // de volta ao lançamento: nada gravado
+                        res.Mensagem = msg;
                         return res;
                     }
+                    res.Incerta = true;
+                    res.Mensagem = msg + " A baixa NÃO foi confirmada; confira a solicitação no MV.";
+                    return res;
                 }
                 if (r.Command("SHOW_ALERT") != null)
                     r = await FecharAlertaAsync(FormTask, "PRODUTOS_CONFIRMADOS", "CD_PRODUTO", NomeAlerta(r), 0);
@@ -1715,6 +1884,45 @@ namespace SoulmvKit.Core
             }
             Logger.Log("Baixa: fechamento -> " + (res.Gravada ? "GRAVADA (situação " + res.Situacao + ")" : "incerta: " + res.Mensagem));
             return res;
+        }
+
+        // "Reabrir Baixa" do quadro de divergência (bloco PRODUTOS_CONFIRMADOS, botão BTN_ACERTO,
+        // "Reabre a Baixa para Alteração"): fecha o aviso do quadro (OK) e volta ao lançamento,
+        // sem gravar. É a saída que o próprio aviso do MV indica ("para resolvê-las clique em
+        // 'Reabrir a Baixa'"); o Retornar com o quadro aberto só repete esse aviso (01/11/2026,
+        // 485907). true = o MV voltou ao lançamento (itens da movimentação).
+        private async Task<bool> ReabrirBaixaAsync(MorphisResponse r)
+        {
+            if (r != null && r.Command("SHOW_ALERT") != null)
+                r = await FecharAlertaAsync(FormTask, "PRODUTOS_CONFIRMADOS", "CD_PRODUTO", NomeAlerta(r), 0);
+            r = await PostAsync(Msg("PRODUTOS_CONFIRMADOS", "CD_PRODUTO", AcaoXml("PRODUTOS_CONFIRMADOS", "BTN_ACERTO", "btnAcerto_click", true), ""));
+            if (r.Command("SHOW_ALERT") != null)
+            {
+                Logger.Log("Baixa: Reabrir a Baixa respondeu com aviso: " + TextoAlerta(r));
+                return false;
+            }
+            bool voltou = VoltouAoLancamento(r);
+            Logger.Log("Baixa: Reabrir a Baixa -> " + (voltou ? "de volta ao lançamento (nada gravado)" : "resposta inesperada (bloco " + r.Block + ", item " + r.Item + ")"));
+            return voltou;
+        }
+
+        public static bool VoltouAoLancamento(MorphisResponse r)
+        {
+            return r != null && r.IsOk && string.Equals(r.Block, "ITMVTO_ESTOQUE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // O quadro no log, só com produto e quantidades (sem paciente).
+        private static string DescreverQuadro(MorphisBlock quadro)
+        {
+            var sb = new StringBuilder();
+            foreach (var rq in quadro.Records)
+            {
+                string cod = SemNulo(rq.Get("CD_PRODUTO"));
+                if (cod.Length == 0) continue;
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append(cod).Append(" sol ").Append(SemNulo(rq.Get("QTD_SOLICITADA"))).Append(" at ").Append(SemNulo(rq.Get("QTD_ATENDIDA")));
+            }
+            return sb.Length > 0 ? sb.ToString() : "(vazio)";
         }
 
         private static ResultadoBaixa Falha(ResultadoBaixa res, int linha, string msg)
@@ -1808,7 +2016,14 @@ namespace SoulmvKit.Core
         // pageNumber/totalPages do <page> que vem logo depois da abertura do bloco pedido.
         private static void LerPaginacaoBloco(string xml, string bloco, out int pageNumber, out int totalPages)
         {
-            pageNumber = 1; totalPages = 1;
+            int totalRegistros;
+            LerPaginacaoBloco(xml, bloco, out pageNumber, out totalPages, out totalRegistros);
+        }
+
+        // Idem, com o totalRecords (-1 = não veio).
+        private static void LerPaginacaoBloco(string xml, string bloco, out int pageNumber, out int totalPages, out int totalRegistros)
+        {
+            pageNumber = 1; totalPages = 1; totalRegistros = -1;
             if (string.IsNullOrEmpty(xml)) return;
             var ab = System.Text.RegularExpressions.Regex.Match(xml, "<block\\b[^>]*\\bname=\"" + bloco + "\"[^>]*>");
             if (!ab.Success) return;
@@ -1819,6 +2034,8 @@ namespace SoulmvKit.Core
             if (pn.Success && int.TryParse(pn.Groups[1].Value, out v)) pageNumber = v;
             var tp = System.Text.RegularExpressions.Regex.Match(mm.Value, "totalPages=\"(\\d+)\"");
             if (tp.Success && int.TryParse(tp.Groups[1].Value, out v)) totalPages = v;
+            var tr = System.Text.RegularExpressions.Regex.Match(mm.Value, "totalRecords=\"(\\d+)\"");
+            if (tr.Success && int.TryParse(tr.Groups[1].Value, out v)) totalRegistros = v;
         }
 
         private static AtendimentoPam AtendimentoDe(MorphisRecord r)

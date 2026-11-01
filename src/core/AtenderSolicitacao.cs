@@ -43,13 +43,16 @@ namespace SoulmvKit.Core
         }
     }
 
+    // Um PRODUTO pedido: o mesmo produto em vários itens da solicitação (a agulha de cada
+    // medicamento da prescrição) vem somado numa linha só (MorphisClient.LerSolicitacaoParaAtenderAsync).
     public class ItemSolicitado
     {
         public int Produto;
         public string Descricao;
         public string Unidade;
-        public decimal Solicitado;
+        public decimal Solicitado;       // soma dos itens do produto
         public decimal Atendido;         // já atendido em baixa anterior (solicitação parcial)
+        public int ItensNoMv = 1;        // quantos itens da solicitação somam nesta linha
 
         public decimal Pendente { get { return Solicitado > Atendido ? Solicitado - Atendido : 0; } }
     }
@@ -117,6 +120,7 @@ namespace SoulmvKit.Core
         public decimal Quantidade;
         public bool ForaDoPedido;        // o MV pergunta "não foi solicitado neste pedido" -> Sim
         public bool AMais;               // o produto vai a mais -> "maior que a solicitada" -> Sim
+        public decimal Pendente;         // o que faltava atender do PRODUTO na solicitação (0 = fora do pedido)
     }
 
     // O que a gravação deu.
@@ -491,11 +495,56 @@ namespace SoulmvKit.Core
                 var b = new LinhaBaixa();
                 b.Indice = i; b.Produto = l.Produto; b.Descricao = l.Descricao ?? ""; b.Unidade = l.Unidade ?? "";
                 b.Lote = l.Lote.Trim(); b.Quantidade = l.Quantidade.Value;
-                b.ForaDoPedido = l.ForaDoPedido || sol.Item(l.Produto) == null;
+                var it = sol.Item(l.Produto);
+                b.ForaDoPedido = l.ForaDoPedido || it == null;
                 b.AMais = aMais.Contains(l.Produto);
+                b.Pendente = it != null ? it.Pendente : 0;
                 res.Add(b);
             }
             return res;
+        }
+
+        // O quadro de divergência que o MV mostra no "Fechar" bate com a baixa lançada? null = bate;
+        // senão, o motivo. O quadro lista só os ITENS da solicitação com diferença (o item
+        // atendido certinho não aparece), um registro por item: o produto pedido em 3 itens dos
+        // quais a baixa atendeu 1 aparece 2 vezes com 0 atendido (485907, 01/11/2026). Por isso a
+        // conta é por produto: a soma das diferenças (solicitado − atendido) dos registros dele tem
+        // que dar o pendente − o lançado (fora do pedido: pendente 0; a mais: negativa). Produto
+        // do quadro que a baixa não lançou: só confere que o MV não o deu como atendido.
+        // lancado e pendente: por produto, das linhas lançadas (LinhaBaixa.Quantidade/Pendente).
+        public static string ConferirQuadro(List<MorphisRecord> quadro, Dictionary<int, decimal> lancado, Dictionary<int, decimal> pendente)
+        {
+            var diferenca = new Dictionary<int, decimal>();
+            var atendido = new Dictionary<int, decimal>();
+            foreach (var rq in quadro)
+            {
+                int cod;
+                if (!int.TryParse(Limpo(rq.Get("CD_PRODUTO")), out cod)) continue;
+                var qs = LerNumero(Limpo(rq.Get("QTD_SOLICITADA")));
+                var qa = LerNumero(Limpo(rq.Get("QTD_ATENDIDA")));
+                if (!qs.HasValue || !qa.HasValue) return "o quadro do MV veio sem a quantidade do produto " + cod;
+                decimal d; diferenca.TryGetValue(cod, out d); diferenca[cod] = d + qs.Value - qa.Value;
+                decimal a; atendido.TryGetValue(cod, out a); atendido[cod] = a + qa.Value;
+            }
+            foreach (var kv in atendido)
+                if (!lancado.ContainsKey(kv.Key) && kv.Value != 0)
+                    return "o MV mostra " + Num(kv.Value) + " atendido(s) do produto " + kv.Key + ", que a baixa não lançou";
+            foreach (var kv in lancado)
+            {
+                decimal p; pendente.TryGetValue(kv.Key, out p);
+                decimal d; diferenca.TryGetValue(kv.Key, out d);
+                decimal esperado = p - kv.Value;
+                if (d != esperado)
+                    return "no produto " + kv.Key + " o MV mostra diferença de " + Num(d) + " e a baixa esperava " + Num(esperado) +
+                        " (pendente " + Num(p) + ", lançado " + Num(kv.Value) + ")";
+            }
+            return null;
+        }
+
+        private static string Limpo(string v)
+        {
+            v = (v ?? "").Trim();
+            return v == "xsi:nil" ? "" : v;
         }
 
         private static ItemConferido Conferido(int produto, string descricao, string unidade, Dictionary<int, decimal> total,

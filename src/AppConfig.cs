@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.1";   // 0.6.1: Atender — antimicrobiano (Tipo do Uso), Preencher automaticamente, negrito
+        public const string Versao = "0.6.2";   // 0.6.2: Atender — produto repetido em vários itens, quadro de divergência (Reabrir Baixa)
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 
