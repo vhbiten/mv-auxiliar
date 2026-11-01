@@ -95,6 +95,17 @@ namespace SoulmvKit.Core
         public decimal? Quantidade;
     }
 
+    // O que o "Preencher automaticamente" fez.
+    public class ResultadoPreencher
+    {
+        public int Preenchidos;          // itens que ganharam lote e quantidade
+        public int ComMaisDeUmLote;
+        public int JaDigitados;          // itens com alguma linha já digitada: não tocados
+        public List<string> Parciais = new List<string>();   // "13780 (2 de 4)": o saldo fora de kit não deu
+        public List<int> SemSaldo = new List<int>();         // nenhum lote com saldo fora de kit
+        public int PrimeiraLinha = -1;   // primeira linha preenchida (para o cursor)
+    }
+
     // Uma linha que o "Fechar a Baixa" lança no MV (já conferida).
     public class LinhaBaixa
     {
@@ -305,6 +316,100 @@ namespace SoulmvKit.Core
             }
             return lista;
         }
+
+        // ===== PREENCHER AUTOMATICAMENTE =====
+        // Pedido do usuário (01/11/2026), revendo o "não sugerir lote nem quantidade" de 28/10:
+        // só quando o atendente pede. Cada item pedido sem nada digitado recebe o lote de MAIOR
+        // saldo fora de kit (saldo − em kit; vencido e lote todo em kit ficam de fora — o MV também
+        // esconde este) e, se não bastar, o próximo, em outra linha do mesmo produto. Faltando
+        // saldo, preenche o que tem e o item fica parcial. Produto com alguma linha já digitada,
+        // fora do pedido ou sem pendência não é tocado. Usa as linhas vazias do produto que já
+        // existem; as que faltam entram logo abaixo delas.
+        public static ResultadoPreencher Preencher(SolicitacaoAtender sol, List<LinhaAtender> linhas, Func<int, LotesProduto> lotes)
+        {
+            var r = new ResultadoPreencher();
+            if (sol == null) return r;
+
+            // Produtos na ordem da grade, com as linhas de cada um.
+            var ordem = new List<int>();
+            var linhasDo = new Dictionary<int, List<int>>();
+            for (int i = 0; i < linhas.Count; i++)
+            {
+                int p = linhas[i].Produto;
+                if (p <= 0) continue;
+                List<int> ls;
+                if (!linhasDo.TryGetValue(p, out ls)) { ls = new List<int>(); linhasDo[p] = ls; ordem.Add(p); }
+                ls.Add(i);
+            }
+
+            // Quanto de cada lote vai em cada produto (sem mexer na lista ainda).
+            var plano = new Dictionary<int, List<KeyValuePair<LoteDisponivel, decimal>>>();
+            foreach (int p in ordem)
+            {
+                var it = sol.Item(p);
+                if (it == null || it.Pendente <= 0) continue;
+                bool digitado = false;
+                foreach (int i in linhasDo[p])
+                    if (linhas[i].Quantidade.HasValue || !string.IsNullOrEmpty(linhas[i].Lote)) digitado = true;
+                if (digitado) { r.JaDigitados++; continue; }
+
+                var lp = lotes(p);
+                var livres = new List<LoteDisponivel>();
+                if (lp != null)
+                    foreach (var lo in lp.Lotes) if (!lo.Vencido && Livre(lo) > 0) livres.Add(lo);
+                livres.Sort(delegate(LoteDisponivel a, LoteDisponivel b)
+                {
+                    int c = Livre(b).CompareTo(Livre(a));   // maior saldo fora de kit primeiro
+                    if (c != 0) return c;
+                    DateTime va = a.Validade.HasValue ? a.Validade.Value : DateTime.MaxValue;
+                    DateTime vb = b.Validade.HasValue ? b.Validade.Value : DateTime.MaxValue;
+                    return va.CompareTo(vb);                // empate: vence antes
+                });
+                if (livres.Count == 0) { r.SemSaldo.Add(p); continue; }
+
+                var uso = new List<KeyValuePair<LoteDisponivel, decimal>>();
+                decimal falta = it.Pendente;
+                foreach (var lo in livres)
+                {
+                    if (falta <= 0) break;
+                    decimal q = Math.Min(falta, Livre(lo));
+                    uso.Add(new KeyValuePair<LoteDisponivel, decimal>(lo, q));
+                    falta -= q;
+                }
+                plano[p] = uso;
+                r.Preenchidos++;
+                if (uso.Count > 1) r.ComMaisDeUmLote++;
+                if (falta > 0) r.Parciais.Add(p + " (" + Num(it.Pendente - falta) + " de " + Num(it.Pendente) + ")");
+            }
+
+            // Aplica de baixo para cima: linha inserida não desloca as de produtos acima.
+            for (int k = ordem.Count - 1; k >= 0; k--)
+            {
+                List<KeyValuePair<LoteDisponivel, decimal>> uso;
+                if (!plano.TryGetValue(ordem[k], out uso)) continue;
+                var ls = linhasDo[ordem[k]];
+                var modelo = linhas[ls[0]];
+                int depois = ls[ls.Count - 1] + 1;
+                for (int j = 0; j < uso.Count; j++)
+                {
+                    LinhaAtender l;
+                    if (j < ls.Count) l = linhas[ls[j]];
+                    else
+                    {
+                        l = new LinhaAtender();
+                        l.Produto = modelo.Produto; l.Descricao = modelo.Descricao; l.Unidade = modelo.Unidade;
+                        linhas.Insert(depois++, l);
+                    }
+                    l.Lote = uso[j].Key.Lote; l.Validade = uso[j].Key.Validade; l.Quantidade = uso[j].Value;
+                }
+            }
+            for (int i = 0; i < linhas.Count && r.PrimeiraLinha < 0; i++)
+                if (linhas[i].Produto > 0 && plano.ContainsKey(linhas[i].Produto)) r.PrimeiraLinha = i;
+            return r;
+        }
+
+        // Saldo do lote que não está montado em kit.
+        public static decimal Livre(LoteDisponivel lo) { return lo.Quantidade > lo.EmKit ? lo.Quantidade - lo.EmKit : 0; }
 
         // ===== CONFERÊNCIA ANTES DE FECHAR =====
         // lotes(produto) devolve os lotes lidos (null = não lidos). Linhas sem lote e sem

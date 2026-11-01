@@ -17,6 +17,7 @@ namespace SoulmvKit.UI
     // de Produtos" do MV (cabeçalho em campos, grade "Produtos", botões embaixo).
     // Decisões do usuário (28/10/2026): quantidade e lote NÃO são sugeridos; a diferença fica
     // parcial; todo tipo de pedido; todos os logins; saldo do lote só na janela de lotes.
+    // 01/11/2026: botão "Preencher automaticamente" sugere lote e quantidade, só a pedido.
     //
     // ETAPA 1: só LÊ do MV — cabeçalho e itens (C_SOLSAI_PRO), lotes (R_CONF_LOTE) e produtos do
     // estoque (Posição de Estoque). O F12 confere e mostra o resumo; a gravação (M_BAIXASOL,
@@ -59,6 +60,7 @@ namespace SoulmvKit.UI
         private GridPro grid;
         private IconButton btnExcluir, btnLimpar;
         private PrimaryButton btnFechar;
+        private PrimaryButton btnPreencher;
 
         private SolicitacaoAtender _sol;
         private readonly List<LinhaAtender> _linhas = new List<LinhaAtender>();
@@ -494,7 +496,7 @@ namespace SoulmvKit.UI
             Col("produto", "Produto", 80, false, true, "9999999");
             Col("descricao", "Descrição", 360, false, false, null).MinimumWidth = Theme.S(200);
             Col("unidade", "Unidade", 100, false, false, "FR C/100ML");
-            Col("solicitado", "Solicitado", 88, true, false, "9999");
+            Col("solicitado", "Solicitado", 88, true, false, "9999").DefaultCellStyle.Font = FonteGradeTitulo;   // destaque
             var ja = Col("jaatendido", "Já atend.", 84, true, false, "9999");
             ja.Visible = false;   // só aparece em solicitação parcial
             ja.HeaderCell.ToolTipText = "Já atendido em baixa anterior";
@@ -721,9 +723,10 @@ namespace SoulmvKit.UI
 
             var tl = new TableLayoutPanel();
             tl.Dock = DockStyle.Fill; tl.AutoSize = true; tl.BackColor = Theme.CardBg;
-            tl.ColumnCount = 3; tl.RowCount = 1;
+            tl.ColumnCount = 4; tl.RowCount = 1;
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
@@ -740,13 +743,24 @@ namespace SoulmvKit.UI
             lblDica.Margin = new Padding(Theme.S(12), 0, Theme.S(12), 0);
             tl.Controls.Add(lblDica, 1, 0);
 
+            // Secundário (contorno), à esquerda do "Fechar a Baixa": não grava nada.
+            btnPreencher = new PrimaryButton();
+            btnPreencher.Ghost = true;
+            btnPreencher.Text = "Preencher automaticamente";
+            btnPreencher.Width = TextRenderer.MeasureText(btnPreencher.Text, btnPreencher.Font).Width + Theme.S(32);
+            btnPreencher.Height = Theme.S(30);
+            btnPreencher.Margin = new Padding(0, 0, Theme.S(10), 0);
+            btnPreencher.Click += new EventHandler(delegate { PreencherAutomaticamente(); });
+            new ToolTip().SetToolTip(btnPreencher, "Preenche lote e quantidade dos itens ainda sem digitação: lote de maior saldo fora de kit; se não bastar, completa com o próximo.");
+            tl.Controls.Add(btnPreencher, 2, 0);
+
             btnFechar = new PrimaryButton();
             btnFechar.Text = "Fechar a Baixa";
             btnFechar.Width = Theme.S(150); btnFechar.Height = Theme.S(30);
             btnFechar.Margin = new Padding(0);
             btnFechar.Click += new EventHandler(delegate { FecharBaixa(); });
             new ToolTip().SetToolTip(btnFechar, "F12 — confere lotes e quantidades e fecha a baixa no MV.");
-            tl.Controls.Add(btnFechar, 2, 0);
+            tl.Controls.Add(btnFechar, 3, 0);
 
             card.Controls.Add(tl);
             return card;
@@ -1366,7 +1380,7 @@ namespace SoulmvKit.UI
             var cols = new[] {
                 new ListaEscolhaDialog.Coluna("Lote", 0, false, true),
                 new ListaEscolhaDialog.Coluna("Validade", 100, false, false),
-                new ListaEscolhaDialog.Coluna("Saldo", 84, true, false),
+                new ListaEscolhaDialog.Coluna("Saldo", 84, true, false) { Negrito = true },
                 new ListaEscolhaDialog.Coluna("Em kit", 80, true, false) };
             int escolhido;
             // Sem busca: são poucos lotes; setas e Enter.
@@ -1418,7 +1432,7 @@ namespace SoulmvKit.UI
                 new ListaEscolhaDialog.Coluna("Código", 84, false, false),
                 new ListaEscolhaDialog.Coluna("Descrição", 0, false, true),
                 new ListaEscolhaDialog.Coluna("Unidade", 110, false, false),
-                new ListaEscolhaDialog.Coluna("Saldo", 76, true, false) };
+                new ListaEscolhaDialog.Coluna("Saldo", 76, true, false) { Negrito = true } };
             int escolhido;
             using (var d = new ListaEscolhaDialog("Produtos do estoque", _sol.DsEstoque + "  ·  só produtos com saldo",
                 cols, linhas, null, "Digite parte do nome ou o código", TamanhoProdutos))
@@ -1438,6 +1452,31 @@ namespace SoulmvKit.UI
             try { await DefinirProduto(linha, sel.Codigo, it != null ? it.Descricao : sel.Nome, it != null ? it.Unidade : sel.Unidade); }
             catch (SessaoExpiradaException) { if (!IsDisposed) _host.SessaoExpirou(); }
             catch (Exception ex) { if (!IsDisposed) avisos.SetState(StatusKind.Error, "Não foi possível ler os lotes: " + ex.Message); }
+        }
+
+        // ===== PREENCHER AUTOMATICAMENTE =====
+        // Regra em AtenderSolicitacao.Preencher. Não grava nada: o atendente confere e fecha (F12).
+        // Sem atalho de teclado e com aviso curto, só de confirmação (pedido do usuário, 01/11/2026);
+        // o detalhe (parciais, sem saldo) vai para o log e aparece na conferência do F12.
+        private void PreencherAutomaticamente()
+        {
+            if (!Atendivel() || _ocupado || _buscando || CarregandoAgora) return;
+            Tocar();
+            if (grid.IsCurrentCellInEditMode) grid.EndEdit();
+            int linhaAntes = grid.CurrentCell != null ? grid.CurrentCell.RowIndex : 0;
+            var r = AtenderSolicitacao.Preencher(_sol, _linhas, delegate(int p) { LotesProduto lp; return _lotes.TryGetValue(p, out lp) ? lp : null; });
+            Renderizar();
+
+            Logger.Log("Atender: preenchimento automático na " + _sol.Numero + " — " + r.Preenchidos + " item(ns), " +
+                r.Parciais.Count + " parcial(is) [" + string.Join("; ", r.Parciais.ToArray()) + "], " + r.SemSaldo.Count + " sem saldo.");
+            if (r.Preenchidos == 0)
+            {
+                IrPara(Math.Min(linhaAntes, _linhas.Count - 1), CLote, false);
+                avisos.SetState(StatusKind.Info, "Nada para preencher.");
+                return;
+            }
+            IrPara(r.PrimeiraLinha >= 0 ? r.PrimeiraLinha : Math.Min(linhaAntes, _linhas.Count - 1), CAtender, false);
+            avisos.SetState(StatusKind.Info, "Itens preenchidos. Confira antes de fechar a baixa.");
         }
 
         // ===== EXCLUIR, LIMPAR =====
@@ -1725,7 +1764,7 @@ namespace SoulmvKit.UI
         private void AtualizarBotoes()
         {
             bool pode = Atendivel() && !_ocupado && !_buscando && !CarregandoAgora;
-            btnExcluir.Enabled = pode; btnFechar.Enabled = pode;
+            btnExcluir.Enabled = pode; btnFechar.Enabled = pode; btnPreencher.Enabled = pode;
             btnLimpar.Enabled = !_ocupado;
             btnAbrir.Enabled = !_ocupado;
             txtNumero.Enabled = !_ocupado;

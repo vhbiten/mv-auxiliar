@@ -1506,7 +1506,8 @@ namespace SoulmvKit.Core
         //     pedido" -> Sim só se a linha é fora do pedido] -> LIST_VALUES (LV_LOTE) -> LOV_OK no
         //     índice do lote ESCOLHIDO (achado pelo código na lista do MV) -> NEXT_ITEM (unidade) ->
         //     NEXT_ITEM com QT_MOVIMENTACAO ["Quantidade Atendida é maior" -> Sim só se o produto vai
-        //     a mais] -> o MV abre a linha seguinte;
+        //     a mais] -> [antimicrobiano: o MV para no TP_USO_PRODUTO, já preenchido por ele ->
+        //     NEXT_ITEM] -> o MV abre a linha seguinte;
         //   btnFecharSolicitacao_click GRAVA (ConcluirFechamentoAsync).
         // Cada resposta é conferida (produto, unidade, lote, saldo, quantidade). Fora do roteiro
         // ANTES do Fechar: para e devolve o problema — quem chama faz o Retornar (nada foi gravado).
@@ -1607,6 +1608,23 @@ namespace SoulmvKit.Core
                 if (reg == null || SemNulo(reg.Get("CD_PRODUTO")) != l.Produto.ToString() ||
                     !string.Equals(SemNulo(reg.Get("CD_LOTE")), l.Lote, StringComparison.OrdinalIgnoreCase) || !qMv.HasValue || qMv.Value != l.Quantidade)
                     return Falha(res, l.Indice, "A linha do produto " + l.Produto + " não ficou como digitada no MV.");
+
+                // 4) antimicrobiano: o MV preenche sozinho o "Tipo do Uso" (T = terapêutico) ao
+                // digitar o produto e, depois da quantidade, para nesse campo em vez de abrir a linha
+                // seguinte. NEXT_ITEM mantém o valor do MV e abre a linha (HAR de 01/11/2026, 485891,
+                // ceftriaxona). Sem valor do MV, para: o app não escolhe o tipo de uso.
+                if (string.Equals(r.Item, "TP_USO_PRODUTO", StringComparison.OrdinalIgnoreCase))
+                {
+                    string uso = SemNulo(reg.Get("TP_USO_PRODUTO"));
+                    if (uso.Length == 0)
+                        return Falha(res, l.Indice, "O MV pede o Tipo do Uso do produto " + l.Produto + " e não o preencheu. Atenda esta solicitação pelo MV.");
+                    r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE", "TP_USO_PRODUTO", AcaoXml("ITMVTO_ESTOQUE", "TP_USO_PRODUTO", "NEXT_ITEM", true), ""));
+                    if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, l.Indice, "O MV recusou o Tipo do Uso do produto " + l.Produto);
+                    reg = Registro(r, rec);
+                    if (reg == null || SemNulo(reg.Get("TP_USO_PRODUTO")) != uso)
+                        return Falha(res, l.Indice, "O Tipo do Uso do produto " + l.Produto + " mudou no MV.");
+                    Logger.Log("Baixa: " + l.Produto + " com Tipo do Uso " + uso + " (preenchido pelo MV).");
+                }
                 string novo = SelecionadoItens(r);
                 if (novo == null || novo == rec) return Falha(res, l.Indice, "O MV não abriu a linha seguinte depois do produto " + l.Produto + ".");
                 rec = novo;

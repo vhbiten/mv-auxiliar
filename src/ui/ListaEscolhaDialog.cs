@@ -23,6 +23,7 @@ namespace SoulmvKit.UI
             public int Largura;          // px a 96 DPI; ignorada quando Preenche
             public bool Direita;
             public bool Preenche;
+            public bool Negrito;         // destaque (Saldo)
             public Coluna(string titulo, int largura, bool direita, bool preenche)
             {
                 Titulo = titulo; Largura = largura; Direita = direita; Preenche = preenche;
@@ -126,6 +127,7 @@ namespace SoulmvKit.UI
                 // largura fixa ficam nela (peso 0); a que preenche leva o resto.
                 var col = AtenderView.NovaColuna(c.Titulo, c.Preenche ? 1 : 0, c.Direita);
                 col.MinimumWidth = Math.Max(col.MinimumWidth, S(c.Preenche ? 140 : c.Largura));
+                if (c.Negrito) col.DefaultCellStyle.Font = AtenderView.FonteGradeTitulo;
                 grid.Columns.Add(col);
             }
             AtenderView.RepartirSempre(grid);
