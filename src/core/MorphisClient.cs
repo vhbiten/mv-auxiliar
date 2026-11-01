@@ -1110,6 +1110,50 @@ namespace SoulmvKit.Core
             return kit;
         }
 
+        // ===== ETIQUETA PELO IDENTIFICADOR (M_ID_ETIQUETA, "Identificador Etiqueta") — READ-ONLY =====
+        // Cadastros > Gerais > Identificador Etiqueta: SEARCH + EXECUTE_QUERY por CD_IDENTIFICADOR
+        // (o código de barras sem o "2" inicial e sem o dígito verificador). Etiqueta de produto
+        // traz produto, lote e validade (SN_ATIVO=S enquanto vale); etiqueta de kit traz o produto
+        // kit e a movimentação da produção, com SN_ATIVO=N depois de baixado (01/11/2026:
+        // 21163 hidralazina S; 21812 kit em estoque S; 21927 kit baixado N). Pelo DSP_CD_IDENTIFICADOR
+        // o critério é ignorado (vem tudo). null = não existe.
+        public static async Task<EtiquetaMv> LerEtiquetaAsync(Session s, string codigo)
+        {
+            long id = AtenderSolicitacao.IdentificadorDaEtiqueta(codigo);
+            if (id <= 0) return null;
+            var m = new MorphisClient(s);
+            await m.WorkspaceInitAsync();
+            await m.CallFormAsync("M_ID_ETIQUETA", "MV.12.01.03.02.08.#");
+            var sr = await m.PostAsync(AcaoBlocoHdr("IDENTIFICADOR_ETIQUETA", "CD_PRODUTO", m.FormTask, "SEARCH") + "<body></body>");
+            string sel = SelectedOf(sr, "IDENTIFICADOR_ETIQUETA");
+            if (sel == null) throw new Exception("O cadastro de etiquetas do MV não entrou em modo de pesquisa.");
+            string body = "<body><block selected=\"" + sel + "\" name=\"IDENTIFICADOR_ETIQUETA\"><record status=\"C\" id=\"" + sel + "\">" +
+                "<item name=\"CD_IDENTIFICADOR\">" + id + "</item></record></block></body>";
+            var q = await m.PostAsync(AcaoBlocoHdr("IDENTIFICADOR_ETIQUETA", "CD_IDENTIFICADOR", m.FormTask, "EXECUTE_QUERY") + body);
+            var b = q.Block_("IDENTIFICADOR_ETIQUETA");
+            if (b != null)
+                foreach (var r in b.Records)
+                {
+                    if (SemNulo(r.Get("CD_IDENTIFICADOR")) != id.ToString()) continue;
+                    int prod;
+                    if (!int.TryParse(SemNulo(r.Get("CD_PRODUTO")), out prod) || prod <= 0) continue;   // eco do critério
+                    var et = new EtiquetaMv();
+                    et.Codigo = codigo.Trim(); et.Identificador = id; et.Produto = prod;
+                    et.Descricao = SemNulo(r.Get("DSP_DS_PRODUTO"));
+                    et.Unidade = SemNulo(r.Get("DSP_DS_UNIDADE"));
+                    et.Lote = SemNulo(r.Get("CD_LOTE"));
+                    DateTime v; if (DataHoraMv(r.Get("DT_VALIDADE"), out v)) et.Validade = v.Date;
+                    var qp = AtenderSolicitacao.LerNumero(SemNulo(r.Get("QTD_PADRAO"))); et.QtdPadrao = qp.HasValue ? qp.Value : 0;
+                    et.Ativa = SemNulo(r.Get("SN_ATIVO")) == "S";
+                    et.Mvto = SemNulo(r.Get("CD_MVTO_ESTOQUE"));
+                    Logger.Log("Etiqueta: " + codigo + " = " + prod + (et.Lote.Length > 0 ? " lote " + et.Lote : "") +
+                        (et.DeKit ? " (kit, mvto " + et.Mvto + ")" : "") + (et.QtdPadrao > 0 ? " padrão " + AtenderSolicitacao.Num(et.QtdPadrao) : "") + (et.Ativa ? "" : " INATIVA"));
+                    return et;
+                }
+            Logger.Log("Etiqueta: " + codigo + " (identificador " + id + ") não existe no MV.");
+            return null;
+        }
+
         // Alto nível: reimprime a etiqueta de um kit pelo código de barras (devolve o ZPL).
         public static async Task<EtiquetaZpl> GerarReimpressaoAsync(Session s, string codBarras)
         {
@@ -1746,10 +1790,16 @@ namespace SoulmvKit.Core
             var porKit = new System.Collections.Generic.Dictionary<int, decimal>();
             var usoLote = new System.Collections.Generic.Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
             var kits = new System.Collections.Generic.List<LinhaBaixa>();
+            var etiquetas = new System.Collections.Generic.List<LinhaBaixa>();
             var comuns = new System.Collections.Generic.List<LinhaBaixa>();
-            foreach (var l in linhas) { if (l.Kit != null) kits.Add(l); else comuns.Add(l); }
+            foreach (var l in linhas) { if (l.Kit != null) kits.Add(l); else if (l.Etiqueta != null) etiquetas.Add(l); else comuns.Add(l); }
             linhas = comuns;
             foreach (var l in linhas)
+            {
+                decimal t; totais.TryGetValue(l.Produto, out t); totais[l.Produto] = t + l.Quantidade;
+                pendentes[l.Produto] = l.Pendente;
+            }
+            foreach (var l in etiquetas)
             {
                 decimal t; totais.TryGetValue(l.Produto, out t); totais[l.Produto] = t + l.Quantidade;
                 pendentes[l.Produto] = l.Pendente;
@@ -1757,7 +1807,7 @@ namespace SoulmvKit.Core
             foreach (var k in kits)
                 foreach (var c in k.Kit.Componentes) { decimal t; porKit.TryGetValue(c.Produto, out t); porKit[c.Produto] = t + c.Quantidade; }
 
-            MorphisResponse r;
+            MorphisResponse r = null;
             // Kits: a etiqueta vai no campo de código de barras automático (o modo em que a tela
             // abre), como no MV (HAR atendendo-kits, 01/11/2026): NEXT_ITEM em
             // ITMVTO_ESTOQUE_AUTO_CTRL.DSP_CODIGO_DE_BARRAS_AUTO -> o MV abre uma linha por item
@@ -1779,12 +1829,63 @@ namespace SoulmvKit.Core
                 Logger.Log("Baixa: kit " + k.Kit.Barras + " (" + k.Kit.CdKit + ") bipado — " + k.Kit.Componentes.Count + " itens conferidos.");
             }
 
+            // Etiquetas de produto: um bipe por unidade (ou por QTD_PADRAO), como no MV (HAR
+            // atendendo-medicamento-pelo-codigo-de-barras, 486009); o bipe repetido soma na mesma
+            // linha. Avisos em cada bipe (teste na 486025, 01/11/2026): produto fora do pedido ->
+            // "não foi solicitado neste pedido" (Sim só se a linha é fora do pedido); quantidade
+            // ainda diferente da pedida -> "Quantidade Atendida é diferente da solicitada" (Sim: é
+            // o meio da contagem, ou o parcial que a conferência já mostrou); "maior que a
+            // solicitada" -> Sim só se o produto vai a mais. Responder Não tira a linha. Outro aviso = para.
+            for (int i = 0; i < etiquetas.Count; i++)
+            {
+                var e = etiquetas[i];
+                decimal passo = e.EtiquetaPasso > 0 ? e.EtiquetaPasso : 1;
+                int bipes = (int)decimal.Round(e.Quantidade / passo);
+                if (bipes <= 0 || bipes * passo != e.Quantidade)
+                    return Falha(res, e.Indice, "A quantidade " + AtenderSolicitacao.Num(e.Quantidade) + " do produto " + e.Produto +
+                        " não fecha com a etiqueta (" + AtenderSolicitacao.Num(passo) + " por bipe).");
+                for (int k = 0; k < bipes; k++)
+                {
+                    if (progresso != null) progresso("Bipando " + e.Produto + " " + e.Descricao + " (" + (k + 1) + " de " + bipes + ")");
+                    string corpo = "<block name=\"ITMVTO_ESTOQUE_AUTO_CTRL\"><record status=\"C\" id=\"\"><item name=\"DSP_CODIGO_DE_BARRAS_AUTO\">" + Xml(e.Etiqueta) + "</item></record></block>";
+                    r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
+                        AcaoXml("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO", "NEXT_ITEM", true), corpo));
+                    if (r.Command("SESSION_END") != null) return Falha(res, -1, "A sessão do MV que segurava a reserva acabou. Abra a solicitação de novo.");
+                    if ((r.Raw ?? "").IndexOf("WIN_PRINCIPAL1_2", StringComparison.Ordinal) < 0)
+                        return Falha(res, -1, "A tela de lançamento do MV não está aberta (a reserva pode ter caído). Abra a solicitação de novo.");
+                    for (int a = 0; a < 4 && r.Command("SHOW_ALERT") != null; a++)
+                    {
+                        string al = TextoAlerta(r);
+                        bool sim = (e.ForaDoPedido && al.IndexOf("não foi solicitado", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                                   al.IndexOf("diferente da solicitada", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   (e.AMais && al.IndexOf("maior que a solicitada", StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (!sim) return await FalhaComAlerta(m, r, res, e.Indice, "O MV recusou a etiqueta " + e.Etiqueta + " (" + e.Produto + ")");
+                        r = await m.FecharAlertaAsync(m.FormTask, r.Block ?? "ITMVTO_ESTOQUE", r.Item ?? "CD_PRODUTO", NomeAlerta(r), 1);
+                    }
+                    if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, e.Indice, "O MV recusou a etiqueta " + e.Etiqueta);
+                }
+                Logger.Log("Baixa: etiqueta " + e.Etiqueta + " (" + e.Produto + " lote " + e.Lote + ") bipada " + bipes + " vez(es).");
+            }
+            if (etiquetas.Count > 0)
+            {
+                string dif = ConferirLinhasDasEtiquetas(r, etiquetas);
+                if (dif != null) return Falha(res, etiquetas[0].Indice, "As etiquetas abriram no MV diferente do esperado: " + dif + ". Atenda esta solicitação pelo MV.");
+            }
+
             // Digitação por código
             r = await m.PostAsync(m.Msg("ITMVTO_ESTOQUE_AUTO_CTRL", "DSP_CODIGO_DE_BARRAS_AUTO",
                 AcaoXml("MVTO_ESTOQUE", "BTN_CD_PRODUTO", "btnCdProduto_click", true), ""));
             if (r.Command("SESSION_END") != null) return Falha(res, -1, "A sessão do MV que segurava a reserva acabou. Abra a solicitação de novo.");
             if ((r.Raw ?? "").IndexOf("WIN_PRINCIPAL1_2", StringComparison.Ordinal) < 0)
                 return Falha(res, -1, "A tela de lançamento do MV não está aberta (a reserva pode ter caído). Abra a solicitação de novo.");
+            // A troca de modo valida de novo a última linha bipada: repete as perguntas do bipe
+            // (teste na 486025, 01/11/2026). Mesmas respostas, só para produto bipado.
+            for (int a = 0; a < 4 && r.Command("SHOW_ALERT") != null; a++)
+            {
+                string al = TextoAlerta(r);
+                if (!PerguntaDeEtiqueta(al, etiquetas)) return await FalhaComAlerta(m, r, res, -1, "O MV não liberou a digitação por código");
+                r = await m.FecharAlertaAsync(m.FormTask, r.Block ?? "ITMVTO_ESTOQUE", r.Item ?? "CD_PRODUTO", NomeAlerta(r), 1);
+            }
             if (r.Command("SHOW_ALERT") != null) return await FalhaComAlerta(m, r, res, -1, "O MV não liberou a digitação por código");
             if (kits.Count > 0)
             {
@@ -2017,6 +2118,57 @@ namespace SoulmvKit.Core
             return r != null && r.IsOk && r.Command("SHOW_ALERT") == null &&
                 (string.Equals(r.Block, "ITMVTO_ESTOQUE", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(r.Block, "ITMVTO_ESTOQUE_AUTO_CTRL", StringComparison.OrdinalIgnoreCase));
+        }
+
+        // Pergunta do MV sobre um produto bipado pela etiqueta que pode ser respondida com Sim:
+        // "não foi solicitado neste pedido" (só se ele é fora do pedido), "Quantidade Atendida é
+        // diferente da solicitada" e "maior que a solicitada" (só se vai a mais). O código do
+        // produto vem no texto, entre parênteses.
+        public static bool PerguntaDeEtiqueta(string aviso, System.Collections.Generic.List<LinhaBaixa> etiquetas)
+        {
+            var mp = System.Text.RegularExpressions.Regex.Match(aviso ?? "", "\\((\\d+)\\)");
+            int prod;
+            if (!mp.Success || !int.TryParse(mp.Groups[1].Value, out prod)) return false;
+            foreach (var e in etiquetas)
+            {
+                if (e.Produto != prod) continue;
+                if (e.ForaDoPedido && aviso.IndexOf("não foi solicitado", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (aviso.IndexOf("diferente da solicitada", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (e.AMais && aviso.IndexOf("maior que a solicitada", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
+        }
+
+        // As linhas que o MV abriu com as etiquetas de produto: por produto e lote, a soma das
+        // quantidades das linhas com essas etiquetas tem que ser a que a baixa bipou.
+        public static string ConferirLinhasDasEtiquetas(MorphisResponse r, System.Collections.Generic.List<LinhaBaixa> etiquetas)
+        {
+            var b = r.Block_("ITMVTO_ESTOQUE");
+            if (b == null) return "o MV não mostrou as linhas";
+            var codigos = new System.Collections.Generic.HashSet<string>();
+            var esperado = new System.Collections.Generic.Dictionary<string, decimal>();
+            foreach (var e in etiquetas)
+            {
+                codigos.Add(e.Etiqueta);
+                string ch = e.Produto + " lote " + (e.Lote ?? "").ToUpperInvariant();
+                decimal t; esperado.TryGetValue(ch, out t); esperado[ch] = t + e.Quantidade;
+            }
+            var noMv = new System.Collections.Generic.Dictionary<string, decimal>();
+            foreach (var rec in b.Records)
+            {
+                if (!codigos.Contains(SemNulo(rec.Get("DSP_CODIGO_DE_BARRAS")))) continue;
+                string ch = SemNulo(rec.Get("CD_PRODUTO")) + " lote " + SemNulo(rec.Get("CD_LOTE")).ToUpperInvariant();
+                var q = AtenderSolicitacao.LerNumero(SemNulo(rec.Get("QT_MOVIMENTACAO")));
+                decimal t; noMv.TryGetValue(ch, out t); noMv[ch] = t + (q.HasValue ? q.Value : 0);
+            }
+            foreach (var kv in esperado)
+            {
+                decimal v; noMv.TryGetValue(kv.Key, out v);
+                if (v != kv.Value) return kv.Key + ": " + AtenderSolicitacao.Num(v) + " no MV, " + AtenderSolicitacao.Num(kv.Value) + " bipado(s)";
+            }
+            foreach (var kv in noMv)
+                if (!esperado.ContainsKey(kv.Key)) return kv.Key + " apareceu no MV sem ter sido bipado";
+            return null;
         }
 
         // As linhas que o MV abriu com a etiqueta (DSP_CODIGO_DE_BARRAS) têm que ser os itens do

@@ -98,6 +98,28 @@ namespace SoulmvKit.Core
         public decimal? Quantidade;
         public string Kit;               // etiqueta do kit bipado (null = linha comum): lote e quantidade travados
         public bool KitInteiro;          // o pedido é do próprio produto kit: a linha é 1 kit (Lote = etiqueta)
+        public string Etiqueta;          // etiqueta de PRODUTO bipada (lote da etiqueta; cada bipe soma EtiquetaPasso)
+        public decimal EtiquetaPasso;
+    }
+
+    // Uma etiqueta (identificador 2000000...) como o cadastro "Identificador Etiqueta" do MV
+    // (M_ID_ETIQUETA) a mostra: de produto (produto + lote + validade, ativa enquanto o lote é
+    // usado) ou de kit (produto kit + movimentação da produção; inativa depois de baixado).
+    public class EtiquetaMv
+    {
+        public string Codigo = "";       // o código de barras bipado
+        public long Identificador;       // CD_IDENTIFICADOR (o código sem o "2" e sem o dígito final)
+        public int Produto;
+        public string Descricao = "";
+        public string Unidade = "";
+        public string Lote = "";
+        public DateTime? Validade;
+        public decimal QtdPadrao;        // QTD_PADRAO (vazio = 1 por bipe)
+        public bool Ativa;               // SN_ATIVO
+        public string Mvto = "";         // CD_MVTO_ESTOQUE (produção do kit)
+
+        public bool DeKit { get { return Lote.Length == 0 && Mvto.Length > 0; } }
+        public decimal Passo { get { return QtdPadrao > 0 ? QtdPadrao : 1; } }
     }
 
     // Um kit produzido na farmácia (etiqueta 2000000...), como a consulta do MV o devolve pelo
@@ -147,6 +169,8 @@ namespace SoulmvKit.Core
         public bool AMais;               // o produto vai a mais -> "maior que a solicitada" -> Sim
         public decimal Pendente;         // o que faltava atender do PRODUTO na solicitação (0 = fora do pedido)
         public KitBipado Kit;            // não nulo = bipar esta etiqueta (o MV abre as linhas do kit); o resto não vale
+        public string Etiqueta;          // não nulo = bipar esta etiqueta de produto (Quantidade / EtiquetaPasso vezes)
+        public decimal EtiquetaPasso = 1;
     }
 
     // O que a gravação deu.
@@ -536,13 +560,74 @@ namespace SoulmvKit.Core
             return linhas.RemoveAll(delegate(LinhaAtender l) { return l.Kit != null && l.Kit == barras; });
         }
 
-        // Etiqueta interna do MV (kits e produtos): 13 dígitos começando com 2.
+        // Etiqueta interna do MV (kits e produtos): EAN-13 = "2" + identificador em 11 dígitos +
+        // dígito verificador (2000000211633 = identificador 21163; conferido em 01/11/2026).
         public static bool PareceEtiqueta(string codigo)
         {
+            return IdentificadorDaEtiqueta(codigo) > 0;
+        }
+
+        // 0 = não é etiqueta do MV (tamanho, prefixo ou dígito verificador errado).
+        public static long IdentificadorDaEtiqueta(string codigo)
+        {
             string c = (codigo ?? "").Trim();
-            if (c.Length < 8 || c.Length > 14 || c[0] != '2') return false;
-            foreach (char ch in c) if (!char.IsDigit(ch)) return false;
-            return true;
+            if (c.Length != 13 || c[0] != '2') return 0;
+            int soma = 0;
+            for (int i = 0; i < 13; i++)
+            {
+                if (!char.IsDigit(c[i])) return 0;
+                if (i < 12) soma += (c[i] - '0') * (i % 2 == 0 ? 1 : 3);
+            }
+            if ((10 - soma % 10) % 10 != c[12] - '0') return 0;
+            long id;
+            return long.TryParse(c.Substring(1, 11), out id) ? id : 0;
+        }
+
+        // Etiqueta de PRODUTO bipada: cada bipe soma o passo da etiqueta (1, salvo QTD_PADRAO) na
+        // linha daquela etiqueta. A 1ª vai na linha vazia do produto, se houver (fica a linha do
+        // pedido com lote e quantidade); senão, numa linha nova logo abaixo. Como no MV, o bipe
+        // repetido soma na mesma linha (teste na 486025, 01/11/2026). Devolve a linha.
+        public static int AdicionarEtiqueta(SolicitacaoAtender sol, List<LinhaAtender> linhas, EtiquetaMv et, bool foraDoPedido)
+        {
+            for (int i = 0; i < linhas.Count; i++)
+                if (linhas[i].Etiqueta == et.Codigo)
+                {
+                    linhas[i].Quantidade = (linhas[i].Quantidade ?? 0) + et.Passo;
+                    return i;
+                }
+            var it = sol.Item(et.Produto);
+            for (int i = 0; i < linhas.Count; i++)
+            {
+                var l = linhas[i];
+                if (l.Produto != et.Produto || l.Kit != null || l.Etiqueta != null) continue;
+                if (l.Quantidade.HasValue || !string.IsNullOrEmpty(l.Lote)) continue;
+                l.Lote = et.Lote; l.Validade = et.Validade; l.Quantidade = et.Passo;
+                l.Etiqueta = et.Codigo; l.EtiquetaPasso = et.Passo;
+                return i;
+            }
+            var n = new LinhaAtender();
+            n.Produto = et.Produto;
+            n.Descricao = it != null ? it.Descricao : et.Descricao;
+            n.Unidade = it != null ? it.Unidade : et.Unidade;
+            n.ForaDoPedido = foraDoPedido && it == null;
+            n.Lote = et.Lote; n.Validade = et.Validade; n.Quantidade = et.Passo;
+            n.Etiqueta = et.Codigo; n.EtiquetaPasso = et.Passo;
+            int pos = PosicaoSob(linhas, et.Produto);
+            linhas.Insert(pos, n);
+            return pos;
+        }
+
+        // Tira a etiqueta: a linha do pedido volta a ficar vazia; linha a mais sai.
+        public static void RemoverEtiqueta(List<LinhaAtender> linhas, int indice)
+        {
+            var l = linhas[indice];
+            int doProduto = 0;
+            foreach (var x in linhas) if (x.Produto == l.Produto) doProduto++;
+            if (doProduto == 1 && !l.ForaDoPedido)
+            {
+                l.Lote = null; l.Validade = null; l.Quantidade = null; l.Etiqueta = null; l.EtiquetaPasso = 0;
+            }
+            else linhas.RemoveAt(indice);
         }
 
         // ===== CONFERÊNCIA ANTES DE FECHAR =====
@@ -666,6 +751,7 @@ namespace SoulmvKit.Core
                 b.ForaDoPedido = l.ForaDoPedido || it == null;
                 b.AMais = aMais.Contains(l.Produto);
                 b.Pendente = it != null ? it.Pendente : 0;
+                if (l.Etiqueta != null) { b.Etiqueta = l.Etiqueta; b.EtiquetaPasso = l.EtiquetaPasso > 0 ? l.EtiquetaPasso : 1; }
                 res.Add(b);
             }
             return res;

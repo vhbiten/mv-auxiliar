@@ -737,7 +737,7 @@ namespace SoulmvKit.UI
             btnExcluir = new IconButton(IconButton.DesenharLixeira, "Excluir linha (Del). Item pedido sem linha não é atendido e fica pendente.");
             btnExcluir.Size = new Size(Theme.S(30), Theme.S(30));
             btnExcluir.Margin = new Padding(0);
-            btnExcluir.Click += new EventHandler(delegate { ExcluirLinha(); });
+            btnExcluir.Click += new EventHandler(delegate { ExcluirLinha(); FocarBarras(); });   // o cursor volta ao Código de barras
             tl.Controls.Add(btnExcluir, 0, 0);
 
             lblDica = new Label();
@@ -758,14 +758,30 @@ namespace SoulmvKit.UI
             txtBarras.BorderStyle = BorderStyle.None;
             txtBarras.Font = new Font("Segoe UI", 10f); txtBarras.ForeColor = Theme.TextDark; txtBarras.BackColor = Color.White;
             txtBarras.Dock = DockStyle.Fill;
+            // Leitor configurado com Tab no fim: o Tab com código no campo vale como Enter.
+            txtBarras.PreviewKeyDown += new PreviewKeyDownEventHandler(delegate(object s, PreviewKeyDownEventArgs pe)
+            {
+                if (pe.KeyCode == Keys.Tab && !pe.Shift && (txtBarras.Text ?? "").Trim().Length > 0) pe.IsInputKey = true;
+            });
             txtBarras.KeyDown += new KeyEventHandler(delegate(object s, KeyEventArgs ke)
             {
-                if (ke.KeyCode == Keys.Enter) { ke.SuppressKeyPress = true; BiparEtiqueta(); }
+                if (ke.KeyCode == Keys.Enter || (ke.KeyCode == Keys.Tab && !ke.Shift && (txtBarras.Text ?? "").Trim().Length > 0))
+                {
+                    ke.SuppressKeyPress = true; ke.Handled = true;
+                    BiparEtiqueta();
+                }
+                else if (ke.KeyCode == Keys.Down && _sol != null && grid.Rows.Count > 0)
+                {
+                    // Para digitar lote à mão: desce para a tabela, na linha marcada.
+                    ke.Handled = true;
+                    int r = grid.CurrentCell != null ? grid.CurrentCell.RowIndex : 0;
+                    IrPara(r, _linhas[r].Produto > 0 ? CLote : CProduto, false);
+                }
             });
             txtBarras.HandleCreated += new EventHandler(delegate { SendMessage(txtBarras.Handle, 0x1501, (IntPtr)1, "Código de barras"); });
             txtBarras.Enter += new EventHandler(delegate { AtualizarDica(); });
             hostBarras.Controls.Add(txtBarras);
-            new ToolTip().SetToolTip(txtBarras, "Etiqueta do kit (2000000...): os itens do kit entram na tabela com lote e quantidade.");
+            new ToolTip().SetToolTip(txtBarras, "Etiqueta do produto ou do kit (2000000...): cada bipe de produto soma 1 no lote da etiqueta; o kit entra com os itens dele.");
             tl.Controls.Add(hostBarras, 2, 0);
 
             // Secundário (contorno), à esquerda do "Fechar a Baixa": não grava nada.
@@ -802,13 +818,14 @@ namespace SoulmvKit.UI
             else if (_sol == null) dica = _preview ? "Pré-visualização: sem consultar o MV." : "Bipe ou digite o nº da solicitação e tecle Enter.";
             else if (_gravacaoIncerta) dica = "Confira a solicitação no MV antes de tentar de novo.";
             else if (!Atendivel()) dica = "Solicitação aberta só para consulta.";
-            else if (txtBarras != null && txtBarras.Focused) dica = "Bipe a etiqueta do kit.";
+            else if (txtBarras != null && txtBarras.Focused) dica = _ultimoBipe != null ? "Último bipe: " + _ultimoBipe : "Bipe a etiqueta.";
             else if (cc == null || !naGrade) dica = "F12 confere e fecha a baixa.";
             else
             {
                 bool vazia = cc.RowIndex >= 0 && cc.RowIndex < _linhas.Count && _linhas[cc.RowIndex].Produto <= 0;
                 string kit = cc.RowIndex >= 0 && cc.RowIndex < _linhas.Count ? _linhas[cc.RowIndex].Kit : null;
                 if (kit != null) dica = "Item de kit · Del tira o kit inteiro.";
+                else if (cc.RowIndex < _linhas.Count && _linhas[cc.RowIndex].Etiqueta != null) dica = "Bipado pela etiqueta · Del tira os bipes.";
                 else if (vazia) dica = cc.ColumnIndex == CProduto ? "Produto: F9 mostra os produtos do estoque (ou digite o código)." : "Para incluir um produto, vá à coluna Produto e tecle F9.";
                 else if (cc.ColumnIndex == CLote) dica = "Lote: F9 mostra os lotes do produto · Enter vai para Atender.";
                 else if (cc.ColumnIndex == CAtender) dica = "Atender: digite a quantidade · Enter vai para a linha de baixo · Shift+Tab volta.";
@@ -820,6 +837,15 @@ namespace SoulmvKit.UI
         // ===== ABRIR A SOLICITAÇÃO (só leitura) =====
         private async void Abrir()
         {
+            // Etiqueta bipada no campo da solicitação (com uma aberta): é bipe, não nº de solicitação.
+            string digitado = (txtNumero.Text ?? "").Trim();
+            if (AtenderSolicitacao.PareceEtiqueta(digitado))
+            {
+                txtNumero.Text = _sol != null ? _sol.Numero.ToString() : "";
+                DesviarParaBarras(digitado);   // sem solicitação aberta: avisa para abrir antes
+                if (_sol == null) txtNumero.Focus();
+                return;
+            }
             long numero;
             if (!long.TryParse((txtNumero.Text ?? "").Trim(), out numero) || numero <= 0)
             {
@@ -899,7 +925,7 @@ namespace SoulmvKit.UI
                 foreach (var kv in lotes) _lotes[kv.Key] = kv.Value;
                 grid.Invalidate();
                 TerminouCarga(null);   // grade liberada antes de receber o foco
-                IrPara(0, CLote, false);
+                MarcarLinha(0);        // o cursor vai para o Código de barras (no fim, já liberado)
             }
             catch (SessaoExpiradaException)
             {
@@ -917,7 +943,11 @@ namespace SoulmvKit.UI
                 _reservando = false;
                 if (carga == _carga) { _ocupado = false; if (!IsDisposed) { MostrarReserva(); AtualizarBotoes(); TerminouCarga(txtNumero); } }
             }
-            if (!IsDisposed && carga == _carga && Atendivel()) PrepararProdutos(_sol.Estoque);
+            if (!IsDisposed && carga == _carga && Atendivel())
+            {
+                PrepararProdutos(_sol.Estoque);
+                FocarBarras();   // pronto para o primeiro bipe
+            }
         }
 
         // Editável só com a reserva no MV (ou solta por inatividade: o próximo toque reserva de novo).
@@ -1051,6 +1081,10 @@ namespace SoulmvKit.UI
         {
             _linhas.Clear();
             _kits.Clear();
+            _etiquetas.Clear();
+            _bipes.Clear();
+            _ultimoBipe = null;
+            _linhaDoCampo = -1;
             bool jaAtendido = false;
             if (_sol != null)
                 foreach (var it in _sol.Itens)
@@ -1173,6 +1207,15 @@ namespace SoulmvKit.UI
                 }
                 if (e.ColumnIndex != CValidade || !l.Validade.HasValue) return;
             }
+            if (l.Etiqueta != null)
+            {
+                if (e.ColumnIndex == CDescricao) { var pd = e.CellStyle.Padding; e.CellStyle.Padding = new Padding(pd.Left, pd.Top, Theme.S(64), pd.Bottom); }
+                if (e.ColumnIndex == CDescricao || e.ColumnIndex == CProduto)
+                {
+                    cel.ToolTipText = "Bipado pela etiqueta " + l.Etiqueta + (l.ForaDoPedido ? " · produto fora do pedido" : "");
+                    return;
+                }
+            }
             // Produto fora do pedido aparece igual aos outros (Solicitado em branco); a conferência
             // do F12 mostra a situação.
             if ((e.ColumnIndex == CDescricao || e.ColumnIndex == CProduto) && l.ForaDoPedido)
@@ -1227,8 +1270,11 @@ namespace SoulmvKit.UI
         private void OnPintar(object sender, DataGridViewCellPaintingEventArgs e)
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            // Item de kit: selo "kit" no fim da Descrição (em qualquer linha, atual ou não).
-            bool seloKit = e.ColumnIndex == CDescricao && e.RowIndex < _linhas.Count && _linhas[e.RowIndex].Kit != null;
+            // Item de kit / bipado pela etiqueta: selo no fim da Descrição (em qualquer linha).
+            string selo = null;
+            if (e.ColumnIndex == CDescricao && e.RowIndex < _linhas.Count)
+                selo = _linhas[e.RowIndex].Kit != null ? "kit" : _linhas[e.RowIndex].Etiqueta != null ? "bipado" : null;
+            bool seloKit = selo != null;
             var cc = grid.CurrentCell;
             bool atual = cc != null && cc.RowIndex == e.RowIndex;
             bool celula = atual && cc.ColumnIndex == e.ColumnIndex;
@@ -1237,7 +1283,7 @@ namespace SoulmvKit.UI
             if (!celula && !primeira)
             {
                 e.Paint(e.ClipBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.Focus);
-                DesenharSeloKit(e.Graphics, e.CellBounds);
+                DesenharSelo(e.Graphics, e.CellBounds, selo);
                 e.Handled = true;
                 return;
             }
@@ -1255,14 +1301,13 @@ namespace SoulmvKit.UI
             else e.Paint(e.ClipBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.Focus);
             if (primeira)
                 using (var b = new SolidBrush(cor)) e.Graphics.FillRectangle(b, e.CellBounds.X, e.CellBounds.Y, Theme.S(4), e.CellBounds.Height - 1);
-            if (seloKit) DesenharSeloKit(e.Graphics, e.CellBounds);
+            if (seloKit) DesenharSelo(e.Graphics, e.CellBounds, selo);
             e.Handled = true;
         }
 
         // Pílula "kit" encostada à direita da célula (a Descrição é larga; o texto fica à esquerda).
-        private static void DesenharSeloKit(Graphics g, Rectangle celula)
+        private static void DesenharSelo(Graphics g, Rectangle celula, string texto)
         {
-            const string texto = "kit";
             Size t = TextRenderer.MeasureText(g, texto, FonteSelo, Size.Empty, TextFormatFlags.NoPadding);
             int h = Math.Min(celula.Height - Theme.S(8), t.Height + Theme.S(4));
             int w = t.Width + Theme.S(14);
@@ -1290,7 +1335,7 @@ namespace SoulmvKit.UI
         {
             if (!Atendivel() || _ocupado || linha < 0 || linha >= _linhas.Count) return false;
             if (_linhas[linha].Produto <= 0) return coluna == CProduto;
-            if (_linhas[linha].Kit != null) return false;   // item de kit: travado (Del tira o kit)
+            if (_linhas[linha].Kit != null || _linhas[linha].Etiqueta != null) return false;   // kit / etiqueta: travado (Del tira)
             return coluna == CLote || coluna == CAtender;
         }
 
@@ -1305,6 +1350,15 @@ namespace SoulmvKit.UI
             var row = grid.Rows[e.RowIndex];
             var l = _linhas[e.RowIndex];
             string txt = Convert.ToString(row.Cells[e.ColumnIndex].Value ?? "").Trim();
+
+            // Etiqueta bipada com o cursor na tabela: não vira lote, quantidade nem produto — vai
+            // para o Código de barras (a célula volta ao que era).
+            if (txt.StartsWith("200000", StringComparison.Ordinal) && AtenderSolicitacao.PareceEtiqueta(txt))
+            {
+                PreencherLinha(row);
+                DesviarParaBarras(txt);
+                return;
+            }
 
             if (e.ColumnIndex == CProduto && l.Produto <= 0)
             {
@@ -1324,6 +1378,7 @@ namespace SoulmvKit.UI
                     if (!q.HasValue || q.Value < 0) avisos.SetState(StatusKind.Warning, "Quantidade inválida: \"" + txt + "\".");
                     else l.Quantidade = q.Value == 0 ? (decimal?)null : q.Value;
                 }
+                if (l.Quantidade.HasValue) VoltarAoCampoSe(e.RowIndex);
             }
             else if (e.ColumnIndex == CLote)
             {
@@ -1356,6 +1411,7 @@ namespace SoulmvKit.UI
                 if (achado == null && it == null)
                 {
                     avisos.SetState(StatusKind.Warning, "O produto " + cod + " não tem saldo em " + _sol.DsEstoque + ". Tecle F9 para procurar pelo nome.");
+                    if (VoltarAoCampoSe(linha)) try { System.Media.SystemSounds.Exclamation.Play(); } catch { }
                     return;
                 }
                 await DefinirProduto(linha, cod, it != null ? it.Descricao : achado.Nome, it != null ? it.Unidade : achado.Unidade);
@@ -1377,7 +1433,7 @@ namespace SoulmvKit.UI
                     cod + "  " + descricao + "\n\nEsse produto não foi solicitado nesse pedido, deseja incluir?", "Incluir", "Não incluir", true))
             {
                 if (IsDisposed) return;
-                IrPara(linha, CProduto, false);
+                if (!VoltarAoCampoSe(linha)) IrPara(linha, CProduto, false);
                 return;
             }
             if (IsDisposed) return;
@@ -1409,7 +1465,7 @@ namespace SoulmvKit.UI
         {
             if (!Atendivel() || _ocupado || _buscando) return;
             if (linha < 0 || linha >= _linhas.Count) return;
-            if (_linhas[linha].Kit != null) return;   // lote do kit não se troca
+            if (_linhas[linha].Kit != null || _linhas[linha].Etiqueta != null) return;   // lote do kit/etiqueta não se troca
             bool vazia = _linhas[linha].Produto <= 0;
             bool lotes = !vazia && coluna == CLote;
             bool produtos = vazia && (coluna == CProduto || (clique && coluna == CDescricao));
@@ -1441,6 +1497,7 @@ namespace SoulmvKit.UI
             {
                 avisos.SetState(StatusKind.Warning, l.Produto + " " + l.Descricao + " não tem lote com saldo em " + _sol.DsEstoque +
                     ". Se for kit, bipe a etiqueta no campo Código de barras.");
+                VoltarAoCampoSe(linha);
                 return;
             }
             var linhas = new List<string[]>();
@@ -1469,7 +1526,7 @@ namespace SoulmvKit.UI
             }
             if (IsDisposed) return;
             Tocar();   // escolher na lista conta como uso
-            if (escolhido < 0) { IrPara(linha, CLote, false); return; }
+            if (escolhido < 0) { if (!VoltarAoCampoSe(linha)) IrPara(linha, CLote, false); return; }
             var sel = lp.Lotes[escolhido];
             l.Lote = sel.Lote; l.Validade = sel.Validade;
             PreencherLinha(grid.Rows[linha]);
@@ -1548,90 +1605,337 @@ namespace SoulmvKit.UI
                 r.Parciais.Count + " parcial(is) [" + string.Join("; ", r.Parciais.ToArray()) + "], " + r.SemSaldo.Count + " sem saldo.");
             if (r.Preenchidos == 0)
             {
-                IrPara(Math.Min(linhaAntes, _linhas.Count - 1), CLote, false);
+                MarcarLinha(Math.Min(linhaAntes, _linhas.Count - 1));
+                FocarBarras();
                 avisos.SetState(StatusKind.Info, "Nada para preencher.");
                 return;
             }
-            IrPara(r.PrimeiraLinha >= 0 ? r.PrimeiraLinha : Math.Min(linhaAntes, _linhas.Count - 1), CAtender, false);
+            MarcarLinha(r.PrimeiraLinha >= 0 ? r.PrimeiraLinha : Math.Min(linhaAntes, _linhas.Count - 1));
+            FocarBarras();   // o cursor fica no Código de barras (a linha preenchida fica marcada)
             avisos.SetState(StatusKind.Info, "Itens preenchidos. Confira antes de fechar a baixa.");
         }
 
-        // ===== ETIQUETA DE KIT =====
-        // Lê o kit pela etiqueta (consulta do MV, só leitura), confere se ainda está em estoque e
-        // põe os itens sob os produtos da solicitação (AtenderSolicitacao.IncluirKit). Não grava:
-        // o "Fechar a Baixa" bipa a etiqueta no MV antes das outras linhas.
-        private async void BiparEtiqueta()
+        // ===== ETIQUETAS (KIT E PRODUTO) =====
+        // O campo "Código de barras" aceita a etiqueta do kit e a do produto (as duas 2000000...;
+        // pedido do usuário, 01/11/2026). A etiqueta é lida no cadastro "Identificador Etiqueta" do
+        // MV (só leitura): kit -> itens do kit sob os produtos (IncluirKit); produto -> lote da
+        // etiqueta, 1 por bipe, na linha do produto (AdicionarEtiqueta). Não grava: o "Fechar a
+        // Baixa" bipa as etiquetas no MV antes das linhas digitadas. Bipes em sequência entram
+        // numa fila; etiqueta de produto já lida não volta ao MV.
+        private readonly Queue<string> _bipes = new Queue<string>();
+        private readonly Dictionary<string, EtiquetaMv> _etiquetas = new Dictionary<string, EtiquetaMv>();   // desta solicitação
+        private bool _bipando;
+
+        // FLUXO DO BIPE (pedido do usuário, 01/11/2026: "o campo de código de barras deve ser o
+        // campo de entrada para bipar produto e kit; ao bipar, o foco permanece nele aguardando o
+        // próximo bipe"):
+        //  - abriu a solicitação -> cursor no Código de barras;
+        //  - bipe certo -> a linha fica marcada na tabela, o campo limpa e o cursor fica nele; sem
+        //    aviso no canto: o rodapé mostra o último bipe (produto · lote · total de pedido);
+        //  - bipe recusado -> aviso + som de alerta, cursor no campo;
+        //  - nº de solicitação bipado aqui -> abre a solicitação;
+        //  - etiqueta bipada com o cursor na tabela ou no nº da solicitação -> vem para cá (não vira
+        //    lote, quantidade nem nº de solicitação);
+        //  - leitor configurado com Tab no fim = Enter; seta para baixo vai para a tabela (digitação
+        //    manual de lote); Preencher, lixeira e Voltar da conferência devolvem o cursor ao campo.
+        private string _ultimoBipe;   // o que o rodapé mostra com o cursor no campo
+
+        private void BiparEtiqueta()
         {
             string cod = (txtBarras.Text ?? "").Trim();
             if (cod.Length == 0) return;
-            if (_sol == null) { avisos.SetState(StatusKind.Warning, "Abra a solicitação antes de bipar o kit."); return; }
-            if (!Atendivel() || _ocupado || _buscando || CarregandoAgora) return;
-            Tocar();
-            if (grid.IsCurrentCellInEditMode) grid.EndEdit();
-            txtBarras.SelectAll();
-            if (!AtenderSolicitacao.PareceEtiqueta(cod)) { avisos.SetState(StatusKind.Warning, "\"" + cod + "\" não é um código de barras de etiqueta."); return; }
-            foreach (var l in _linhas) if (l.Kit == cod) { avisos.SetState(StatusKind.Warning, "Esse kit já foi bipado."); return; }
-
-            long numero = _sol.Numero;
-            KitBipado kit = null;
-            bool emEstoque = false;
-            bool tenho = false;
-            avisos.SetState(StatusKind.Busy, "Lendo a etiqueta " + cod + "...");
-            _buscando = true; AtualizarBotoes();
-            try
-            {
-                if (_preview) { await Task.Delay(300); kit = KitDeExemplo(cod); emEstoque = kit != null && cod != "2000000000002"; }
-                else
-                {
-                    tenho = await MvGate.EntrarAsync("atender-kit", 30000);
-                    if (IsDisposed) return;
-                    if (!tenho) { avisos.SetState(StatusKind.Warning, "O MV está respondendo outra consulta. Bipe de novo em instantes."); return; }
-                    kit = await MorphisClient.LerKitAsync(_host.Session, cod);
-                    if (kit != null && !IsDisposed && _sol != null) emEstoque = await AtenderSolicitacao.KitEmEstoqueAsync(_host.Session, kit, _sol.Estoque, false);
-                }
-            }
-            catch (SessaoExpiradaException) { if (!IsDisposed) _host.SessaoExpirou(); return; }
-            catch (Exception ex)
-            {
-                Logger.Log("Atender: etiqueta " + cod + " não lida: " + ex.Message);
-                if (!IsDisposed) avisos.SetState(StatusKind.Error, "Não foi possível ler a etiqueta: " + ex.Message);
-                return;
-            }
-            finally
-            {
-                if (tenho) MvGate.Sair();
-                _buscando = false;
-                if (!IsDisposed) AtualizarBotoes();
-            }
-            if (IsDisposed || _sol == null || _sol.Numero != numero) return;
-            if (kit == null) { avisos.SetState(StatusKind.Warning, "O código " + cod + " não é etiqueta de kit."); return; }
-            if (!emEstoque)
-            {
-                Logger.Log("Atender: kit " + cod + " fora da Consulta de Kits do estoque " + _sol.Estoque + ".");
-                avisos.SetState(StatusKind.Warning, "Esse kit não está mais em estoque (já foi baixado?).");
-                return;
-            }
-            string erro = AtenderSolicitacao.IncluirKit(_sol, _linhas, kit);
-            if (erro != null) { avisos.SetState(StatusKind.Warning, erro); return; }
-            _kits[kit.Barras] = kit;
-            Logger.Log("Atender: kit " + cod + " (" + kit.CdKit + " " + kit.Nome + ") incluído na " + _sol.Numero + ".");
-            Renderizar();
-            int primeira = _linhas.FindIndex(delegate(LinhaAtender l) { return l.Kit == kit.Barras; });
-            if (primeira >= 0)
-            {
-                _montando = true;
-                try { grid.CurrentCell = grid.Rows[primeira].Cells[CLote]; } catch { }
-                _montando = false;
-            }
             txtBarras.Text = "";
-            txtBarras.Focus();   // pronto para o próximo kit
-            avisos.SetState(StatusKind.Info, "Kit incluído.");
+            _linhaDoCampo = -1;
+            if (!AtenderSolicitacao.PareceEtiqueta(cod) && cod.Length <= 9 && SoDigitos(cod))
+            {
+                if (_sol == null)
+                {
+                    // Sem solicitação aberta: é o nº da solicitação (bipado ou digitado aqui).
+                    txtNumero.Text = cod;
+                    Abrir();
+                    return;
+                }
+                // Com a solicitação aberta: é o CÓDIGO DO PRODUTO, como na digitação por código do
+                // MV (01/11/2026: o atendente digitou 9020240 no campo). Nunca fecha a solicitação aberta.
+                if (!Atendivel()) { Recusar("Solicitação aberta só para consulta."); return; }
+                if (_ocupado || _buscando || CarregandoAgora) { Recusar("Aguarde e digite o código de novo."); return; }
+                ProdutoDigitado(int.Parse(cod));
+                return;
+            }
+            if (_sol == null) { Recusar("Abra a solicitação antes de bipar."); return; }
+            if (!Atendivel()) { Recusar("Solicitação aberta só para consulta."); return; }
+            if (_ocupado || CarregandoAgora) { Recusar("Aguarde a solicitação terminar de carregar e bipe de novo."); return; }
+            _bipes.Enqueue(cod);
+            if (!_bipando) ProcessarBipes();
         }
 
-        // Pré-visualização: 2000000000001 = kit de exemplo com 2 itens da 484416; 2000000000002 = já baixado.
+        private static bool SoDigitos(string s)
+        {
+            foreach (char c in s) if (!char.IsDigit(c)) return false;
+            return s.Length > 0;
+        }
+
+        // Etiqueta que chegou fora do campo (tabela, nº da solicitação): entra na fila do bipe.
+        private void DesviarParaBarras(string cod)
+        {
+            if (_sol == null || !Atendivel()) { Recusar(_sol == null ? "Abra a solicitação antes de bipar." : "Solicitação aberta só para consulta."); return; }
+            _bipes.Enqueue(cod);
+            if (!_bipando) ProcessarBipes();
+            FocarBarras();
+        }
+
+        private void Recusar(string msg)
+        {
+            avisos.SetState(StatusKind.Warning, msg);
+            try { System.Media.SystemSounds.Exclamation.Play(); } catch { }
+            FocarBarras();
+        }
+
+        // Cursor no campo do código de barras (depois que a tela terminar o que está fazendo).
+        private void FocarBarras()
+        {
+            if (txtBarras == null || IsDisposed || !IsHandleCreated) return;
+            this.BeginInvoke((MethodInvoker)delegate
+            {
+                if (IsDisposed || !this.Visible) return;
+                foreach (Form f in Application.OpenForms) if (f.Modal && f.Visible) return;
+                if (grid.IsCurrentCellInEditMode) grid.EndEdit();
+                if (txtBarras.Enabled && txtBarras.CanFocus) txtBarras.Focus();
+                AtualizarDica();
+            });
+        }
+
+        // Código de produto digitado no campo: a linha vazia do produto no pedido (lote pela lista,
+        // depois a quantidade); produto já com lote, ou fora do pedido, vai pela linha vazia do fim
+        // (fora do pedido pergunta antes). Digitada a quantidade, o cursor volta ao campo.
+        private int _linhaDoCampo = -1;
+
+        private void ProdutoDigitado(int produto)
+        {
+            Tocar();
+            int livre = _linhas.FindIndex(delegate(LinhaAtender l)
+            {
+                return l.Produto == produto && l.Kit == null && l.Etiqueta == null && !l.Quantidade.HasValue && string.IsNullOrEmpty(l.Lote);
+            });
+            if (livre >= 0)
+            {
+                _linhaDoCampo = livre;
+                IrPara(livre, CLote, false);
+                AbrirLotes(livre);
+                return;
+            }
+            int vazia = _linhas.FindIndex(delegate(LinhaAtender l) { return l.Produto <= 0; });
+            if (vazia < 0) { Recusar("Não há linha livre para incluir o produto."); return; }
+            _linhaDoCampo = vazia;
+            IrPara(vazia, CProduto, false);
+            DefinirProdutoPorCodigo(vazia, produto);
+        }
+
+        // A digitação que começou no campo terminou (ou foi cancelada): o cursor volta para ele.
+        private bool VoltarAoCampoSe(int linha)
+        {
+            if (_linhaDoCampo < 0 || linha != _linhaDoCampo) return false;
+            _linhaDoCampo = -1;
+            FocarBarras();
+            return true;
+        }
+
+        // Marca a linha na tabela sem levar o cursor para lá.
+        private void MarcarLinha(int linha)
+        {
+            if (linha < 0 || linha >= grid.Rows.Count) return;
+            _montando = true;
+            try { grid.CurrentCell = grid.Rows[linha].Cells[CLote]; } catch { }
+            _montando = false;
+        }
+
+        private async void ProcessarBipes()
+        {
+            _bipando = true;
+            try
+            {
+                // Um bipe recusado não derruba os seguintes: cada etiqueta vale por si.
+                while (_bipes.Count > 0 && !IsDisposed && _sol != null)
+                    await UmBipe(_bipes.Dequeue());
+            }
+            finally { _bipando = false; }
+        }
+
+        // false = parou com aviso.
+        private async Task<bool> UmBipe(string cod)
+        {
+            Tocar();
+            if (grid.IsCurrentCellInEditMode) grid.EndEdit();
+            if (!AtenderSolicitacao.PareceEtiqueta(cod)) { Recusar("\"" + cod + "\" não é um código de barras de etiqueta."); return false; }
+            foreach (var l in _linhas) if (l.Kit == cod) { Recusar("Esse kit já foi bipado."); return false; }
+
+            long numero = _sol.Numero;
+            EtiquetaMv et;
+            KitBipado kit = null;
+            if (!_etiquetas.TryGetValue(cod, out et))
+            {
+                bool tenho = false;
+                avisos.SetState(StatusKind.Busy, "Lendo a etiqueta " + cod + "...");
+                _buscando = true; AtualizarBotoes();
+                try
+                {
+                    if (_preview) { await Task.Delay(300); et = EtiquetaDeExemplo(cod); if (et != null && et.DeKit) kit = KitDeExemplo(cod); }
+                    else
+                    {
+                        tenho = await MvGate.EntrarAsync("atender-etiqueta", 30000);
+                        if (IsDisposed) return false;
+                        if (!tenho) { Recusar("O MV está respondendo outra consulta. Bipe de novo em instantes."); return false; }
+                        et = await MorphisClient.LerEtiquetaAsync(_host.Session, cod);
+                        if (et != null && et.Ativa && et.Lote.Length == 0) kit = await MorphisClient.LerKitAsync(_host.Session, cod);
+                    }
+                }
+                catch (SessaoExpiradaException) { if (!IsDisposed) _host.SessaoExpirou(); return false; }
+                catch (Exception ex)
+                {
+                    Logger.Log("Atender: etiqueta " + cod + " não lida: " + ex.Message);
+                    if (!IsDisposed) { avisos.SetState(StatusKind.Error, "Não foi possível ler a etiqueta: " + ex.Message); FocarBarras(); }
+                    return false;
+                }
+                finally
+                {
+                    if (tenho) MvGate.Sair();
+                    _buscando = false;
+                    if (!IsDisposed) AtualizarBotoes();
+                }
+                if (IsDisposed || _sol == null || _sol.Numero != numero) return false;
+                if (et == null) { Recusar("A etiqueta " + cod + " não existe no MV."); return false; }
+                if (et.Lote.Length > 0 && et.Ativa) _etiquetas[cod] = et;   // etiqueta de produto vale para o lote todo
+            }
+
+            // ----- kit -----
+            if (et.Lote.Length == 0)
+            {
+                if (!et.Ativa) { Recusar("Esse kit não está mais em estoque (já foi baixado)."); return false; }
+                if (kit == null) { Recusar("A etiqueta " + cod + " não tem lote nem kit no MV: atenda este item pelo MV."); return false; }
+                string erro = AtenderSolicitacao.IncluirKit(_sol, _linhas, kit);
+                if (erro != null) { Recusar(erro); return false; }
+                _kits[kit.Barras] = kit;
+                Logger.Log("Atender: kit " + cod + " (" + kit.CdKit + " " + kit.Nome + ") incluído na " + _sol.Numero + ".");
+                Renderizar();
+                MostrarLinha(_linhas.FindIndex(delegate(LinhaAtender l) { return l.Kit == kit.Barras; }));
+                avisos.Livre();
+                _ultimoBipe = kit.Nome + " · " + kit.Componentes.Count + " itens";
+                AtualizarDica();
+                return true;
+            }
+
+            // ----- produto -----
+            if (!et.Ativa) { Recusar("A etiqueta " + cod + " está inativa no MV."); return false; }
+            if (et.Validade.HasValue && et.Validade.Value.Date < DateTime.Today)
+            {
+                Recusar("Lote " + et.Lote + " de " + et.Descricao + " vencido em " + et.Validade.Value.ToString("dd/MM/yyyy") + ".");
+                return false;
+            }
+            LotesProduto lp;
+            try
+            {
+                if (!_lotes.TryGetValue(et.Produto, out lp))
+                {
+                    avisos.SetState(StatusKind.Busy, "Lendo os lotes de " + et.Descricao + "...");
+                    _buscando = true; AtualizarBotoes();
+                    try { lp = await GarantirLotesAsync(et.Produto); }
+                    finally { _buscando = false; if (!IsDisposed) AtualizarBotoes(); }
+                }
+            }
+            catch (SessaoExpiradaException) { if (!IsDisposed) _host.SessaoExpirou(); return false; }
+            catch (Exception ex) { if (!IsDisposed) { avisos.SetState(StatusKind.Error, "Não foi possível ler os lotes: " + ex.Message); FocarBarras(); } return false; }
+            if (IsDisposed || _sol == null || _sol.Numero != numero) return false;
+            if (!_preview && lp.Achar(et.Lote) == null)
+            {
+                Recusar("O lote " + et.Lote + " de " + et.Descricao + " não tem saldo em " + _sol.DsEstoque + ".");
+                return false;
+            }
+            // Saldo do lote no MV: o bipe que passa do saldo é recusado na hora (não só no F12).
+            var loteMv = lp.Achar(et.Lote);
+            if (loteMv != null)
+            {
+                decimal usado = 0;
+                foreach (var l in _linhas)
+                    if (l.Produto == et.Produto && l.Kit == null && l.Quantidade.HasValue && string.Equals((l.Lote ?? "").Trim(), loteMv.Lote, StringComparison.OrdinalIgnoreCase))
+                        usado += l.Quantidade.Value;
+                if (usado + et.Passo > loteMv.Quantidade)
+                {
+                    Recusar("O lote " + loteMv.Lote + " de " + et.Descricao + " tem " + AtenderSolicitacao.Num(loteMv.Quantidade) + " de saldo no MV; já há " + AtenderSolicitacao.Num(usado) + " na baixa.");
+                    return false;
+                }
+            }
+            bool jaBipada = _linhas.Exists(delegate(LinhaAtender l) { return l.Etiqueta == cod; });
+            bool fora = _sol.Item(et.Produto) == null;
+            // Padrão "Não incluir": o Enter do próximo bipe não confirma a inclusão sem querer.
+            if (fora && !jaBipada && !PerguntaMv.Perguntar(this, "Produto não solicitado",
+                    et.Produto + "  " + et.Descricao + "\n\nEsse produto não foi solicitado nesse pedido, deseja incluir?", "Incluir", "Não incluir", false))
+            {
+                FocarBarras();
+                return false;
+            }
+            if (IsDisposed || _sol == null) return false;
+            int linha = AtenderSolicitacao.AdicionarEtiqueta(_sol, _linhas, et, fora);
+            GarantirLinhaVaziaNoFim();
+            Renderizar();
+            MostrarLinha(linha);
+            avisos.Livre();   // bipe de produto não gera aviso: a tabela e o rodapé mostram
+            var itp = _sol.Item(et.Produto);
+            decimal noProduto = 0;
+            foreach (var l in _linhas) if (l.Produto == et.Produto && l.Quantidade.HasValue) noProduto += l.Quantidade.Value;
+            _ultimoBipe = et.Descricao + " · lote " + et.Lote + " · " + AtenderSolicitacao.Num(noProduto) +
+                (itp != null ? " de " + AtenderSolicitacao.Num(itp.Pendente) : " (fora do pedido)");
+            AtualizarDica();
+            return true;
+        }
+
+        // Deixa a linha visível e selecionada sem tirar o cursor do campo (pronto para o próximo bipe).
+        private void MostrarLinha(int linha)
+        {
+            if (linha >= 0 && linha < grid.Rows.Count)
+            {
+                _montando = true;
+                try { grid.CurrentCell = grid.Rows[linha].Cells[CLote]; } catch { }
+                _montando = false;
+            }
+            txtBarras.Focus();
+        }
+
+        // A linha vazia do fim continua sendo a última (a etiqueta pode ter entrado depois dela).
+        private void GarantirLinhaVaziaNoFim()
+        {
+            if (!Atendivel()) return;
+            int vazia = _linhas.FindIndex(delegate(LinhaAtender l) { return l.Produto <= 0; });
+            if (vazia >= 0 && vazia != _linhas.Count - 1) { var v = _linhas[vazia]; _linhas.RemoveAt(vazia); _linhas.Add(v); }
+            else if (vazia < 0) _linhas.Add(new LinhaAtender());
+        }
+
+        // Pré-visualização (códigos com dígito verificador certo): 2000000000015 = kit de exemplo;
+        // 2000000000022 = kit já baixado; 2000000000039 = etiqueta de produto (1º item, 1º lote).
+        private EtiquetaMv EtiquetaDeExemplo(string cod)
+        {
+            var et = new EtiquetaMv();
+            et.Codigo = cod; et.Identificador = AtenderSolicitacao.IdentificadorDaEtiqueta(cod); et.Ativa = true;
+            if (cod == "2000000000039" && _sol != null && _sol.Itens.Count > 0)
+            {
+                var it = _sol.Itens[0];
+                LotesProduto lp;
+                et.Produto = it.Produto; et.Descricao = it.Descricao; et.Unidade = it.Unidade;
+                if (_lotes.TryGetValue(it.Produto, out lp) && lp.Lotes.Count > 0) { et.Lote = lp.Lotes[0].Lote; et.Validade = lp.Lotes[0].Validade; }
+                else { et.Lote = "ETQ-1"; et.Validade = DateTime.Today.AddYears(1); }
+                return et;
+            }
+            if (cod == "2000000000015" || cod == "2000000000022")
+            {
+                et.Produto = 99999; et.Descricao = "KIT DE EXEMPLO"; et.Mvto = "1"; et.Ativa = cod == "2000000000015";
+                return et;
+            }
+            return null;
+        }
+
+        // Pré-visualização: o kit de exemplo tem 2 itens da 484416.
         private KitBipado KitDeExemplo(string cod)
         {
-            if (cod != "2000000000001" && cod != "2000000000002") return null;
+            if (cod != "2000000000015" && cod != "2000000000022") return null;
             var k = new KitBipado();
             k.Barras = cod; k.CdKit = 99999; k.Nome = "KIT DE EXEMPLO"; k.Estoque = _sol != null ? _sol.Estoque : 0; k.Validade = DateTime.Today.AddYears(2);
             int n = 0;
@@ -1667,6 +1971,15 @@ namespace SoulmvKit.UI
                 Renderizar();
                 IrPara(Math.Min(r, _linhas.Count - 1), CLote, false);
                 avisos.SetState(StatusKind.Info, "Kit " + barras + " retirado.");
+                return;
+            }
+            if (l.Etiqueta != null)
+            {
+                // Etiqueta de produto: sai o que foi bipado (a linha do pedido volta a ficar vazia).
+                AtenderSolicitacao.RemoverEtiqueta(_linhas, r);
+                Renderizar();
+                IrPara(Math.Min(r, _linhas.Count - 1), CLote, false);
+                avisos.SetState(StatusKind.Info, "Bipes de " + l.Descricao + " retirados.");
                 return;
             }
             _linhas.RemoveAt(r);
@@ -1707,6 +2020,9 @@ namespace SoulmvKit.UI
             _reserva = EstadoReserva.Nenhuma; _reservando = false; _avisouInatividade = false; _gravacaoIncerta = false;
             _linhas.Clear();
             _kits.Clear();
+            _etiquetas.Clear();
+            _bipes.Clear();
+            _ultimoBipe = null;
             _lotes.Clear();
             MostrarCabecalho();
             Renderizar();
@@ -1746,7 +2062,7 @@ namespace SoulmvKit.UI
             string sub = "Solicitação " + _sol.Numero + "  ·  " + Origem() + "  ·  " + _sol.DsEstoque;
             using (var d = new ConferenciaDialog(sub, r)) resp = d.ShowDialog(this.FindForm());
             if (IsDisposed) return;
-            if (resp != DialogResult.OK) { IrPara(grid.CurrentCell != null ? grid.CurrentCell.RowIndex : 0, CLote, false); return; }
+            if (resp != DialogResult.OK) { MarcarLinha(grid.CurrentCell != null ? grid.CurrentCell.RowIndex : 0); FocarBarras(); return; }
             Gravar(r);
         }
 
@@ -2039,7 +2355,8 @@ namespace SoulmvKit.UI
             if (IsDisposed || _sol != s) return;
             TerminouCarga(null);
             PrepararProdutos(s.Estoque);
-            IrPara(0, CLote, false);
+            MarcarLinha(0);
+            FocarBarras();
             AtualizarDica();
         }
 
