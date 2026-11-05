@@ -107,15 +107,17 @@ namespace SoulmvKit.UI
             _navJust = new NavButton("Justificativas");
             _navJust.Selected += new EventHandler(delegate { Selecionar(_navJust, "Justificativas", new JustificativasView(_host)); });
 
-            // Reposição (Previsão de Consumo e Estoque) é decisão de farmacêutico. Para o
-            // atendente de farmácia os dois botões não chegam a existir — assim não há
+            // Reposição: a Previsão de Consumo é de um único login e a Compras CAF é decisão de
+            // farmacêutico. Para quem não pode, o botão não chega a existir — assim não há
             // tela para alcançar por Tab nem por atalho, e nenhum item cinza sobrando no
             // menu. Ver Permissoes.
-            if (SoulmvKit.Core.Permissoes.PodeVerReposicao(_host.Usuario))
+            if (SoulmvKit.Core.Permissoes.PodeVerPrevisaoConsumo(_host.Usuario))
             {
                 _navPedido = new NavButton("Previsão de Consumo");
                 _navPedido.Selected += new EventHandler(delegate { Selecionar(_navPedido, "Previsão de Consumo", new PedidoCafView(_host)); });
-
+            }
+            if (SoulmvKit.Core.Permissoes.PodeVerComprasCaf(_host.Usuario))
+            {
                 _navEstoque = new NavButton("Compras CAF");
                 _navEstoque.Selected += new EventHandler(delegate { Selecionar(_navEstoque, "Compras CAF", new EstoqueView(_host)); });
             }
@@ -131,7 +133,8 @@ namespace SoulmvKit.UI
             //   ESTOQUE: Conferência de Lotes (físico x eletrônico) e o par de reposição —
             //   Previsão de Consumo (Central pede à CAF) e Compras CAF (a CAF decide o que comprar;
             //   era a aba "Estoque", renomeada para não repetir o nome do grupo).
-            // Para o atendente o grupo ESTOQUE fica só com a Conferência (ver Permissoes).
+            // Para o atendente o grupo ESTOQUE fica só com a Conferência, e a Previsão de Consumo
+            // só aparece para o login liberado (ver Permissoes).
             _recolhidos = CarregarRecolhidos();
             AdicionarGrupo(nav, "kits", "Kits", "\uE7B8", _navKits, _navConsulta);              // caixa
             AdicionarGrupo(nav, "solicitacoes", "Solicitações", "\uEADF", _navAtender, _navSolic, _navPam);     // prancheta
@@ -412,8 +415,8 @@ namespace SoulmvKit.UI
             Selecionar(_navAtb, "Antimicrobianos", new AntimicrobianosView(_host));
         }
 
-        // Os dois módulos de reposição não existem na sessão de um atendente: sem botão
-        // no menu, o atalho de desenvolvimento também não abre a tela.
+        // Módulo de reposição que o login não pode ver (ver Permissoes) não tem botão no
+        // menu, e o atalho de desenvolvimento também não abre a tela.
         public void IrParaEstoque()
         {
             if (_navEstoque == null) return;
