@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -7,10 +8,10 @@ using SoulmvKit.Core;
 
 namespace SoulmvKit.UI
 {
-    // Módulo "Consultar kits": via um produto comum a todos os kits (4992 - agulha 40x12),
-    // gera o relatório R_KIT_PROD e mostra, por tipo de kit, o nome + quantidade em estoque +
-    // os códigos de barras de cada unidade. Botão "Abrir o PDF" abre o relatório no navegador.
-    // READ-ONLY — não produz nem altera nada.
+    // Módulo "Consultar kits": o relatório R_KIT_PROD lista os kits em estoque que CONTÊM um
+    // produto; a tela gera um por produto de Produtos, junta e mostra, por tipo de kit, o nome +
+    // quantidade em estoque + os códigos de barras de cada unidade. Botão "Abrir o PDF" abre os
+    // relatórios no navegador. READ-ONLY — não produz nem altera nada.
     public class ConsultarKitsView : UserControl, IComandosDeTela
     {
         private readonly MainWindow _host;
@@ -19,12 +20,17 @@ namespace SoulmvKit.UI
         private StatusBanner banner;
         private GridPro grid;
         private Label lblVazio;
-        private string _reportUrl;
+        private readonly List<string> _reportUrls = new List<string>();
         private bool _consultando;    // consulta em andamento — segura o F5 e cliques repetidos
         private bool _reimprimindo;   // trava contra cliques repetidos no botão da linha
 
         private const int Estoque = 5;       // Farmácia Central
-        private const int Produto = 4992;    // agulha 40x12 (presente em todos os kits)
+
+        // Produtos pelos quais os kits são procurados. A agulha 40x12 (4992) está em todos os
+        // kits, menos no KIT AGULHAMENTO (16730), que entra pela agulha de marcação de nódulo
+        // mamário (16722). Conferido nas fórmulas do M_PRODUZIR_KIT em 07/11/2026: os outros 13
+        // kits produzíveis têm a 4992. Kit novo sem a 4992: acrescentar aqui um produto dele.
+        private static readonly int[] Produtos = { 4992, 16722 };
 
         public ConsultarKitsView(MainWindow host)
         {
@@ -53,7 +59,7 @@ namespace SoulmvKit.UI
             this.Controls.Add(root);
 
             banner.SetState(StatusKind.Info,
-                "Consulta os kits em estoque pelo produto " + Produto + " (Agulha 40x12), presente em todos os kits.");
+                "Consulta os kits em estoque pela agulha 40x12 (4992) e, para o kit agulhamento, pela agulha de marcação (16722).");
 
             this.Load += new EventHandler(OnLoad);
         }
@@ -241,10 +247,10 @@ namespace SoulmvKit.UI
 
             _consultando = true;
             btnConsultar.Enabled = false; btnConsultar.Text = "Consultando...";
-            btnPdf.Enabled = false; _reportUrl = null;
+            btnPdf.Enabled = false; _reportUrls.Clear();
             grid.Rows.Clear(); grid.Visible = false; lblVazio.Visible = true;
             lblVazio.Text = "Consultando os kits no servidor...";
-            banner.SetState(StatusKind.Busy, "Gerando o relatório de kits (produto " + Produto + ") e lendo os dados...");
+            banner.SetState(StatusKind.Busy, "Gerando o relatório de kits e lendo os dados...");
 
             bool tenho = false;
             try
@@ -260,13 +266,20 @@ namespace SoulmvKit.UI
                     return;
                 }
 
-                var res = await MorphisClient.ConsultarKitsCompletoAsync(_host.Session, Estoque, Produto);
-                if (IsDisposed || Disposing) return;
+                var kits = new List<KitEstoque>();
+                for (int i = 0; i < Produtos.Length; i++)
+                {
+                    banner.SetState(StatusKind.Busy, "Gerando o relatório de kits (produto " + Produtos[i] +
+                        ", parte " + (i + 1) + " de " + Produtos.Length + ") e lendo os dados...");
+                    var res = await MorphisClient.ConsultarKitsCompletoAsync(_host.Session, Estoque, Produtos[i]);
+                    if (IsDisposed || Disposing) return;
+                    if (res.ReportUrl != null) _reportUrls.Add(res.ReportUrl);
+                    Juntar(kits, res.Kits);
+                }
+                kits.Sort(delegate(KitEstoque a, KitEstoque b) { return a.CdKit.CompareTo(b.CdKit); });
+                btnPdf.Enabled = _reportUrls.Count > 0;
 
-                _reportUrl = res.ReportUrl;
-                btnPdf.Enabled = (_reportUrl != null);
-
-                foreach (var kit in res.Kits)
+                foreach (var kit in kits)
                 {
                     int h = grid.Rows.Add(kit.CdKit + " - " + kit.Nome, "", "", kit.Quantidade);
                     var hr = grid.Rows[h];
@@ -289,7 +302,7 @@ namespace SoulmvKit.UI
                     }
                 }
 
-                bool tem = res.Kits.Count > 0;
+                bool tem = kits.Count > 0;
                 grid.Visible = tem; lblVazio.Visible = !tem;
                 lblVazio.Text = "Nenhum kit em estoque na Farmácia Central.";
                 grid.LimparSelecao();
@@ -319,13 +332,32 @@ namespace SoulmvKit.UI
             }
         }
 
+        // Junta os kits de mais de um relatório: o mesmo kit (e a mesma unidade) pode sair em dois,
+        // se tiver os dois produtos.
+        private static void Juntar(List<KitEstoque> destino, List<KitEstoque> novos)
+        {
+            foreach (var k in novos)
+            {
+                KitEstoque ja = null;
+                foreach (var d in destino) if (d.CdKit == k.CdKit) { ja = d; break; }
+                if (ja == null) { destino.Add(k); continue; }
+                var vistos = new HashSet<string>();
+                foreach (var u in ja.Unidades) vistos.Add(u.CodBarras ?? "");
+                foreach (var u in k.Unidades) if (vistos.Add(u.CodBarras ?? "")) ja.Unidades.Add(u);
+            }
+        }
+
+        // Um PDF por produto consultado: abre todos (uma aba cada).
         private void OnPdf(object sender, EventArgs e)
         {
-            if (_reportUrl == null) return;
-            try { Navegador.Abrir(_reportUrl); }   // abre o PDF numa aba (Cent Browser -> Edge -> padrão)
-            catch (Exception ex)
+            foreach (var url in _reportUrls.ToArray())
             {
-                banner.SetState(StatusKind.Warning, "Não foi possível abrir o PDF no navegador: " + ex.Message + "  URL: " + _reportUrl);
+                try { Navegador.Abrir(url); }   // abre o PDF numa aba (Cent Browser -> Edge -> padrão)
+                catch (Exception ex)
+                {
+                    banner.SetState(StatusKind.Warning, "Não foi possível abrir o PDF no navegador: " + ex.Message + "  URL: " + url);
+                    return;
+                }
             }
         }
 

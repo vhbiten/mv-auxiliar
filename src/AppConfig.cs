@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.7";   // 0.6.7: Atender: avisos e perguntas acima do rodapé (não cobrem os botões)
+        public const string Versao = "0.6.8";   // 0.6.8: 16703 na hemodiálise; KIT AGULHAMENTO (16730) no Consultar kits
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

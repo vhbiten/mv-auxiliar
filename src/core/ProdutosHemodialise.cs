@@ -20,8 +20,11 @@ namespace SoulmvKit.Core
         private static readonly HashSet<int> _codigos = new HashSet<int>();
 
         // Lista informada pela farmácia (17/08/2026): dialisador, kit de linha de sangue, as
-        // duas soluções (ácida e básica) e o isolador de pressão/transdutor.
-        private static readonly int[] Semente = { 16690, 16691, 16693, 16694, 16723 };
+        // duas soluções (ácida e básica) e o isolador de pressão/transdutor. Em 07/11/2026 entrou
+        // a agulha para fístula arteriovenosa 16G (16703). A semente vale em todos os PCs: o
+        // arquivo dados/hemodialise.txt de cada um só acrescenta ou tira códigos (e a atualização
+        // nunca sobrescreve dados locais).
+        private static readonly int[] Semente = { 16690, 16691, 16693, 16694, 16703, 16723 };
 
         public static void Init(string baseDir)
         {
