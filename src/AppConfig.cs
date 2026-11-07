@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.5";   // 0.6.5: Previsão de Consumo só para o login FA7324
+        public const string Versao = "0.6.6";   // 0.6.6: Previsão de Consumo volta para todos, menos os atendentes (AF)
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 
