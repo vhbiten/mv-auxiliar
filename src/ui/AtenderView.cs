@@ -47,7 +47,8 @@ namespace SoulmvKit.UI
 
         private readonly MainWindow _host;
         private readonly bool _preview;
-        private AvisosMv avisos;              // notificações no canto inferior direito (como no MV)
+        private AvisosMv avisos;              // notificações no canto inferior direito (como no MV), acima do rodapé
+        private Control rodape;               // faixa dos botões: os avisos e as perguntas ficam acima dela
         private Label lblDica;    // rodapé: o que fazer na célula atual
         private CarregandoGrade carregando;   // véu com spinner sobre a grade enquanto a solicitação abre
         private AvisoMv _avisoInatividade;
@@ -109,9 +110,13 @@ namespace SoulmvKit.UI
 
             root.Controls.Add(BuildCabecalho(), 0, 0);
             root.Controls.Add(BuildProdutos(), 0, 1);
-            root.Controls.Add(BuildRodape(), 0, 2);
+            rodape = BuildRodape();
+            root.Controls.Add(rodape, 0, 2);
             this.Controls.Add(root);
+            // Pedido do usuário (07/11/2026): avisos no canto inferior direito, mas sem cobrir os
+            // botões do rodapé ("Código de barras", "Preencher automaticamente", "Fechar a Baixa").
             avisos = new AvisosMv(this);
+            avisos.Acima = rodape;
 
             this.Load += new EventHandler(OnLoad);
             _host.VoltouAoPrimeiroPlano += new EventHandler(OnVoltouAoApp);
@@ -142,7 +147,7 @@ namespace SoulmvKit.UI
         public bool PodeSair()
         {
             if (_sol == null || !TemDigitacao()) return true;
-            return PerguntaMv.Perguntar(this, "Sair da solicitação " + _sol.Numero + "?",
+            return PerguntaMv.Perguntar(this, rodape,"Sair da solicitação " + _sol.Numero + "?",
                 "Os lotes e quantidades digitados serão descartados e a solicitação será liberada no MV.", "Sair", "Voltar", false);
         }
 
@@ -854,7 +859,7 @@ namespace SoulmvKit.UI
             }
             if (_ocupado) return;
             if (TemDigitacao() && _sol != null
-                && !PerguntaMv.Perguntar(this, "Abrir a solicitação de novo?",
+                && !PerguntaMv.Perguntar(this, rodape,"Abrir a solicitação de novo?",
                     "Os lotes e quantidades digitados na solicitação " + _sol.Numero + " serão descartados.", "Descartar", "Voltar", false))
                 return;
             avisos.Limpar();   // os avisos da solicitação anterior não valem mais
@@ -1429,7 +1434,7 @@ namespace SoulmvKit.UI
         {
             if (linha < 0 || linha >= _linhas.Count) return;
             bool fora = _sol.Item(cod) == null;
-            if (fora && !PerguntaMv.Perguntar(this, "Produto não solicitado",
+            if (fora && !PerguntaMv.Perguntar(this, rodape,"Produto não solicitado",
                     cod + "  " + descricao + "\n\nEsse produto não foi solicitado nesse pedido, deseja incluir?", "Incluir", "Não incluir", true))
             {
                 if (IsDisposed) return;
@@ -1867,7 +1872,7 @@ namespace SoulmvKit.UI
             bool jaBipada = _linhas.Exists(delegate(LinhaAtender l) { return l.Etiqueta == cod; });
             bool fora = _sol.Item(et.Produto) == null;
             // Padrão "Não incluir": o Enter do próximo bipe não confirma a inclusão sem querer.
-            if (fora && !jaBipada && !PerguntaMv.Perguntar(this, "Produto não solicitado",
+            if (fora && !jaBipada && !PerguntaMv.Perguntar(this, rodape,"Produto não solicitado",
                     et.Produto + "  " + et.Descricao + "\n\nEsse produto não foi solicitado nesse pedido, deseja incluir?", "Incluir", "Não incluir", false))
             {
                 FocarBarras();
@@ -2009,7 +2014,7 @@ namespace SoulmvKit.UI
             if (perguntar)
             {
                 if (_ocupado) return;
-                if (TemDigitacao() && !PerguntaMv.Perguntar(this, "Limpar a tela?",
+                if (TemDigitacao() && !PerguntaMv.Perguntar(this, rodape,"Limpar a tela?",
                         "Os lotes e quantidades digitados serão descartados.", "Limpar", "Voltar", false))
                     return;
                 avisos.Limpar();

@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.6";   // 0.6.6: Previsão de Consumo volta para todos, menos os atendentes (AF)
+        public const string Versao = "0.6.7";   // 0.6.7: Atender: avisos e perguntas acima do rodapé (não cobrem os botões)
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

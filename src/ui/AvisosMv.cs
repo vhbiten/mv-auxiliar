@@ -10,12 +10,15 @@ namespace SoulmvKit.UI
     // sucesso somem sozinhos; aviso e erro ficam até fechar no ✕ (ou até abrir outra
     // solicitação); "aguarde" é um só, atualizado no lugar, e some quando a operação termina.
     // Mesmo vocabulário do StatusBanner: SetState(tipo, texto).
+    // Com Acima definido (o rodapé com os botões), a pilha começa logo acima dele e não cobre os
+    // botões (pedido do usuário, 07/11/2026); sem ele, começa no fundo do host.
     public class AvisosMv
     {
         private const int Maximo = 3;
         private readonly Control _host;
         private readonly List<AvisoMv> _avisos = new List<AvisoMv>();
         private AvisoMv _aguarde;
+        private Control _acima;
 
         // Último texto mostrado (os testes leem daqui).
         public string Ultimo = "";
@@ -24,6 +27,33 @@ namespace SoulmvKit.UI
         {
             _host = host;
             _host.Resize += new EventHandler(delegate { Reposicionar(); });
+        }
+
+        // Controle que a pilha não pode cobrir: ela fica acima dele. Precisa estar dentro do host.
+        public Control Acima
+        {
+            get { return _acima; }
+            set
+            {
+                if (_acima != null) { _acima.LocationChanged -= OnAcimaMudou; _acima.SizeChanged -= OnAcimaMudou; }
+                _acima = value;
+                if (_acima != null) { _acima.LocationChanged += OnAcimaMudou; _acima.SizeChanged += OnAcimaMudou; }
+                Reposicionar();
+            }
+        }
+
+        private void OnAcimaMudou(object sender, EventArgs e) { Reposicionar(); }
+
+        // Base da pilha (coordenada y no host): acima do controle Acima, se houver; senão, o fundo.
+        private int Base()
+        {
+            int fundo = _host.ClientSize.Height - Theme.S(10);
+            if (_acima == null || _acima.IsDisposed) return fundo;
+            int topo = 0;
+            Control c = _acima;
+            while (c != null && c != _host) { topo += c.Top; c = c.Parent; }
+            if (c != _host) return fundo;   // fora do host: sem referência
+            return Math.Min(fundo, topo - Theme.S(8));
         }
 
         public AvisoMv SetState(StatusKind tipo, string texto) { return SetState(tipo, texto, null); }
@@ -94,7 +124,7 @@ namespace SoulmvKit.UI
         private void Reposicionar()
         {
             if (_host.IsDisposed) return;
-            int y = _host.ClientSize.Height - Theme.S(10);
+            int y = Base();
             int x = _host.ClientSize.Width - Theme.S(12);
             var pilha = new List<AvisoMv>();
             if (_aguarde != null) pilha.Add(_aguarde);
@@ -220,6 +250,8 @@ namespace SoulmvKit.UI
         private readonly string _titulo, _texto;
         private readonly PrimaryButton _sim, _nao;
         private readonly Form _dono;
+        private Control _acima;   // como nos avisos: a pergunta fica acima deste controle (o rodapé)
+        private Control _origem;  // com _acima: alinha pela direita da aba, na mesma coluna dos avisos
 
         private PerguntaMv(Form dono, string titulo, string texto, string sim, string nao, bool padraoSim)
         {
@@ -259,16 +291,35 @@ namespace SoulmvKit.UI
         // true = respondeu o primeiro botão (sim).
         public static bool Perguntar(Control origem, string titulo, string texto, string sim, string nao, bool padraoSim)
         {
+            return Perguntar(origem, null, titulo, texto, sim, nao, padraoSim);
+        }
+
+        // acima: a pergunta fica acima deste controle (o rodapé com os botões), no lugar dos avisos.
+        public static bool Perguntar(Control origem, Control acima, string titulo, string texto, string sim, string nao, bool padraoSim)
+        {
             Form dono = origem != null ? origem.FindForm() : null;
             using (var p = new PerguntaMv(dono, titulo, texto, sim, nao, padraoSim))
+            {
+                p._acima = acima;
+                p._origem = acima != null ? origem : null;
                 return p.ShowDialog(dono) == DialogResult.OK;
+            }
         }
 
         protected override void OnLoad(EventArgs e)
         {
             base.OnLoad(e);
             Rectangle area = _dono != null && _dono.Visible ? _dono.RectangleToScreen(_dono.ClientRectangle) : Screen.FromControl(this).WorkingArea;
-            Location = new Point(area.Right - Width - Theme.S(12), area.Bottom - Height - Theme.S(10));
+            int fundo = area.Bottom - Theme.S(10);
+            int direita = area.Right;
+            if (_acima != null && !_acima.IsDisposed && _acima.IsHandleCreated)
+            {
+                int topo = _acima.PointToScreen(Point.Empty).Y - Theme.S(8);
+                if (topo < fundo && topo - Height > area.Top) fundo = topo;   // não cabe acima: fica no fundo
+                if (_origem != null && !_origem.IsDisposed && _origem.IsHandleCreated)
+                    direita = Math.Min(direita, _origem.RectangleToScreen(_origem.ClientRectangle).Right);
+            }
+            Location = new Point(direita - Width - Theme.S(12), fundo - Height);
         }
 
         protected override void OnShown(EventArgs e)
