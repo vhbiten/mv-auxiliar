@@ -180,7 +180,8 @@ namespace SoulmvKit.Core
     {
         public System.Collections.Generic.List<Solicitacao> Itens = new System.Collections.Generic.List<Solicitacao>();
         public bool AtingiuTeto { get; set; }       // parou no limite de janelas (há mais além do coletado)
-        public int TotalServidor { get; set; }      // totalRecords informado pelo servidor na 1ª página
+        public int TotalServidor { get; set; }      // quantas o servidor informa (totalRecords) para a consulta
+        public int Faltam { get; set; }             // informadas pelo servidor que a leitura não trouxe (0 = lista conferida)
     }
 
     // Um item do pedido de estoque à CAF (form M_SOLSAIPRO): código + quantidade.

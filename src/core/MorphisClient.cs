@@ -1219,16 +1219,42 @@ namespace SoulmvKit.Core
         // offset sobre uma ordem estável: cada registro aparece em exatamente uma página, então
         // é completa (2 passadas seguidas deram o MESMO conjunto, sem pular nem duplicar depois
         // da deduplicação). O filtro por igualdade de data devolve exatamente aquele dia.
-        public static async Task<SolicitacoesResult> ListarDiaAsync(
+        //
+        // CORREÇÃO de 26/11/2026 — a paginação nativa NÃO é completa. O MV ordena a lista SÓ
+        // pela hora (HR_SOLSAI_PRO) e refaz a consulta a cada NEXT_PAGE. Solicitações com a
+        // MESMA hora empatam, e os lotes dos turnos (madrugada 00:01, manhã 06:01, tarde 13:01,
+        // noite 18:01) têm dezenas com a mesma hora. Quando um empate cai na virada de página,
+        // a ordem dentro dele muda de uma página para a outra: parte vem REPETIDA e a mesma
+        // quantidade FICA DE FORA. Medido ao vivo: o MV informava 115 no dia e a paginação
+        // trazia 115 linhas com só 102 distintas (a 494873 e a 494731, do lote da manhã, não
+        // vinham); no dia anterior, 350 de 395. Duas passadas seguidas dão o MESMO conjunto
+        // incompleto — por isso o defeito passou pela validação acima.
+        //
+        // Leitura conferida:
+        //  1. paginação nativa, contando por hora o que veio e o que veio repetido (a
+        //     quantidade repetida numa hora é exatamente a que ficou de fora nela);
+        //  2. cada hora com repetição é relida SOZINHA (critério HR_SOLSAI_PRO = "HH:mm", que
+        //     casa pelo minuto): até 50 cabem numa página e a leitura é exata; acima disso,
+        //     LerExatoAsync divide pelo número e, se preciso, pela situação;
+        //  3. confere com o total que o servidor informa (totalRecords — confiável: bate com a
+        //     soma das situações). Não fechou = res.Faltam > 0 e quem chamou avisa na tela.
+        //
+        // `conhecidas` (opcional) = o que quem chama já tinha DESTE dia e DESTE filtro. A
+        // solicitação atendida não muda mais: a que ficou de fora e já era conhecida como
+        // atendida volta da memória, sem reler o lote inteiro a cada 30 s; a conhecida ainda
+        // pendente é relida pelo número. Sem `conhecidas`, todo lote com repetição é relido.
+        public static Task<SolicitacoesResult> ListarDiaAsync(
             Session s, int estoque, string situacao, string origem, DateTime dia)
         {
+            return ListarDiaAsync(s, estoque, situacao, origem, dia, null);
+        }
+
+        public static async Task<SolicitacoesResult> ListarDiaAsync(
+            Session s, int estoque, string situacao, string origem, DateTime dia,
+            System.Collections.Generic.IList<Solicitacao> conhecidas)
+        {
             var res = new SolicitacoesResult();
-            var m = new MorphisClient(s);
-            await m.WorkspaceInitAsync();
-            var cf = await m.CallFormAsync("M_BAIXASOL", "MV.12.01.02.01.#");
-            var blk = cf.Block_("SOLSAI_PRO");
-            string recId = blk != null ? (blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null)) : null;
-            if (recId == null) { Logger.Log("Solicitações: form sem registro inicial."); return res; }
+            var tela = new TelaSolicitacoes(s, estoque);
 
             var filtro = new System.Collections.Generic.Dictionary<string, string>();
             filtro["CD_ESTOQUE"] = estoque.ToString();
@@ -1239,35 +1265,311 @@ namespace SoulmvKit.Core
             if (origem == "PRE" || origem == "TRA") filtro["TP_ORIGEM_SOLICITACAO"] = origem;
             else if (origem == "DEV") filtro["TP_SOLSAI_PRO"] = "C";
 
-            var sb = new StringBuilder();
-            foreach (var c in SolCampos)
-            {
-                string v; if (!filtro.TryGetValue(c, out v)) v = "";
-                sb.Append("<item name=\"").Append(c).Append("\">").Append(Xml(v)).Append("</item>");
-            }
-            string body = "<body><block selected=\"" + recId + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + recId + "\">" + sb + "</record></block></body>";
-            string execHdr = "<header><control block=\"SOLSAI_PRO\" item=\"CD_SOLSAI_PRO\" task=\"" + m.FormTask +
-                "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
-                "<action name=\"EXECUTE_QUERY\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
+            var geral = await LerFirmeAsync(tela, filtro, 400);   // trava anti-loop (400×50 = 20000)
+            // Interrompida mesmo depois das novas tentativas é erro: devolver a lista cortada
+            // faria as solicitações sumirem da tela de quem chamou.
+            if (geral != null && geral.Interrompida) throw new Exception(ListaInterrompida);
+            if (geral == null) { Logger.Log("Solicitações: form sem registro inicial."); return res; }
+            if (geral.AtingiuTeto) res.AtingiuTeto = true;
 
-            var vistos = new System.Collections.Generic.HashSet<long>();
-            var q = await m.PostAsync(execHdr + body);
-            int pagina = 0;
-            while (true)
+            var achadas = geral.Distintas;
+            int naPaginacao = achadas.Count;   // antes de completar os lotes (vai para o log)
+            var relidas = new System.Collections.Generic.List<string>();
+            var daMemoria = new System.Collections.Generic.List<string>();
+            if (!geral.AtingiuTeto)
             {
-                pagina++;
-                int pageNumber, totalPages;
-                LerPaginacao(q.Raw, out pageNumber, out totalPages);
-                foreach (var sol in ParseSolicitacoes(q.Raw, estoque))
-                    if (vistos.Add(sol.Numero)) res.Itens.Add(sol);
-                Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + " est " + estoque + ": página " + pageNumber + "/" + totalPages + " -> " + res.Itens.Count + " distintas");
-                if (pageNumber >= totalPages) break;
-                if (pagina >= 400) { res.AtingiuTeto = true; break; }   // trava anti-loop (400×50 = 20000)
-                q = await m.PostAsync(NextPageHdr(m.FormTask) + "<body></body>");
+                foreach (string hora in geral.HorasComRepeticao())
+                {
+                    int faltam = geral.LidasPorHora[hora] - geral.DistintasPorHora[hora];
+                    if (hora.Length == 0) continue;   // sem hora não há como reler: aparece em Faltam
+                    if (await CompletarDaMemoriaAsync(tela, filtro, conhecidas, dia, hora, faltam, achadas))
+                    {
+                        daMemoria.Add(hora);
+                        continue;
+                    }
+                    var doLote = new System.Collections.Generic.Dictionary<string, string>(filtro);
+                    doLote["HR_SOLSAI_PRO"] = hora;
+                    var lote = await LerExatoAsync(tela, doLote, 0);
+                    if (lote == null) continue;
+                    if (lote.Interrompida) throw new Exception(ListaInterrompida);
+                    // O que acabou de ser relido é o mais fresco: vale por cima do que veio na paginação.
+                    foreach (var x in lote.Distintas.Values) achadas[x.Numero] = x;
+                    relidas.Add(hora + (lote.Completa ? "" : " (incompleto: " + lote.Distintas.Count + " de " + lote.Total + ")"));
+                }
             }
+
+            foreach (var x in achadas.Values) res.Itens.Add(x);
             res.Itens.Sort(delegate(Solicitacao a, Solicitacao b) { return b.Numero.CompareTo(a.Numero); });
-            res.TotalServidor = res.Itens.Count;
+            res.TotalServidor = geral.Total >= 0 ? geral.Total : res.Itens.Count;
+            res.Faltam = res.Itens.Count < res.TotalServidor ? res.TotalServidor - res.Itens.Count : 0;
+
+            Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + " est " + estoque + ": " + res.Itens.Count + " de " + res.TotalServidor +
+                " (" + geral.Paginas + " página(s), " + geral.Lidas + " linhas, " + naPaginacao + " distintas na paginação" +
+                (relidas.Count > 0 ? "; lotes relidos: " + string.Join(", ", relidas.ToArray()) : "") +
+                (daMemoria.Count > 0 ? "; da memória: " + string.Join(", ", daMemoria.ToArray()) : "") + ")" +
+                (res.Faltam > 0 ? " — FALTAM " + res.Faltam : "") + (res.AtingiuTeto ? " — TETO" : ""));
             return res;
+        }
+
+        private const string ListaInterrompida =
+            "O MV não devolveu a lista de solicitações inteira (resposta inesperada no meio da leitura). Tente de novo em instantes.";
+
+        // Lê com novas tentativas quando a leitura é interrompida (o MV respondeu outra coisa no
+        // lugar da página pedida). Medido em 26/11/2026: acontece quando OUTRA sessão do mesmo
+        // login fala com o MV no mesmo instante (o MV aberto no navegador, outro PC, a coleta da
+        // revisão) — o NEXT_PAGE volta com a página anterior ou com "Acção inválida". No log do
+        // app, 335 de 24.759 varreduras antigas tinham a sequência de páginas quebrada, e a
+        // leitura antiga seguia em frente com a lista cortada. É passageiro: esperar e reler.
+        private static async Task<LeituraSol> LerFirmeAsync(
+            TelaSolicitacoes tela, System.Collections.Generic.Dictionary<string, string> filtro, int maxPaginas)
+        {
+            LeituraSol r = null;
+            for (int tentativa = 1; tentativa <= 3; tentativa++)
+            {
+                r = await tela.LerAsync(filtro, maxPaginas);
+                if (r == null || !r.Interrompida) return r;
+                if (tentativa < 3) await Task.Delay(1200 * tentativa);
+            }
+            return r;   // ainda interrompida: quem chamou decide (ListarDiaAsync vira erro)
+        }
+
+        // Quantas pendentes conhecidas vale reler uma a uma (~0,1 s cada) antes de reler o lote.
+        private const int MaxReleiturasPorNumero = 8;
+
+        // As que ficaram de fora numa hora e que quem chama já conhecia: se a memória tem
+        // EXATAMENTE a quantidade que faltou, a atendida volta como estava (não muda mais) e a
+        // que ainda estava pendente é relida pelo número. Qualquer dúvida (quantidade não bate,
+        // pendentes demais, a relida não veio) = false, e o lote inteiro é relido.
+        private static async Task<bool> CompletarDaMemoriaAsync(
+            TelaSolicitacoes tela, System.Collections.Generic.Dictionary<string, string> filtro,
+            System.Collections.Generic.IList<Solicitacao> conhecidas, DateTime dia, string hora, int faltam,
+            System.Collections.Generic.Dictionary<long, Solicitacao> achadas)
+        {
+            if (conhecidas == null || faltam <= 0) return false;
+            var candidatas = new System.Collections.Generic.List<Solicitacao>();
+            int pendentes = 0;
+            foreach (var c in conhecidas)
+            {
+                if (c == null || achadas.ContainsKey(c.Numero)) continue;
+                if (HoraDoLote(c.Hora) != hora) continue;
+                DateTime d;
+                if (!TryData(c.Data, out d) || d.Date != dia.Date) continue;
+                candidatas.Add(c);
+                if (c.Situacao != "S") pendentes++;
+            }
+            if (candidatas.Count != faltam || pendentes > MaxReleiturasPorNumero) return false;
+
+            var prontas = new System.Collections.Generic.List<Solicitacao>();
+            foreach (var c in candidatas)
+            {
+                if (c.Situacao == "S") { prontas.Add(c); continue; }
+                var doNumero = new System.Collections.Generic.Dictionary<string, string>(filtro);
+                doNumero["CD_SOLSAI_PRO"] = c.Numero.ToString();
+                var uma = await LerFirmeAsync(tela, doNumero, 1);
+                Solicitacao atual;
+                if (uma == null || uma.Interrompida || !uma.Distintas.TryGetValue(c.Numero, out atual)) return false;   // saiu do filtro ou foi excluída
+                prontas.Add(atual);
+            }
+            foreach (var p in prontas) achadas[p.Numero] = p;
+            return true;
+        }
+
+        // Leitura EXATA de um recorte pequeno (o lote de uma hora). Até 50 cabem numa página.
+        // Maior que isso, a paginação pode repetir e pular de novo (todos empatam na hora):
+        // divide pelo número (">=" e "<=" funcionam no critério; é um critério só por campo,
+        // então são duas metades) e, se uma metade ainda repetir, pela situação.
+        private static async Task<LeituraSol> LerExatoAsync(
+            TelaSolicitacoes tela, System.Collections.Generic.Dictionary<string, string> filtro, int nivel)
+        {
+            var r = await LerFirmeAsync(tela, filtro, 40);
+            if (r == null || r.Completa || r.Interrompida || nivel >= 3) return r;
+
+            var partes = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>();
+            if (!filtro.ContainsKey("CD_SOLSAI_PRO") && r.Distintas.Count >= 2)
+            {
+                var numeros = new System.Collections.Generic.List<long>(r.Distintas.Keys);
+                numeros.Sort();
+                long meio = numeros[numeros.Count / 2];
+                var deCima = new System.Collections.Generic.Dictionary<string, string>(filtro);
+                deCima["CD_SOLSAI_PRO"] = ">=" + meio;
+                var deBaixo = new System.Collections.Generic.Dictionary<string, string>(filtro);
+                deBaixo["CD_SOLSAI_PRO"] = "<=" + (meio - 1);
+                partes.Add(deCima); partes.Add(deBaixo);
+            }
+            else if (!filtro.ContainsKey("TP_SITUACAO"))
+            {
+                foreach (string sit in new[] { "P", "A", "S" })
+                {
+                    var daSituacao = new System.Collections.Generic.Dictionary<string, string>(filtro);
+                    daSituacao["TP_SITUACAO"] = sit;
+                    partes.Add(daSituacao);
+                }
+            }
+            else return r;
+
+            // Soma as partes por cima do que já veio; o total a conferir continua o do recorte.
+            var junto = new LeituraSol();
+            junto.Total = r.Total; junto.Paginas = r.Paginas;
+            foreach (var x in r.Distintas.Values) junto.Guardar(x);
+            foreach (var f in partes)
+            {
+                var p = await LerExatoAsync(tela, f, nivel + 1);
+                if (p == null) continue;
+                if (p.Interrompida) junto.Interrompida = true;
+                junto.Paginas += p.Paginas;
+                foreach (var x in p.Distintas.Values) junto.Guardar(x);
+            }
+            return junto;
+        }
+
+        // "HH:mm" da solicitação. A tela de atendimento já devolve assim; a consulta devolve
+        // data e hora ("26/11/2026 06:01:00"). "" = sem hora legível.
+        internal static string HoraDoLote(string hr)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match((hr ?? "").Trim(), "(\\d{2}:\\d{2})(:\\d{2})?$");
+            return m.Success ? m.Groups[1].Value : "";
+        }
+
+        // O que uma consulta devolveu, somadas as páginas.
+        private class LeituraSol
+        {
+            public System.Collections.Generic.Dictionary<long, Solicitacao> Distintas = new System.Collections.Generic.Dictionary<long, Solicitacao>();
+            public System.Collections.Generic.Dictionary<string, int> LidasPorHora = new System.Collections.Generic.Dictionary<string, int>();      // com as repetidas
+            public System.Collections.Generic.Dictionary<string, int> DistintasPorHora = new System.Collections.Generic.Dictionary<string, int>();
+            public int Lidas;          // linhas lidas, com as repetidas
+            public int Total = -1;     // totalRecords do servidor (-1 = não veio)
+            public int Paginas;
+            public bool AtingiuTeto;
+            public bool Interrompida;  // uma resposta não era a página pedida: a leitura parou no meio
+
+            // Veio tudo: nenhuma repetida (repetida = outra ficou de fora) e a conta fecha com o servidor.
+            public bool Completa
+            {
+                get { return !AtingiuTeto && !Interrompida && Lidas == Distintas.Count && (Total < 0 || Distintas.Count >= Total); }
+            }
+
+            // Conta a linha lida (página da paginação): repetida conta em Lidas, não em Distintas.
+            public void Contar(Solicitacao sol)
+            {
+                string h = HoraDoLote(sol.Hora);
+                int n;
+                Lidas++;
+                LidasPorHora.TryGetValue(h, out n); LidasPorHora[h] = n + 1;
+                if (Distintas.ContainsKey(sol.Numero)) return;
+                Distintas[sol.Numero] = sol;
+                DistintasPorHora.TryGetValue(h, out n); DistintasPorHora[h] = n + 1;
+            }
+
+            // Guarda sem contar como linha lida (soma de partes já conferidas).
+            public void Guardar(Solicitacao sol)
+            {
+                Distintas[sol.Numero] = sol;
+                Lidas = Distintas.Count;
+            }
+
+            public System.Collections.Generic.List<string> HorasComRepeticao()
+            {
+                var res = new System.Collections.Generic.List<string>();
+                foreach (var kv in LidasPorHora)
+                {
+                    int d; DistintasPorHora.TryGetValue(kv.Key, out d);
+                    if (kv.Value > d) res.Add(kv.Key);
+                }
+                res.Sort(StringComparer.Ordinal);
+                return res;
+            }
+        }
+
+        // Uma tela M_BAIXASOL aberta para várias consultas seguidas — só EXECUTE_QUERY,
+        // NEXT_PAGE e SEARCH (o modo de pesquisa do bloco); nunca confirma nem grava.
+        // A 2ª consulta em diante entra por SEARCH na MESMA tela (validado ao vivo em
+        // 26/11/2026: ~40 ms, contra ~450 ms de abrir outra tela; sem o SEARCH o critério novo
+        // é ignorado). Depois de uma consulta SEM resultado a tela fica em modo de pesquisa e o
+        // SEARCH responde "Acção inválida": aí abre outra tela, que é o caminho conhecido.
+        private class TelaSolicitacoes
+        {
+            private readonly Session _s;
+            private readonly int _estoque;
+            private MorphisClient _m;
+            private string _registro;     // registro de critério do próximo EXECUTE_QUERY
+            private bool _consultou;      // a tela já fez uma consulta: a próxima pede SEARCH
+            private bool _reabrir;        // a última leitura foi interrompida: a próxima abre outra tela
+
+            public TelaSolicitacoes(Session s, int estoque) { _s = s; _estoque = estoque; }
+
+            private async Task AbrirAsync()
+            {
+                _m = new MorphisClient(_s);
+                await _m.WorkspaceInitAsync();
+                var cf = await _m.CallFormAsync("M_BAIXASOL", "MV.12.01.02.01.#");
+                _registro = RegistroDoBloco(cf);
+                _consultou = false;
+            }
+
+            private static string RegistroDoBloco(MorphisResponse r)
+            {
+                var blk = r != null ? r.Block_("SOLSAI_PRO") : null;
+                if (blk == null) return null;
+                return blk.Selected != null ? blk.Selected : (blk.Records.Count > 0 ? blk.Records[0].Id : null);
+            }
+
+            // 1ª página da consulta com o filtro. null = a tela não abriu.
+            private async Task<MorphisResponse> ConsultarAsync(System.Collections.Generic.Dictionary<string, string> filtro)
+            {
+                if (_m == null || _reabrir) { _reabrir = false; await AbrirAsync(); }
+                else if (_consultou)
+                {
+                    var sr = await _m.PostAsync(AcaoBlocoHdr("SOLSAI_PRO", "CD_SOLSAI_PRO", _m.FormTask, "SEARCH") + "<body></body>");
+                    string novo = RegistroDoBloco(sr);
+                    if (novo != null) _registro = novo; else await AbrirAsync();
+                }
+                if (_registro == null) return null;
+
+                var sb = new StringBuilder();
+                foreach (var c in SolCampos)
+                {
+                    string v; if (!filtro.TryGetValue(c, out v)) v = "";
+                    sb.Append("<item name=\"").Append(c).Append("\">").Append(Xml(v)).Append("</item>");
+                }
+                string body = "<body><block selected=\"" + _registro + "\" name=\"SOLSAI_PRO\"><record status=\"C\" id=\"" + _registro + "\">" + sb + "</record></block></body>";
+                _consultou = true;
+                return await _m.PostAsync(AcaoBlocoHdr("SOLSAI_PRO", "CD_SOLSAI_PRO", _m.FormTask, "EXECUTE_QUERY") + body);
+            }
+
+            // Consulta e percorre as páginas (até maxPaginas). null = a tela não abriu.
+            public async Task<LeituraSol> LerAsync(System.Collections.Generic.Dictionary<string, string> filtro, int maxPaginas)
+            {
+                var q = await ConsultarAsync(filtro);
+                if (q == null) return null;
+                var r = new LeituraSol();
+                while (true)
+                {
+                    r.Paginas++;
+                    int pageNumber, totalPages, totalRegistros;
+                    LerPaginacaoBloco(q.Raw, "SOLSAI_PRO", out pageNumber, out totalPages, out totalRegistros);
+                    // Toda resposta desta consulta traz o <page> do bloco, até a vazia. Sem ele,
+                    // ou com outra página, a resposta NÃO é a página pedida (o servidor engasgou
+                    // ou respondeu outra coisa): tratar como "última página" cortaria a lista em
+                    // silêncio (26/11/2026: 208 de 307 num teste). Marca e para; quem chamou decide.
+                    if (totalRegistros < 0 || pageNumber != r.Paginas)
+                    {
+                        r.Interrompida = true;
+                        _reabrir = true;   // a tela ficou em estado desconhecido
+                        Logger.Log("Solicitações: resposta fora do esperado na página " + r.Paginas + " (outcome=" + q.Outcome +
+                            ", página informada: " + (totalRegistros < 0 ? "nenhuma" : pageNumber + "/" + totalPages) +
+                            ", " + (q.Raw ?? "").Length + " caracteres" +
+                            (q.Messages.Count > 0 ? ", mensagens: " + string.Join(" | ", q.Messages.ToArray()) : "") + ").");
+                        break;
+                    }
+                    r.Total = totalRegistros;
+                    foreach (var sol in ParseSolicitacoes(q.Raw, _estoque)) r.Contar(sol);
+                    if (pageNumber >= totalPages) break;
+                    if (r.Paginas >= maxPaginas) { r.AtingiuTeto = true; break; }
+                    q = await _m.PostAsync(NextPageHdr(_m.FormTask) + "<body></body>");
+                }
+                if (r.Lidas == 0) r.Total = 0;   // sem resultado o bloco só ecoa o critério (totalRecords=1)
+                return r;
+            }
         }
 
         private static string NextPageHdr(string task)
@@ -1275,19 +1577,6 @@ namespace SoulmvKit.Core
             return "<header><control block=\"SOLSAI_PRO\" item=\"CD_SOLSAI_PRO\" task=\"" + task +
                 "\" isChanged=\"false\" modal=\"false\" isSuspended=\"false\">" +
                 "<action name=\"NEXT_PAGE\" kind=\"Action\" validation=\"false\" recordValidation=\"false\" taskValidation=\"false\" validateNewRow=\"false\"></action></control></header>";
-        }
-
-        // Lê os atributos pageNumber/totalPages do <page ...> da resposta (0 registros -> 1/1).
-        private static void LerPaginacao(string xml, out int pageNumber, out int totalPages)
-        {
-            pageNumber = 1; totalPages = 1;
-            var mm = System.Text.RegularExpressions.Regex.Match(xml, "<[a-zA-Z:]*page\\b[^>]*>");
-            if (!mm.Success) return;
-            int v;
-            var pn = System.Text.RegularExpressions.Regex.Match(mm.Value, "pageNumber=\"(\\d+)\"");
-            if (pn.Success && int.TryParse(pn.Groups[1].Value, out v)) pageNumber = v;
-            var tp = System.Text.RegularExpressions.Regex.Match(mm.Value, "totalPages=\"(\\d+)\"");
-            if (tp.Success && int.TryParse(tp.Groups[1].Value, out v)) totalPages = v;
         }
 
         // ===== ATENDIMENTOS DE URGÊNCIA (form CON_ATE, bloco ATENDIME) — READ-ONLY =====
@@ -3036,6 +3325,10 @@ namespace SoulmvKit.Core
                 if (MorphisResponse.Attr(block, "name") != "SOLSAI_PRO") continue;
                 foreach (System.Xml.XmlElement rec in block.GetElementsByTagName("record"))
                 {
+                    // Consulta sem resultado devolve o próprio critério como registro (id gerado
+                    // pelo Morphis): com o número no critério ele pareceria uma solicitação.
+                    string idRec = MorphisResponse.Attr(rec, "id");
+                    if (idRec != null && idRec.StartsWith("MORPHIS.", StringComparison.Ordinal)) continue;
                     var v = new System.Collections.Generic.Dictionary<string, string>();
                     foreach (System.Xml.XmlElement it in rec.GetElementsByTagName("item"))
                         if (MorphisResponse.Attr(it, "type") == "value")

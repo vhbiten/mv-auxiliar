@@ -40,6 +40,7 @@ namespace SoulmvKit.UI
         private readonly HashSet<long> _novos = new HashSet<long>();       // realçar recém-chegadas (azul)
         private readonly HashSet<long> _atendidas = new HashSet<long>();   // realçar recém-atendidas (verde)
         private long _maxNumero;
+        private int _faltam;                // quantas o MV informou e a última leitura não trouxe (0 = conferida)
         private string _sit = "", _orig = "";
         private bool _busy;
         private bool _trocandoUI;   // suprime o handler do combo durante ajustes programáticos
@@ -585,7 +586,17 @@ namespace SoulmvKit.UI
             string orig = mOrig.Length == 0 ? null : mOrig;
             string chave = ChaveFiltro(mSit, mOrig);
 
-            var res = await BuscarAsync(host.Session, estoque, sit, orig, completo, hoje);
+            // Varredura leve: o que já está na foto DESTE dia e DESTE filtro poupa reler, a cada
+            // 30s, os lotes que a paginação do MV repete (ver ListarDiaAsync). A completa não
+            // usa memória: confere tudo de novo no servidor.
+            IList<Solicitacao> conhecidas = null;
+            if (!completo)
+            {
+                var foto = SnapshotEstatico(estoque);
+                if (foto != null && foto.FiltroKey == chave && foto.Quando.Date == hoje) conhecidas = foto.Itens;
+            }
+
+            var res = await BuscarAsync(host.Session, estoque, sit, orig, completo, hoje, conhecidas);
             if (sessao != _sessaoId) return;   // logout durante a varredura: descarta tudo
 
             // A base anterior serve para DUAS coisas distintas:
@@ -646,7 +657,7 @@ namespace SoulmvKit.UI
             }
 
             if (_viva != null && !_viva.IsDisposed && !_viva.Disposing && _viva._estoque == estoque)
-                _viva.AbsorverAtualizacao(itens, maxNumero, agora, res.AtingiuTeto);
+                _viva.AbsorverAtualizacao(itens, maxNumero, agora, res.AtingiuTeto, res.Faltam);
         }
 
         private static string ChaveFiltro(string sit, string orig) { return sit + "|" + orig + "|0"; }
@@ -655,12 +666,13 @@ namespace SoulmvKit.UI
         // porque o filtro de data por IGUALDADE é o único que pagina de forma estável no MV —
         // com ">=" o servidor espalha os registros e a varredura pula linhas).
         // 'hoje' vem de fora e não é relido: a varredura leva ~10s e pode cruzar a meia-noite.
+        // 'conhecidas' = o que a foto já tem (só na varredura leve; null = conferir tudo no servidor).
         private static async Task<SolicitacoesResult> BuscarAsync(
-            Session s, int estoque, string sit, string orig, bool completo, DateTime hoje)
+            Session s, int estoque, string sit, string orig, bool completo, DateTime hoje, IList<Solicitacao> conhecidas)
         {
             int dias = (estoque == EstoqueCaf && completo) ? DiasCaf : 1;
             if (dias <= 1)
-                return await MorphisClient.ListarDiaAsync(s, estoque, sit, orig, hoje);
+                return await MorphisClient.ListarDiaAsync(s, estoque, sit, orig, hoje, conhecidas);
 
             var res = new SolicitacoesResult();
             var vistos = new HashSet<long>();
@@ -669,8 +681,9 @@ namespace SoulmvKit.UI
                 var dia = await MorphisClient.ListarDiaAsync(s, estoque, sit, orig, hoje.AddDays(-i));
                 foreach (var it in dia.Itens) if (vistos.Add(it.Numero)) res.Itens.Add(it);
                 if (dia.AtingiuTeto) res.AtingiuTeto = true;
+                res.TotalServidor += dia.TotalServidor;
+                res.Faltam += dia.Faltam;
             }
-            res.TotalServidor = res.Itens.Count;
             return res;
         }
 
@@ -781,12 +794,13 @@ namespace SoulmvKit.UI
         }
 
         // A view viva recebe o resultado da varredura de fundo e se redesenha.
-        private void AbsorverAtualizacao(List<Solicitacao> itens, long maxNumero, DateTime quando, bool teto)
+        private void AbsorverAtualizacao(List<Solicitacao> itens, long maxNumero, DateTime quando, bool teto, int faltam)
         {
             _itens.Clear(); _numeros.Clear();
             foreach (var s in itens) if (_numeros.Add(s.Numero)) _itens.Add(s);
             _maxNumero = maxNumero;
             _ultimaAtualizacao = quando;
+            _faltam = faltam;
             AbsorverMarcas();
             OrdenarDesc();
 
@@ -932,7 +946,7 @@ namespace SoulmvKit.UI
         // vêm das marcas do estoque: quem volta ao módulo vê o que chegou enquanto estava fora.
         private void RestaurarDoSnapshot(SolicitacoesCache.Snapshot snap)
         {
-            _itens.Clear(); _numeros.Clear(); _maxNumero = snap.MaxNumero;
+            _itens.Clear(); _numeros.Clear(); _maxNumero = snap.MaxNumero; _faltam = 0;
             foreach (var s in snap.Itens) if (_numeros.Add(s.Numero)) _itens.Add(s);
             AbsorverMarcas();
             _ultimaAtualizacao = snap.Quando;
@@ -1074,7 +1088,7 @@ namespace SoulmvKit.UI
             grid.Rows.Clear(); grid.Visible = false; lblVazio.Visible = true;
             lblVazio.Text = "Carregando solicitações...";
             _itens.Clear(); _numeros.Clear(); _novos.Clear(); _atendidas.Clear();
-            _maxNumero = 0; _ultimaAtualizacao = DateTime.MinValue;
+            _maxNumero = 0; _faltam = 0; _ultimaAtualizacao = DateTime.MinValue;
             Marcas(_memNovos, _estoque).Clear(); Marcas(_memAtendidas, _estoque).Clear();
 
             try
@@ -1229,6 +1243,11 @@ namespace SoulmvKit.UI
             if (teto)
                 banner.SetState(StatusKind.Warning,
                     "Muitas solicitações no período — mostrando as " + _itens.Count + " mais recentes. Filtre a situação.");
+            else if (_faltam > 0)
+                // A leitura é conferida com o total que o MV informa; não fechou = dizer, em vez
+                // de mostrar uma lista curta com cara de completa.
+                banner.SetState(StatusKind.Warning,
+                    "A lista pode estar incompleta: o MV informa " + _faltam + " a mais. Use “Recarregar tudo”.");
             else if (_itens.Count > 0)
                 banner.SetState(_novos.Count > 0 || _atendidas.Count > 0 ? StatusKind.Success : StatusKind.Info,
                     "Atualizado às " + _ultimaAtualizacao.ToString("HH:mm:ss") + " (" + periodo + ").");
