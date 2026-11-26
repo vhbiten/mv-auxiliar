@@ -24,6 +24,9 @@ namespace SoulmvKit
             SoulmvKit.Core.ContagemCaf.Init(AppDomain.CurrentDomain.BaseDirectory);
             SoulmvKit.Core.ContagemFarmacia.Init(AppDomain.CurrentDomain.BaseDirectory);
             SoulmvKit.Core.PedidoEmbalagens.Init(AppDomain.CurrentDomain.BaseDirectory);
+            SoulmvKit.Core.PedidoRotina.Init(AppDomain.CurrentDomain.BaseDirectory);
+            SoulmvKit.Core.PedidoRecusados.Init(AppDomain.CurrentDomain.BaseDirectory);
+            SoulmvKit.Core.PedidoHistorico.Init(AppDomain.CurrentDomain.BaseDirectory);
             SoulmvKit.Core.ProdutosSoro.Init(AppDomain.CurrentDomain.BaseDirectory);
             SoulmvKit.Core.ProdutosHemodialise.Init(AppDomain.CurrentDomain.BaseDirectory);
             SoulmvKit.Core.Posologia.Init(AppDomain.CurrentDomain.BaseDirectory);

@@ -9,7 +9,7 @@ namespace SoulmvKit.UI
     // Uma linha do pré-pedido: o produto do relatório + a quantidade escolhida.
     internal class LinhaPedido
     {
-        public MovProduto Prod;
+        public MovProduto Prod;    // Prod.Consumo = o que saiu no período do pedido (2 ou 3 dias)
         public int Pedido;         // 0 = fora do pedido
         public int Sugestao;       // valor inicial calculado (referência p/ marcar ajuste manual)
         public decimal EstoqueCaf; // saldo atual do produto na CAF (relatório do estoque 2)
@@ -17,8 +17,9 @@ namespace SoulmvKit.UI
     }
 
     // Módulo "Pedido CAF": monta o PRÉ-PEDIDO de reposição da Farmácia Central junto à CAF.
-    // 1) Gera o R_MOVI_ESTOQ (READ-ONLY) do período escolhido → consumo + estoque atual por
-    //    produto; 2) sugere a quantidade (consumo arredondado p/ número de caixa fechada);
+    // 1) Gera o R_MOVI_ESTOQ (READ-ONLY) do período da rotina — 2 dias, ou 3 quando o próximo
+    //    pedido do tipo demora mais (PedidoRotina) → consumo + estoque atual por produto;
+    // 2) sugere a quantidade (consumo arredondado p/ número de caixa fechada);
     // 3) o farmacêutico ajusta livremente na grade (vendo SAIU / ESTOQUE / SUGESTÃO lado a
     //    lado); 4) "Enviar pedido à CAF" GRAVA a solicitação no MV (pedido entre estoques,
     //    validado ao vivo no pedido nº 459588 em 17/08/2026) — pede confirmação, e depois de
@@ -32,10 +33,10 @@ namespace SoulmvKit.UI
 
         // Larguras BASE (96 DPI) das colunas dos botões — passam por Theme.S() no uso.
         // Orçamento da barra p/ janela mínima (base 96 DPI): padding do cartão 40 +
-        // 156+112+144+100+152 = 664 fixos ≤ ~672 úteis — o "Enviar pedido à CAF" nunca é
+        // 156+144+100+152 = 552 fixos ≤ ~672 úteis — o "Enviar pedido à CAF" nunca é
         // cortado, "Medicamentos" cabe sem reticências e a moldura do cartão fecha inteira.
-        // PERÍODO precisa de 112: em 96 DPI (monitor da farmácia) "3 dias" saía "3 di…"
-        // com 96 — a diferença veio do tipo e do Abrir PDF, que tinham sobra.
+        // (Até 26/11/2026 havia uma coluna de 112 para o seletor de PERÍODO, retirado: o
+        // período agora vem da rotina — ver PedidoRotina.)
         private const int LarguraGerar = 144;
         private const int LarguraEnviar = 152;
 
@@ -47,7 +48,6 @@ namespace SoulmvKit.UI
 
         private readonly MainWindow _host;
         private StyledComboBox cmbEspecie;
-        private StyledComboBox cmbPeriodo;
         private PrimaryButton btnGerar;
         private PrimaryButton btnPdf;
         private PrimaryButton btnEnviar;
@@ -77,9 +77,12 @@ namespace SoulmvKit.UI
         private string _reportUrl;
         private string _reportUrl2;   // 2º relatório (hemodiálise usa as duas espécies)
         private DateTime _de, _ate;
-        private int _dias = 3;      // período usado na geração (recalcular sugestão ao mudar a caixa)
+        private int _dias = 2;      // período usado na geração: 2 ou 3 dias (PedidoRotina.DiasDeConsumo)
+        // Dias que o relatório cobre de verdade (período + a parte de hoje já corrida): é por
+        // ele que a cobertura é calculada — ver PedidoSugestao.JanelaDias.
+        private double _janela = 2;
         private bool _busy;
-        private bool _renderizando;                    // suprime handlers da grade durante o rebuild
+        private bool _renderizando;                   // suprime handlers da grade durante o rebuild
         private bool _movendoCelula;                   // evita reentrância ao desviar p/ a coluna "Pedido"
         private System.Windows.Forms.Timer _esperaBusca;   // debounce da busca (parado durante a geração)
         private int _linhaCorrente = -1;               // linha selecionada (repinta ao mudar)
@@ -110,6 +113,7 @@ namespace SoulmvKit.UI
         private static DateTime _memQuando, _memDe, _memAte;
         private static string _memTipo = TipoMedicamentos;
         private static int _memPeriodo = 3;
+        private static double _memJanela = 2;
 
         // O pedido enviado também sobrevive à troca de módulo: sem isto, voltar à aba recriaria
         // a view com o mesmo pré-pedido e o botão liberado — e o MV aceitaria um pedido gêmeo.
@@ -183,10 +187,9 @@ namespace SoulmvKit.UI
             tl.AutoSize = true;
             tl.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             tl.BackColor = Theme.CardBg;
-            tl.ColumnCount = 6;
+            tl.ColumnCount = 5;
             tl.RowCount = 2;
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(156))); // tipo de pedido
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(112))); // período
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(LarguraGerar))); // Gerar pré-pedido
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(100))); // Abrir PDF
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(LarguraEnviar))); // Enviar à CAF
@@ -195,7 +198,6 @@ namespace SoulmvKit.UI
             tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             tl.Controls.Add(MicroLabel("TIPO DE PEDIDO"), 0, 0);
-            tl.Controls.Add(MicroLabel("PERÍODO"), 1, 0);
 
             // TIPO de pedido. No MV só existem duas espécies (1 = DROGAS E MEDICAMENTOS,
             // 2 = MATERIAIS); SOROS e HEMODIÁLISE são recortes feitos aqui, no cliente, e saem
@@ -209,19 +211,16 @@ namespace SoulmvKit.UI
             Selecionar(cmbEspecie, TipoDoDia());
             tl.Controls.Add(cmbEspecie, 0, 1);
 
-            cmbPeriodo = NovoCombo(new object[] {
-                new OpcaoItem("2 dias", "2"), new OpcaoItem("3 dias", "3"),
-                new OpcaoItem("4 dias", "4") });
-            cmbPeriodo.SelectedIndex = 1;   // padrão: 3 dias
-            tl.Controls.Add(cmbPeriodo, 1, 1);
-
+            // Sem seletor de período (retirado a pedido em 26/11/2026): quantos dias de saída
+            // o pedido repõe vem da rotina — PedidoRotina.DiasDeConsumo — e o usuário só
+            // escolhe o tipo e clica em "Gerar pré-pedido".
             btnGerar = new PrimaryButton();
             btnGerar.Text = "Gerar pré-pedido";
             btnGerar.Anchor = AnchorStyles.Left | AnchorStyles.Right;
             btnGerar.Height = Theme.S(40);
             btnGerar.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnGerar.Click += new EventHandler(OnGerar);
-            tl.Controls.Add(btnGerar, 2, 1);
+            tl.Controls.Add(btnGerar, 1, 1);
 
             btnPdf = new PrimaryButton();
             btnPdf.Text = "Abrir PDF";   // o tooltip diz qual PDF (do relatório de consumo)
@@ -231,7 +230,7 @@ namespace SoulmvKit.UI
             btnPdf.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnPdf.Enabled = false;
             btnPdf.Click += new EventHandler(OnAbrirPdf);
-            tl.Controls.Add(btnPdf, 3, 1);
+            tl.Controls.Add(btnPdf, 2, 1);
 
             // ⚠️ ÚNICO botão deste módulo que GRAVA no MV (cria a solicitação).
             btnEnviar = new PrimaryButton();
@@ -241,7 +240,7 @@ namespace SoulmvKit.UI
             btnEnviar.Margin = new Padding(0, 0, Theme.S(12), 0);
             btnEnviar.Enabled = false;               // quem decide é AtualizarEnvio()
             btnEnviar.Click += new EventHandler(OnEnviar);
-            tl.Controls.Add(btnEnviar, 4, 1);
+            tl.Controls.Add(btnEnviar, 3, 1);
 
             // Depois que o pedido sai, esta faixa é o que resta a fazer: ver o comprovante e
             // começar outro. Fica escondida até haver um pedido enviado.
@@ -271,7 +270,7 @@ namespace SoulmvKit.UI
             btnNovo.Click += new EventHandler(OnNovoPedido);
             posEnvio.Controls.Add(btnNovo);
 
-            tl.Controls.Add(posEnvio, 5, 1);
+            tl.Controls.Add(posEnvio, 4, 1);
             _barraAcoes = tl;   // as colunas de "Gerar"/"Enviar" encolhem no estado pós-envio
 
             var dica = new ToolTip();
@@ -286,12 +285,45 @@ namespace SoulmvKit.UI
             return card;
         }
 
-        // seg/qua/sex = medicamentos; ter/qui = materiais; fim de semana = medicamentos.
-        // Soros não entram no automático: é o farmacêutico que escolhe quando pedir.
+        // seg/qua = materiais; os outros dias = medicamentos. É a rotina MEDIDA no log de
+        // 01/10 a 25/11/2026 (38 pedidos): materiais saíram sempre na segunda e na quarta (16),
+        // medicamentos no domingo, na terça e na quinta (21) e uma vez na quarta. A regra
+        // anterior (seg/qua/sex = medicamentos, ter/qui = materiais) era o inverso e abriu a
+        // tela no tipo errado em 30 desses 38. Sexta e sábado não tiveram pedido: ficam em
+        // medicamentos. Soros não entram no automático: é o farmacêutico que escolhe.
         private static string TipoDoDia()
         {
-            var d = DateTime.Today.DayOfWeek;
-            return (d == DayOfWeek.Tuesday || d == DayOfWeek.Thursday) ? TipoMateriais : TipoMedicamentos;
+            return TipoDoDia(DateTime.Today.DayOfWeek);
+        }
+
+        internal static string TipoDoDia(DayOfWeek d)
+        {
+            return (d == DayOfWeek.Monday || d == DayOfWeek.Wednesday) ? TipoMateriais : TipoMedicamentos;
+        }
+
+        // Chave do tipo na rotina de pedidos (dias de pedido por tipo).
+        private static string ChaveDoTipo(string tipo)
+        {
+            if (tipo == TipoMateriais) return PedidoRotina.Materiais;
+            if (tipo == TipoSoros) return PedidoRotina.Soros;
+            if (tipo == TipoHemodialise) return PedidoRotina.Hemodialise;
+            return PedidoRotina.Medicamentos;
+        }
+
+        // Sugestão de uma linha: repor o que saiu no período (PedidoSugestao). Produto que o MV
+        // recusa por não ser padronizado fica em 0 (segue na grade para quem quiser digitar):
+        // sugerir de novo só renderia outra recusa depois do envio — ver PedidoRecusados.
+        private int SugestaoDe(MovProduto p)
+        {
+            if (PedidoRecusados.Recusado(p.Codigo)) return 0;
+            return PedidoSugestao.Sugerir(p.Consumo, p.EstoqueAtual, _janela, PedidoEmbalagens.Obter(p.Codigo));
+        }
+
+        private static string AvisoRecusado(int codigo)
+        {
+            string quando = PedidoRecusados.Quando(codigo);
+            return "Não padronizado: o MV recusou este produto no pedido" +
+                (quando.Length > 0 ? " de " + quando : "") + ". Fica fora da sugestão.";
         }
 
         // Espécie do MV que o relatório precisa para cada tipo (soro vive na dos medicamentos).
@@ -471,7 +503,10 @@ namespace SoulmvKit.UI
             var ecaf = Col("estoquecaf", "Estoque CAF", 110, false, DataGridViewContentAlignment.MiddleCenter, true);
             ecaf.HeaderCell.ToolTipText = "Saldo atual do produto na CAF (quem vai atender o pedido)";
             g.Columns.Add(ecaf);
-            g.Columns.Add(Col("saiu", "Saiu", 78, false, DataGridViewContentAlignment.MiddleCenter, true));
+            // "Saiu" = o que saiu no período do pedido (2 dias; 3 quando o próximo pedido demora).
+            var saiu = Col("saiu", "Saiu", 78, false, DataGridViewContentAlignment.MiddleCenter, true);
+            saiu.HeaderCell.ToolTipText = "O que saiu da Farmácia Central no período do pedido (2 ou 3 dias)";
+            g.Columns.Add(saiu);
             var est = Col("estoque", "Estoque", 84, false, DataGridViewContentAlignment.MiddleCenter, true);
             est.HeaderCell.ToolTipText = "Saldo atual na Farmácia Central";
             g.Columns.Add(est);
@@ -854,9 +889,8 @@ namespace SoulmvKit.UI
             if (_memLinhas != null && _memLinhas.Count > 0 && _memQuando.Date == DateTime.Today)
             {
                 _linhas.Clear(); _linhas.AddRange(_memLinhas);
-                _reportUrl = _memUrl; _de = _memDe; _ate = _memAte; _dias = _memPeriodo;
+                _reportUrl = _memUrl; _de = _memDe; _ate = _memAte; _dias = _memPeriodo; _janela = _memJanela;
                 Selecionar(cmbEspecie, _memTipo);
-                Selecionar(cmbPeriodo, _memPeriodo.ToString());
                 btnPdf.Enabled = _reportUrl != null;
 
                 // Este pré-pedido já foi enviado (ou ficou incerto)? Continua travado nesta view
@@ -918,14 +952,18 @@ namespace SoulmvKit.UI
 
             string tipo = (cmbEspecie.SelectedItem as OpcaoItem).Valor;
             int especie = EspecieDoTipo(tipo);
-            int dias = int.Parse((cmbPeriodo.SelectedItem as OpcaoItem).Valor);
+            // Período = quantos dias de saída o pedido repõe. Vem da rotina, não de um seletor:
+            // 2 dias; 3 quando o próximo pedido do tipo está a mais de 2 dias (quarta dos
+            // materiais, quinta dos medicamentos) — ver PedidoRotina.DiasDeConsumo.
+            int dias = PedidoRotina.DiasDeConsumo(ChaveDoTipo(tipo), DateTime.Today);
             DateTime de = DateTime.Today.AddDays(-dias);
 
             TravarControles("Gerando...");
             grid.Visible = false; lblVazio.Visible = true;
             lblVazio.Text = "Gerando o relatório de movimentações no MV Soul...";
-            banner.SetState(StatusKind.Busy, "Gerando o relatório de movimentações (" +
-                NomeDoTipo(tipo) + ", desde " + de.ToString("dd/MM") + ")...");
+            // Legendas da consulta SEM detalhe entre parênteses (período, contagens), a pedido
+            // em 26/11/2026: é informação demais para quem só está esperando o pedido.
+            banner.SetState(StatusKind.Busy, "Gerando o relatório de movimentações...");
 
             bool tenho = false;
             try
@@ -947,13 +985,12 @@ namespace SoulmvKit.UI
                 var produtos = new List<MovProduto>();
                 var vistos = new HashSet<int>();
                 int totalRelatorio = 0;
+                DateTime geradoEm = DateTime.Now;
                 for (int i = 0; i < especies.Length; i++)
                 {
-                    if (especies.Length > 1)
-                        banner.SetState(StatusKind.Busy, "Gerando o relatório de movimentações (" +
-                            NomeDoTipo(tipo) + ", parte " + (i + 1) + " de " + especies.Length + ")...");
                     var r = await MorphisClient.GerarMovimentacaoAsync(_host.Session, 5, especies[i], de);
                     if (IsDisposed || Disposing) return;
+                    geradoEm = DateTime.Now;   // o relatório conta as saídas até este instante
                     if (!string.IsNullOrEmpty(r.ReportUrl)) urls.Add(r.ReportUrl);
                     totalRelatorio += r.Produtos.Count;
                     // O filtro vem ANTES da consulta de saldo — no pedido de soros/hemodiálise
@@ -981,8 +1018,7 @@ namespace SoulmvKit.UI
                         // real da inclusão manual, com os papéis invertidos (atendente = Central);
                         // conferido item a item com o R_POS_EST_S: 5 de 5.
                         Dictionary<int, decimal> saldoFc = null;
-                        banner.SetState(StatusKind.Busy, "Consultando o saldo da Farmácia Central ("
-                            + faltantes.Count + " itens de hemodiálise sem movimento no período)...");
+                        banner.SetState(StatusKind.Busy, "Consultando o saldo da Farmácia Central...");
                         try
                         {
                             saldoFc = await MorphisClient.ConsultarSaldosCafAsync(
@@ -1021,15 +1057,12 @@ namespace SoulmvKit.UI
                 {
                     var codigos = new List<int>();
                     foreach (var p in produtos) codigos.Add(p.Codigo);
-                    banner.SetState(StatusKind.Busy, "Consultando o saldo atual da CAF (" +
-                        codigos.Count + " produtos, em tempo real)...");
+                    banner.SetState(StatusKind.Busy, "Consultando o saldo atual da CAF...");
                     caf = await MorphisClient.ConsultarSaldosCafAsync(_host.Session, 2, 5, codigos);
                     if (IsDisposed || Disposing) return;
                 }
                 catch (SessaoExpiradaException) { throw; }
                 catch (Exception ex) { Logger.Log("Pedido CAF: saldo da CAF indisponível: " + ex.Message); }
-
-                _dias = dias;
 
                 // Pré-pedido NOVO (dados novos no lugar dos antigos): libera o envio outra vez.
                 // Só aqui — se a geração tivesse falhado, a trava do pedido anterior continuaria.
@@ -1037,13 +1070,24 @@ namespace SoulmvKit.UI
                 _travado = false; _memPedido = 0; _memPedidoUrl = null; _memBloqueado = false;
                 btnComprovante.Visible = false;
 
+                // Junto com as linhas novas (se a geração falhasse antes, a tela seguiria com o
+                // período do pré-pedido que ainda está nela). O relatório começa às 00:00 de
+                // "dias" atrás e vai até agora: a janela real é maior que o período, e é por
+                // ela que o consumo diário se divide.
+                _dias = dias;
+                _janela = PedidoSugestao.JanelaDias(de, geradoEm, dias);
                 _linhas.Clear();
+                int naoPadronizados = 0;
                 foreach (var p in produtos)
                 {
                     var l = new LinhaPedido();
                     l.Prod = p;
-                    l.Sugestao = PedidoSugestao.Sugerir(p.Consumo, p.EstoqueAtual, dias, PedidoEmbalagens.Obter(p.Codigo));
+                    l.Sugestao = SugestaoDe(p);
                     l.Pedido = l.Sugestao;
+                    // Conta só quem TERIA sugestão: o aviso é sobre o que a regra deixou de pedir.
+                    if (l.Sugestao == 0 && PedidoRecusados.Recusado(p.Codigo) &&
+                        PedidoSugestao.Sugerir(p.Consumo, p.EstoqueAtual, _janela, PedidoEmbalagens.Obter(p.Codigo)) > 0)
+                        naoPadronizados++;
                     decimal ec;
                     if (caf != null && caf.TryGetValue(p.Codigo, out ec)) { l.EstoqueCaf = ec; l.TemCaf = true; }
                     _linhas.Add(l);
@@ -1060,10 +1104,13 @@ namespace SoulmvKit.UI
 
                 if (_linhas.Count == 0)
                     banner.SetState(StatusKind.Warning, "Nenhum produto de " + NomeDoTipo(tipo) +
-                        " com movimento no período. Confira o tipo e o período.");
+                        " com movimento no período. Confira o tipo.");
                 else
                     banner.SetState(StatusKind.Success, "Atualizado às " + DateTime.Now.ToString("HH:mm:ss")
-                        + " (consumo de " + de.ToString("dd/MM") + " a " + DateTime.Today.ToString("dd/MM") + ").");
+                        + " (consumo de " + de.ToString("dd/MM") + " a " + DateTime.Today.ToString("dd/MM") + ")."
+                        + (naoPadronizados == 0 ? ""
+                            : naoPadronizados == 1 ? " 1 produto não padronizado ficou fora da sugestão (o MV recusa)."
+                            : " " + naoPadronizados + " produtos não padronizados ficaram fora da sugestão (o MV recusa)."));
             }
             catch (SessaoExpiradaException)
             {
@@ -1137,8 +1184,8 @@ namespace SoulmvKit.UI
             if (_barraAcoes == null) return;
             btnGerar.Visible = !posEnvio;
             btnEnviar.Visible = !posEnvio;
-            _barraAcoes.ColumnStyles[2].Width = posEnvio ? 0 : Theme.S(LarguraGerar);
-            _barraAcoes.ColumnStyles[4].Width = posEnvio ? 0 : Theme.S(LarguraEnviar);
+            _barraAcoes.ColumnStyles[1].Width = posEnvio ? 0 : Theme.S(LarguraGerar);
+            _barraAcoes.ColumnStyles[3].Width = posEnvio ? 0 : Theme.S(LarguraEnviar);
             btnNovo.Visible = posEnvio;
             btnComprovante.Visible = posEnvio && !string.IsNullOrEmpty(_memPedidoUrl);
         }
@@ -1264,6 +1311,9 @@ namespace SoulmvKit.UI
                 _memBloqueado = res.Numero > 0 || res.Ambiguo;
                 _memPedidoData = DateTime.Today;
                 if (res.Numero > 0) { _memUltimoNumero = res.Numero; _memUltimoQuando = DateTime.Now; }
+                // Também antes do teste de descarte (o pedido existe mesmo que a tela tenha
+                // sido fechada) e sem await: nada aqui pode lançar — ver o INVARIANTE abaixo.
+                if (res.Numero > 0) RegistrarEnvio(res, itens);
                 if (IsDisposed || Disposing) return;
 
                 _travado = true;                       // qualquer desfecho: não reenviar desta tela
@@ -1288,13 +1338,16 @@ namespace SoulmvKit.UI
                     if (res.Rejeitados.Count > 0)
                     {
                         var lst = new System.Text.StringBuilder();
+                        bool lembrados = false;
                         foreach (var r in res.Rejeitados)
                         {
                             Logger.Log("Pedido CAF: recusado " + r.Codigo + ": " + r.Motivo);
                             if (lst.Length < 700) lst.Append("\n• ").Append(r.Codigo).Append(" — ").Append(r.Motivo);
+                            if (PedidoRecusados.Recusado(r.Codigo)) lembrados = true;
                         }
                         StyledDialog.Aviso(this.FindForm(), "Produtos recusados pelo MV",
-                            "O pedido nº " + res.Numero + " foi criado, mas estes produtos ficaram fora:" + lst,
+                            "O pedido nº " + res.Numero + " foi criado, mas estes produtos ficaram fora:" + lst +
+                            (lembrados ? "\n\nOs não padronizados ficam fora das próximas sugestões." : ""),
                             "Entendi");
                     }
                 }
@@ -1345,6 +1398,43 @@ namespace SoulmvKit.UI
             }
         }
 
+        // Depois de um pedido CRIADO no MV: (1) guarda os produtos recusados por não serem
+        // padronizados, para saírem das próximas sugestões; (2) tira da lista quem o MV
+        // aceitou; (3) grava sugestão × enviado de todas as linhas no histórico local.
+        // Síncrono e à prova de exceção: roda entre a gravação no MV e o aviso de sucesso, e
+        // uma falha aqui não pode virar "falha ao enviar" na tela (o pedido já existe).
+        private void RegistrarEnvio(PedidoResult res, List<PedidoItem> itens)
+        {
+            try
+            {
+                var recusados = new HashSet<int>();
+                foreach (var r in res.Rejeitados) recusados.Add(r.Codigo);
+
+                var nomes = new Dictionary<int, string>();
+                var registro = new List<HistoricoLinha>();
+                foreach (var l in _linhas)
+                {
+                    nomes[l.Prod.Codigo] = l.Prod.Nome;
+                    var h = new HistoricoLinha();
+                    h.Codigo = l.Prod.Codigo; h.Nome = l.Prod.Nome; h.Unidade = l.Prod.Unidade;
+                    h.Consumo = l.Prod.Consumo; h.Estoque = l.Prod.EstoqueAtual;
+                    h.TemCaf = l.TemCaf; h.EstoqueCaf = l.EstoqueCaf;
+                    h.Caixa = PedidoEmbalagens.Obter(l.Prod.Codigo);
+                    h.Sugestao = l.Sugestao; h.Pedido = l.Pedido;
+                    h.Recusado = l.Pedido > 0 && recusados.Contains(l.Prod.Codigo);
+                    registro.Add(h);
+                }
+
+                PedidoRecusados.Aprender(res.Rejeitados, nomes);
+                var aceitos = new List<int>();
+                foreach (var it in itens) if (!recusados.Contains(it.Codigo)) aceitos.Add(it.Codigo);
+                PedidoRecusados.Liberar(aceitos);
+
+                PedidoHistorico.Registrar(DateTime.Now, res.Numero, NomeDoTipo(_memTipo), _dias, _janela, registro);
+            }
+            catch (Exception ex) { Logger.Log("Pedido CAF: falha ao registrar o envio (o pedido foi criado): " + ex.Message); }
+        }
+
         // Editor de caixas fechadas (modal). Ao fechar, recalcula a quantidade inicial das
         // linhas que o usuário ainda NÃO ajustou à mão (Pedido == valor calculado).
         private void OnCaixas(object sender, EventArgs e)
@@ -1359,8 +1449,7 @@ namespace SoulmvKit.UI
             bool mudou = false;
             foreach (var l in _linhas)
             {
-                int nova = PedidoSugestao.Sugerir(l.Prod.Consumo, l.Prod.EstoqueAtual, _dias,
-                    PedidoEmbalagens.Obter(l.Prod.Codigo));
+                int nova = SugestaoDe(l.Prod);
                 if (nova == l.Sugestao) continue;
                 if (l.Pedido == l.Sugestao) l.Pedido = nova;   // acompanha só quem não foi mexido
                 l.Sugestao = nova;
@@ -1374,7 +1463,7 @@ namespace SoulmvKit.UI
             btnGerar.Enabled = false; btnGerar.Text = texto;
             btnPdf.Enabled = false;
             btnEnviar.Enabled = false;
-            cmbEspecie.Enabled = false; cmbPeriodo.Enabled = false;
+            cmbEspecie.Enabled = false;
             txtBusca.Enabled = false;
             _esperaBusca.Stop();                                  // tick atrasado da busca não dispara no meio
             if (grid.IsCurrentCellInEditMode) grid.CancelEdit();  // edição aberta não sobrevive à troca de dados
@@ -1396,7 +1485,7 @@ namespace SoulmvKit.UI
         {
             btnGerar.Enabled = true; btnGerar.Text = "Gerar pré-pedido";
             btnPdf.Enabled = _reportUrl != null;
-            cmbEspecie.Enabled = true; cmbPeriodo.Enabled = true;
+            cmbEspecie.Enabled = true;
             txtBusca.Enabled = true;
             // Pedido já enviado = quantidade CONGELADA: mudar depois faria a tela mostrar um
             // número que nunca foi para a CAF (e _memLinhas compartilha os mesmos objetos).
@@ -1410,7 +1499,7 @@ namespace SoulmvKit.UI
             _memUrl = _reportUrl;
             _memQuando = DateTime.Now;
             _memDe = _de; _memAte = _ate;
-            _memTipo = tipo; _memPeriodo = dias;
+            _memTipo = tipo; _memPeriodo = dias; _memJanela = _janela;
         }
 
         // ---- Grade ----
@@ -1445,6 +1534,12 @@ namespace SoulmvKit.UI
                     // Tooltip do realce vermelho: o DataGridView não aceita tooltip por estilo.
                     if (l.Prod.Codigo == _codigoDuplicado)
                         foreach (DataGridViewCell c in grid.Rows[r].Cells) c.ToolTipText = AvisoDuplicado;
+                    // Sugestão 0 com consumo pede explicação: é o não padronizado que o MV recusa.
+                    else if (PedidoRecusados.Recusado(l.Prod.Codigo))
+                    {
+                        string aviso = AvisoRecusado(l.Prod.Codigo);
+                        foreach (DataGridViewCell c in grid.Rows[r].Cells) c.ToolTipText = aviso;
+                    }
                 }
                 grid.ResumeLayout();
 
