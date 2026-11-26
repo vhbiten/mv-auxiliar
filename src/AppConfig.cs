@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.9";   // 0.6.9: Solicitações — lista conferida com o total do MV (a paginação repetia e pulava os lotes dos turnos)
+        public const string Versao = "0.6.10";   // 0.6.10: Solicitações — turnos de amanhã já emitidos na lista; atualização de 30 s lê só as não atendidas
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

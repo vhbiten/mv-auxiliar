@@ -476,8 +476,9 @@ namespace SoulmvKit.UI
         // Foto de hoje renovada (o estoque vai no argumento): a aba Urgência (PAM) troca na hora
         // a situação dos pedidos dos pacientes dela, sem esperar o próprio ciclo.
         public static event Action<int> FotoAtualizada;
-        // A varredura de 30s cobre só HOJE (1 consulta, barata). De tempos em tempos refaz o
-        // período inteiro — é o que pega mudança de situação em solicitação de dias anteriores.
+        // A varredura de 30s é LEVE: só as não atendidas de hoje (e dos turnos de amanhã já
+        // emitidos), com as atendidas vindas da foto. De tempos em tempos refaz tudo no servidor —
+        // é o que pega a que já nasceu atendida, a excluída e, na CAF, os dias anteriores.
         private const int TicksParaVarreduraCompleta = 10;   // 10 x 30s = 5 min
 
         private static System.Windows.Forms.Timer _monitor;
@@ -586,9 +587,9 @@ namespace SoulmvKit.UI
             string orig = mOrig.Length == 0 ? null : mOrig;
             string chave = ChaveFiltro(mSit, mOrig);
 
-            // Varredura leve: o que já está na foto DESTE dia e DESTE filtro poupa reler, a cada
-            // 30s, os lotes que a paginação do MV repete (ver ListarDiaAsync). A completa não
-            // usa memória: confere tudo de novo no servidor.
+            // Varredura leve: parte do que já está na foto DESTE dia e DESTE filtro — só as não
+            // atendidas são relidas do MV (ver BuscarAsync e MorphisClient.AtualizarDiaAsync).
+            // A completa não usa memória: confere tudo de novo no servidor.
             IList<Solicitacao> conhecidas = null;
             if (!completo)
             {
@@ -662,7 +663,8 @@ namespace SoulmvKit.UI
 
         private static string ChaveFiltro(string sit, string orig) { return sit + "|" + orig + "|0"; }
 
-        // Busca do período do estoque: Farmácia Central = HOJE; CAF = últimos 7 dias (dia a dia,
+        // Busca do período do estoque: Farmácia Central = HOJE mais os turnos de amanhã que o MV
+        // já emitiu; CAF = últimos 7 dias (dia a dia,
         // porque o filtro de data por IGUALDADE é o único que pagina de forma estável no MV —
         // com ">=" o servidor espalha os registros e a varredura pula linhas).
         // 'hoje' vem de fora e não é relido: a varredura leva ~10s e pode cruzar a meia-noite.
@@ -672,7 +674,35 @@ namespace SoulmvKit.UI
         {
             int dias = (estoque == EstoqueCaf && completo) ? DiasCaf : 1;
             if (dias <= 1)
-                return await MorphisClient.ListarDiaAsync(s, estoque, sit, orig, hoje, conhecidas);
+            {
+                // Varredura LEVE (a de 30 em 30 segundos, com a situação em "Todas"): lê do MV só
+                // as não atendidas e mantém as atendidas que a foto já tem. Ler a lista inteira
+                // de um dia cheio leva de 16 a 33 s com o portão do MV preso — quem estivesse na
+                // aba Atender esperava isso a cada meio minuto. A conferência completa (10ª
+                // varredura, virada do dia, "Recarregar tudo") é quem acha o resto.
+                // Com a situação filtrada a lista já é um recorte: segue a leitura normal.
+                bool leve = !completo && conhecidas != null && string.IsNullOrEmpty(sit);
+
+                var doDia = leve
+                    ? await MorphisClient.AtualizarDiaAsync(s, estoque, orig, hoje, false, conhecidas)
+                    : await MorphisClient.ListarDiaAsync(s, estoque, sit, orig, hoje, conhecidas);
+                if (estoque == EstoqueCaf) return doDia;
+
+                // Farmácia Central: junto com as de hoje vêm os turnos de AMANHÃ que o MV já
+                // emitiu. Os pedidos da madrugada e da manhã nascem com a data do dia seguinte e
+                // são separados na noite anterior, quando o MV os imprime — sem isto eles só
+                // apareciam aqui depois da meia-noite, com o trabalho já feito.
+                var amanha = leve
+                    ? await MorphisClient.AtualizarDiaAsync(s, estoque, orig, hoje.AddDays(1), true, conhecidas)
+                    : await MorphisClient.ListarEmitidasDoDiaAsync(s, estoque, sit, orig, hoje.AddDays(1), conhecidas);
+                var numeros = new HashSet<long>();
+                foreach (var it in doDia.Itens) numeros.Add(it.Numero);
+                foreach (var it in amanha.Itens) if (numeros.Add(it.Numero)) doDia.Itens.Add(it);
+                if (amanha.AtingiuTeto) doDia.AtingiuTeto = true;
+                doDia.TotalServidor += amanha.TotalServidor;
+                doDia.Faltam += amanha.Faltam;
+                return doDia;
+            }
 
             var res = new SolicitacoesResult();
             var vistos = new HashSet<long>();
@@ -748,7 +778,13 @@ namespace SoulmvKit.UI
             var s = SnapshotEstatico(estoque);
             if (s == null || s.Itens.Count == 0 || s.Quando.Date != DateTime.Today) return null;
             if (s.FiltroKey != ChaveFiltro("", "")) return null;
-            return new List<Solicitacao>(s.Itens);
+            // Só as de HOJE: a foto da Farmácia Central também guarda os turnos de amanhã já
+            // emitidos, e quem usa esta foto (PAM, Antimicrobianos) conta com o dia de hoje.
+            var deHoje = new List<Solicitacao>();
+            DateTime hoje = DateTime.Today, d;
+            foreach (var it in s.Itens)
+                if (!TentarData(it.Data, out d) || d <= hoje) deHoje.Add(it);
+            return deHoje.Count > 0 ? deHoje : null;
         }
 
         // A mesma foto, só se for RECENTE: quem precisa da SITUAÇÃO de cada pedido quase em
@@ -1233,12 +1269,21 @@ namespace SoulmvKit.UI
             }
         }
 
+        // A lista da Farmácia Central já tem turnos de amanhã (emitidos pelo MV na véspera)?
+        private bool TemDeAmanha()
+        {
+            DateTime hoje = DateTime.Today, d;
+            foreach (var s in _itens)
+                if (TentarData(s.Data, out d) && d > hoje) return true;
+            return false;
+        }
+
         // Banner enxuto e fiel: só a hora da última atualização — as contagens saíram a
         // pedido (o que chegou ou mudou já aparece realçado na própria grade). O verde
         // continua marcando a varredura que trouxe novidade.
         private void AtualizarBanner(bool teto)
         {
-            string periodo = _estoque == EstoqueCaf ? "últimos " + DiasCaf + " dias" : "hoje";
+            string periodo = _estoque == EstoqueCaf ? "últimos " + DiasCaf + " dias" : (TemDeAmanha() ? "hoje e amanhã" : "hoje");
 
             if (teto)
                 banner.SetState(StatusKind.Warning,

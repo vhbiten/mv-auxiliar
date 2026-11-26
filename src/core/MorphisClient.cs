@@ -1249,21 +1249,129 @@ namespace SoulmvKit.Core
             return ListarDiaAsync(s, estoque, situacao, origem, dia, null);
         }
 
-        public static async Task<SolicitacoesResult> ListarDiaAsync(
+        public static Task<SolicitacoesResult> ListarDiaAsync(
             Session s, int estoque, string situacao, string origem, DateTime dia,
             System.Collections.Generic.IList<Solicitacao> conhecidas)
         {
-            var res = new SolicitacoesResult();
-            var tela = new TelaSolicitacoes(s, estoque);
+            return ListarDiaConferidaAsync(s, estoque, situacao, origem, dia, conhecidas, false);
+        }
 
+        // As solicitações de um dia que o MV já EMITIU (SN_EMITIDO2 = S), com a mesma leitura
+        // conferida. Serve para os turnos do dia SEGUINTE: o pedido de prescrição leva a data e a
+        // hora do TURNO (madrugada 00:01, manhã 06:01, tarde 13:01, noite 18:01), então os da
+        // madrugada e da manhã nascem durante o dia já com a data de amanhã — e só passam a valer
+        // para a farmácia quando o MV os emite (imprime), à noite. Medido em 26/11/2026 às 02:16:
+        // turnos 00:01 e 06:01 do dia, impressos na véspera, todos emitidos; 13:01 e 18:01 do
+        // mesmo dia, ainda não impressos, não emitidos; pedido feito depois da hora de impressão
+        // do turno já nasce emitido.
+        public static Task<SolicitacoesResult> ListarEmitidasDoDiaAsync(
+            Session s, int estoque, string situacao, string origem, DateTime dia,
+            System.Collections.Generic.IList<Solicitacao> conhecidas)
+        {
+            return ListarDiaConferidaAsync(s, estoque, situacao, origem, dia, conhecidas, true);
+        }
+
+        // ===== VARREDURA LEVE DE UM DIA — READ-ONLY =====
+        // Para a atualização de 30 em 30 segundos: lê do MV só as NÃO atendidas (critério de
+        // situação "<>S", validado ao vivo em 26/11/2026: 88 = 85 pendentes + 3 em atendimento),
+        // com a mesma leitura conferida, e completa com o que quem chama já conhecia:
+        //  - a atendida conhecida fica como está (atendida não muda mais);
+        //  - a que era conhecida como pendente/em atendimento e NÃO veio agora foi atendida (ou
+        //    excluída): é conferida pelo número (~0,1 s) — veio, entra com a situação de agora;
+        //    não veio, sai da lista.
+        // O que esta leitura NÃO vê: solicitação que já nasce atendida e exclusão/reabertura de
+        // atendida. Isso fica para a conferência completa (ListarDiaAsync sem `conhecidas`), que
+        // quem chama repete a cada poucos minutos.
+        // Por que existe: a lista inteira de um dia cheio são 8 páginas (1,4 a 2,4 s cada) mais
+        // os lotes relidos — 16 a 33 s medidos, com o portão do MV preso; as não atendidas cabem
+        // em 1 ou 2 páginas. Sem `conhecidas` (ou se a leitura das não atendidas não fechar com
+        // o total do MV) faz a leitura completa.
+        public static async Task<SolicitacoesResult> AtualizarDiaAsync(
+            Session s, int estoque, string origem, DateTime dia, bool soEmitidas,
+            System.Collections.Generic.IList<Solicitacao> conhecidas)
+        {
+            if (conhecidas == null)
+                return await ListarDiaConferidaAsync(s, estoque, null, origem, dia, null, soEmitidas);
+
+            var tela = new TelaSolicitacoes(s, estoque);
+            string rotulo = (soEmitidas ? " (emitidas)" : "") + " leve";
+            var abertas = await LerConferidoAsync(tela, FiltroDoDia(estoque, "<>S", origem, dia, soEmitidas), estoque, dia, null, rotulo);
+            // Sem a lista fechada das não atendidas não dá para concluir nada de quem ficou de fora.
+            if (abertas.Faltam > 0 || abertas.AtingiuTeto)
+                return await ListarDiaConferidaAsync(s, estoque, null, origem, dia, null, soEmitidas);
+
+            var res = new SolicitacoesResult();
+            var naLista = new System.Collections.Generic.HashSet<long>();
+            foreach (var x in abertas.Itens) if (naLista.Add(x.Numero)) res.Itens.Add(x);
+
+            var sumiram = new System.Collections.Generic.List<Solicitacao>();
+            int daMemoria = 0;
+            foreach (var c in conhecidas)
+            {
+                if (c == null || naLista.Contains(c.Numero)) continue;
+                DateTime d;
+                if (!TryData(c.Data, out d) || d.Date != dia.Date) continue;
+                if (c.Situacao == "S") { naLista.Add(c.Numero); res.Itens.Add(c); daMemoria++; }
+                else sumiram.Add(c);
+            }
+            // Muitas de uma vez: sai mais barato (e mais seguro) ler o dia inteiro.
+            if (sumiram.Count > MaxConferenciasPorNumero)
+                return await ListarDiaConferidaAsync(s, estoque, null, origem, dia, null, soEmitidas);
+
+            var deTodas = FiltroDoDia(estoque, null, origem, dia, soEmitidas);
+            int conferidas = 0, fora = 0;
+            foreach (var c in sumiram)
+            {
+                var doNumero = new System.Collections.Generic.Dictionary<string, string>(deTodas);
+                doNumero["CD_SOLSAI_PRO"] = c.Numero.ToString();
+                var uma = await LerFirmeAsync(tela, doNumero, 1);
+                if (uma == null || uma.Interrompida) throw new Exception(ListaInterrompida);
+                Solicitacao atual;
+                if (uma.Distintas.TryGetValue(c.Numero, out atual)) { if (naLista.Add(atual.Numero)) res.Itens.Add(atual); conferidas++; }
+                else fora++;   // excluída, ou mudou de dia/estoque
+            }
+
+            res.Itens.Sort(delegate(Solicitacao a, Solicitacao b) { return b.Numero.CompareTo(a.Numero); });
+            res.TotalServidor = res.Itens.Count;
+            Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + rotulo + " est " + estoque + ": " + res.Itens.Count + " = " +
+                abertas.Itens.Count + " não atendidas + " + daMemoria + " atendidas da memória" +
+                (sumiram.Count > 0 ? " + " + conferidas + " conferidas pelo número" + (fora > 0 ? " (" + fora + " saíram da lista)" : "") : ""));
+            return res;
+        }
+
+        // Quantas "sumidas" a varredura leve confere uma a uma antes de preferir a leitura completa.
+        private const int MaxConferenciasPorNumero = 25;
+
+        private static System.Collections.Generic.Dictionary<string, string> FiltroDoDia(
+            int estoque, string situacao, string origem, DateTime dia, bool soEmitidas)
+        {
             var filtro = new System.Collections.Generic.Dictionary<string, string>();
             filtro["CD_ESTOQUE"] = estoque.ToString();
             filtro["DT_SOLSAI_PRO"] = dia.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);   // IGUALDADE = só aquele dia
+            if (soEmitidas) filtro["SN_EMITIDO2"] = "S";
             if (!string.IsNullOrEmpty(situacao)) filtro["TP_SITUACAO"] = situacao;
             // Origem no servidor (igual à consulta antiga): PRE/TRA por TP_ORIGEM; "DEV" por
             // TP_SOLSAI_PRO=C; "AVU" (Material) não filtra no servidor — refino no cliente.
             if (origem == "PRE" || origem == "TRA") filtro["TP_ORIGEM_SOLICITACAO"] = origem;
             else if (origem == "DEV") filtro["TP_SOLSAI_PRO"] = "C";
+            return filtro;
+        }
+
+        private static Task<SolicitacoesResult> ListarDiaConferidaAsync(
+            Session s, int estoque, string situacao, string origem, DateTime dia,
+            System.Collections.Generic.IList<Solicitacao> conhecidas, bool soEmitidas)
+        {
+            return LerConferidoAsync(new TelaSolicitacoes(s, estoque), FiltroDoDia(estoque, situacao, origem, dia, soEmitidas),
+                estoque, dia, conhecidas, soEmitidas ? " (emitidas)" : "");
+        }
+
+        // A leitura conferida em si (paginação + lotes com repetição + conta com o servidor),
+        // numa tela já criada — quem chama pode seguir usando a mesma tela depois.
+        private static async Task<SolicitacoesResult> LerConferidoAsync(
+            TelaSolicitacoes tela, System.Collections.Generic.Dictionary<string, string> filtro,
+            int estoque, DateTime dia, System.Collections.Generic.IList<Solicitacao> conhecidas, string rotulo)
+        {
+            var res = new SolicitacoesResult();
 
             var geral = await LerFirmeAsync(tela, filtro, 400);   // trava anti-loop (400×50 = 20000)
             // Interrompida mesmo depois das novas tentativas é erro: devolver a lista cortada
@@ -1303,7 +1411,7 @@ namespace SoulmvKit.Core
             res.TotalServidor = geral.Total >= 0 ? geral.Total : res.Itens.Count;
             res.Faltam = res.Itens.Count < res.TotalServidor ? res.TotalServidor - res.Itens.Count : 0;
 
-            Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + " est " + estoque + ": " + res.Itens.Count + " de " + res.TotalServidor +
+            Logger.Log("Solicitações dia " + dia.ToString("dd/MM") + rotulo + " est " + estoque + ": " + res.Itens.Count + " de " + res.TotalServidor +
                 " (" + geral.Paginas + " página(s), " + geral.Lidas + " linhas, " + naPaginacao + " distintas na paginação" +
                 (relidas.Count > 0 ? "; lotes relidos: " + string.Join(", ", relidas.ToArray()) : "") +
                 (daMemoria.Count > 0 ? "; da memória: " + string.Join(", ", daMemoria.ToArray()) : "") + ")" +
