@@ -65,6 +65,18 @@ namespace SoulmvKit.UI
         // true = a última varredura NÃO conseguiu consultar o estoque (portão ocupado ou
         // erro): os saldos na tela são os da varredura anterior e o banner precisa dizer.
         private static bool _estoqueFalhou;
+        // true = a última varredura NÃO conseguiu ler as justificativas no PEP: a coluna
+        // ficaria toda vermelha sem ser verdade, então o banner avisa e a contagem zera.
+        private static bool _justificativasFalharam;
+
+        // Pacientes da última varredura (para a aba Justificativas completar a busca
+        // paciente a paciente quando a lista geral do PEP falha).
+        public static List<int> PacientesDaFoto()
+        {
+            var l = new List<int>();
+            foreach (var it in _itens) if (it.PacienteId > 0 && !l.Contains(it.PacienteId)) l.Add(it.PacienteId);
+            return l;
+        }
         // Nomes já anunciados no log como "sem ligação" — sem isso o monitor repetiria as
         // mesmas duas linhas a cada 3 minutos, o dia inteiro.
         private static readonly HashSet<string> _semLigacaoLogados =
@@ -727,18 +739,29 @@ namespace SoulmvKit.UI
             // 4) Justificativas. A janela se ajusta ao tratamento mais antigo em curso: quem
             //    está em D13 começou há 12 dias e a justificativa dele é de lá.
             int semJust = 0;
+            bool justFalhou = false;
             try
             {
                 int janela = CruzamentoJustificativas.JanelaNecessaria(v.Itens, 7);
+                // Os próprios pacientes da varredura: se a lista geral do PEP falhar, a
+                // busca paciente a paciente cobre exatamente quem precisa ser cruzado.
+                var pacs = new List<int>();
+                foreach (var it in v.Itens) if (it.PacienteId > 0 && !pacs.Contains(it.PacienteId)) pacs.Add(it.PacienteId);
                 var just = await PepClient.ListarJustificativasAsync(
-                    sessao_, DateTime.Today.AddDays(-janela), DateTime.Today);
+                    sessao_, DateTime.Today.AddDays(-janela), DateTime.Today, pacs, false);
                 if (sessao != _sessaoId) return;
-                semJust = CruzamentoJustificativas.Aplicar(v.Itens, just.Itens);
+                if (!string.IsNullOrEmpty(just.Aviso))
+                {
+                    justFalhou = true;
+                    Logger.Log("Antimicrobianos: justificativas não lidas: " + just.Aviso);
+                }
+                else semJust = CruzamentoJustificativas.Aplicar(v.Itens, just.Itens);
             }
             catch (SessaoExpiradaException) { throw; }
             catch (Exception ex)
             {
                 // Sem as justificativas a lista de antimicrobianos ainda vale.
+                justFalhou = true;
                 Logger.Log("Antimicrobianos: falha ao cruzar as justificativas: " + ex.Message);
             }
 
@@ -756,6 +779,7 @@ namespace SoulmvKit.UI
             // LigarEstoqueAsync (um registro por nome) já contam a história para quem
             // administra; na tela o aviso só gerava ruído.
             _semJustificativa = semJust;
+            _justificativasFalharam = justFalhou;
             _incompleta = v.ListaDePacientesIncompleta;
             _avisoVarredura = v.Aviso;
             _consultados = v.AtendimentosConsultados;
@@ -818,7 +842,13 @@ namespace SoulmvKit.UI
                 avisos.Add(_semPrescricao + " atendimentos não têm prescrição eletrônica no PEP e ficaram de fora");
                 grau = StatusKind.Warning;
             }
-            if (_semJustificativa > 0)
+            if (_justificativasFalharam)
+            {
+                avisos.Add("não deu para ler as justificativas no PEP — a coluna Justificativa"
+                    + " não vale nesta varredura");
+                grau = StatusKind.Warning;
+            }
+            else if (_semJustificativa > 0)
             {
                 avisos.Add(_semJustificativa + (_semJustificativa == 1
                     ? " antimicrobiano sem justificativa emitida" : " antimicrobianos sem justificativa emitida"));
@@ -912,6 +942,7 @@ namespace SoulmvKit.UI
             _semPrescricao = _semJustificativa = _consultados = 0;
             _semCalculo = _semConversao = _soHoje = 0;
             _estoqueFalhou = false;
+            _justificativasFalharam = false;
             _semLigacaoLogados.Clear();
             _erro = null; _avisoVarredura = null; _incompleta = false;
             if (estava) Logger.Log("Antimicrobianos: monitor em segundo plano desligado.");

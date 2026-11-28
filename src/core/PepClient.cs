@@ -310,6 +310,15 @@ namespace SoulmvKit.Core
 
         public static async Task<VarreduraJustificativas> ListarJustificativasAsync(Session s, DateTime de, DateTime ate)
         {
+            return await ListarJustificativasAsync(s, de, ate, null, true);
+        }
+
+        // pacientes / incluirInternados: só contam se a lista geral falhar (ver
+        // JustificativasPorPacienteAsync). A aba Antimicrobianos passa os pacientes dela e
+        // dispensa os internados; a aba Justificativas quer os dois.
+        public static async Task<VarreduraJustificativas> ListarJustificativasAsync(Session s, DateTime de, DateTime ate,
+            IEnumerable<int> pacientes, bool incluirInternados)
+        {
             var res = new VarreduraJustificativas();
             res.Desde = de.Date; res.Ate = ate.Date;
             if (!await EntrarAsync(s))
@@ -328,7 +337,15 @@ namespace SoulmvKit.Core
                     + "&size=" + PaginaJustificativas + "&sort=documentDate,DESC"
                     + "&template=" + TemplateJustificativa);
                 if (string.IsNullOrEmpty(json) || json.Length < 10) break;
-                if (json.StartsWith("{\"code\"")) { res.Aviso = "O PEP recusou a consulta das justificativas."; break; }
+                if (json.StartsWith("{\"code\""))
+                {
+                    if (pagina == 0)
+                        return await JustificativasPorPacienteAsync(s, res, inicio, fim, pacientes, incluirInternados,
+                            Texto(json, "\"message\":\"([^\"]{0,160})"));
+                    res.Aviso = "O PEP recusou a consulta das justificativas.";
+                    break;
+                }
+                if (_listaGeralQuebrada) { _listaGeralQuebrada = false; Logger.Log("Justificativas: a lista geral do PEP voltou a responder."); }
 
                 var daPagina = new List<Justificativa>();
                 ExtrairJustificativas(json, daPagina, vistos);
@@ -385,6 +402,92 @@ namespace SoulmvKit.Core
                 j.Cid = cod.Length > 0 ? (lab.Length > 0 ? cod + " — " + lab : cod) : "";
                 destino.Add(j);
             }
+        }
+
+        // ===== CONTORNO: JUSTIFICATIVAS PACIENTE A PACIENTE =====
+        //
+        // Em 28/11/2026 a lista geral de documentos do PEP passou a responder erro do próprio
+        // servidor ("could not resolve property: multiEmpresa of: br.com.mv.sma.entidades.
+        // Atendimento") para QUALQUER consulta sem paciente — com ou sem template, setor ou
+        // atendimento. A mesma rota com `patient=` continua respondendo. Então, enquanto o
+        // MV não corrigir, perguntamos paciente a paciente (~55 ms cada): os internados de
+        // agora (hospital-admissions, só internação) e os pacientes que quem chama conhece.
+        // O que fica de fora: quem já teve alta e o pronto-socorro/ambulatório que não
+        // estiver na lista de quem chama. A lista geral é tentada primeiro toda vez, então
+        // o contorno sai de cena sozinho quando o servidor voltar.
+        private const int PaginaPorPaciente = 50;
+        private const int MaxPaginasPorPaciente = 5;
+        private static bool _listaGeralQuebrada;
+
+        private static async Task<VarreduraJustificativas> JustificativasPorPacienteAsync(Session s,
+            VarreduraJustificativas res, DateTime inicio, DateTime fim, IEnumerable<int> extras,
+            bool incluirInternados, string motivo)
+        {
+            if (!_listaGeralQuebrada)
+            {
+                _listaGeralQuebrada = true;
+                Logger.Log("Justificativas: o PEP recusou a lista geral (" + motivo + "); buscando paciente a paciente.");
+            }
+
+            var pacientes = new List<int>();
+            var jaPostos = new HashSet<int>();
+            if (incluirInternados)
+            {
+                string censo = await GetAsync(s, Pep + "/api/hospital-admissions?page=0&size=1000");
+                if (!string.IsNullOrEmpty(censo) && !censo.StartsWith("{\"code\""))
+                    foreach (Match m in Regex.Matches(censo, "\"patient\":\\{\"id\":(\\d+)"))
+                    {
+                        int p;
+                        if (int.TryParse(m.Groups[1].Value, out p) && p > 0 && jaPostos.Add(p)) pacientes.Add(p);
+                    }
+            }
+            if (extras != null)
+                foreach (int p in extras) if (p > 0 && jaPostos.Add(p)) pacientes.Add(p);
+
+            if (pacientes.Count == 0)
+            {
+                res.Aviso = "O PEP recusou a consulta das justificativas.";
+                return res;
+            }
+
+            var vistos = new HashSet<int>();
+            int falhas = 0;
+            foreach (int p in pacientes)
+            {
+                for (int pagina = 0; pagina < MaxPaginasPorPaciente; pagina++)
+                {
+                    string json = await GetAsync(s, Pep + "/api/clinical-documents?page=" + pagina
+                        + "&size=" + PaginaPorPaciente + "&sort=documentDate,DESC"
+                        + "&template=" + TemplateJustificativa + "&patient=" + p);
+                    if (string.IsNullOrEmpty(json) || json.Length < 10) break;
+                    if (json.StartsWith("{\"code\"")) { falhas++; break; }
+
+                    var daPagina = new List<Justificativa>();
+                    ExtrairJustificativas(json, daPagina, vistos);
+                    if (daPagina.Count == 0) break;
+
+                    bool passouDoInicio = false;
+                    foreach (var j in daPagina)
+                    {
+                        if (j.PacienteId != p) continue;                 // só o que é dele
+                        if (j.Data != DateTime.MinValue && j.Data < inicio) { passouDoInicio = true; continue; }
+                        if (j.Data >= fim) continue;
+                        res.Itens.Add(j);
+                    }
+                    if (passouDoInicio || daPagina.Count < PaginaPorPaciente) break;
+                }
+            }
+
+            if (falhas == pacientes.Count)
+            {
+                res.Aviso = "O PEP recusou a consulta das justificativas.";
+                return res;
+            }
+            res.Parcial = "A lista geral do PEP está com defeito; mostrando as justificativas de "
+                + pacientes.Count + " pacientes (internados e em uso de antimicrobiano). "
+                + "Quem já teve alta pode não aparecer."
+                + (falhas > 0 ? " " + falhas + " paciente(s) não responderam." : "");
+            return res;
         }
 
         // Onde começa o próximo documento do array (ou o fim do JSON).

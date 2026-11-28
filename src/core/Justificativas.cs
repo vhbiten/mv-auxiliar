@@ -84,5 +84,8 @@ namespace SoulmvKit.Core
         public DateTime Desde, Ate;
         public bool AtingiuTeto;    // parou no limite de páginas: há mais no período
         public string Aviso;
+        // Veio pela busca paciente a paciente (a lista geral do PEP falhou): a lista vale,
+        // mas só cobre os pacientes que o programa conhece. A tela avisa com este texto.
+        public string Parcial;
     }
 }

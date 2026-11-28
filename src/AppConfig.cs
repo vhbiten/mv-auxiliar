@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.12";   // 0.6.12: Solicitações — selo "Alta" no paciente com alta médica ou que já saiu (o selo abre o prontuário no PEP; "alta" na busca lista só essas); filtro HORÁRIO pelos turnos das prescrições
+        public const string Versao = "0.6.13";   // 0.6.13: Justificativas — busca paciente a paciente quando a lista geral do PEP falha (defeito do servidor em 28/11/2026); Antimicrobianos deixa de marcar todos como sem justificativa quando elas não foram lidas
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

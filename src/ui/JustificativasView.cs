@@ -32,6 +32,7 @@ namespace SoulmvKit.UI
         private static bool _busy;
         private static DateTime _atualizadoEm;
         private static string _aviso;
+        private static string _parcial;   // veio paciente a paciente (ver PepClient)
         private static bool _atingiuTeto;
         private static int _dias = 7;   // período em vigor; o monitor usa o último escolhido
         private bool _restaurando;      // suprime o handler do combo ao reabrir a aba
@@ -476,13 +477,17 @@ namespace SoulmvKit.UI
         private static async Task VarrerAsync(Session sessao_, int dias, int sessao)
         {
             // O PEP é outra sessão, fora do portão do Morphis: não disputa com as outras abas.
+            // Os pacientes da aba Antimicrobianos só são usados se a lista geral do PEP
+            // falhar: completam os internados com o pronto-socorro em tratamento.
             var v = await PepClient.ListarJustificativasAsync(
-                sessao_, DateTime.Today.AddDays(-dias), DateTime.Today);
+                sessao_, DateTime.Today.AddDays(-dias), DateTime.Today,
+                AntimicrobianosView.PacientesDaFoto(), true);
             if (sessao != _sessaoId) return;
 
             _itens.Clear(); _itens.AddRange(v.Itens);
             _atualizadoEm = DateTime.Now;
             _aviso = v.Aviso;
+            _parcial = v.Parcial;
             _atingiuTeto = v.AtingiuTeto;
         }
 
@@ -493,6 +498,8 @@ namespace SoulmvKit.UI
             else if (_atingiuTeto)
                 banner.SetState(StatusKind.Warning, "Há mais justificativas no período do que consegui trazer. "
                     + "Escolha um período menor.");
+            else if (!string.IsNullOrEmpty(_parcial))
+                banner.SetState(StatusKind.Warning, _parcial + " Atualizado às " + _atualizadoEm.ToString("HH:mm:ss") + ".");
             else if (_itens.Count == 0)
                 banner.SetState(StatusKind.Info, "Nenhuma justificativa emitida (" + periodo + ").");
             else
@@ -533,7 +540,7 @@ namespace SoulmvKit.UI
             _sessaoId++;
             _itens.Clear();                 // tem nome de paciente: não sobrevive ao logout
             _atualizadoEm = DateTime.MinValue;
-            _aviso = null; _atingiuTeto = false;
+            _aviso = null; _parcial = null; _atingiuTeto = false;
             if (estava) Logger.Log("Justificativas: monitor em segundo plano desligado.");
         }
 
