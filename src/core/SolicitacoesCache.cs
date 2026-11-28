@@ -16,6 +16,9 @@ namespace SoulmvKit.Core
         private static readonly object _lock = new object();
         private static string _dir;
         private const char US = '\u001F';
+        // Linha herdada de uma foto antiga volta a ser gravada antes de ser relida do MV: a
+        // marca guarda que o turno dela ainda não é conhecido (vazio = sabido que não tem).
+        private const string TurnoNaoLido = "?";
 
         public static void Init(string dirBase)
         {
@@ -61,7 +64,8 @@ namespace SoulmvKit.Core
                         sb.Append(s.Numero).Append(US).Append(s.Estoque).Append(US).Append(C(s.Situacao)).Append(US)
                           .Append(C(s.Origem)).Append(US).Append(C(s.Setor)).Append(US).Append(C(s.Data)).Append(US)
                           .Append(C(s.Hora)).Append(US).Append(s.Urgente ? "1" : "0").Append(US).Append(C(s.Solicitante)).Append(US)
-                          .Append(C(s.Atendimento)).Append(US).Append(C(s.Paciente)).Append(US).Append(C(s.TpSol)).Append('\n');
+                          .Append(C(s.Atendimento)).Append(US).Append(C(s.Paciente)).Append(US).Append(C(s.TpSol)).Append(US)
+                          .Append(C(s.Alta)).Append(US).Append(s.Turno == null ? TurnoNaoLido : C(s.Turno)).Append('\n');
                     }
                     File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
                 }
@@ -95,6 +99,9 @@ namespace SoulmvKit.Core
                         s.Situacao = f[2]; s.Origem = f[3]; s.Setor = f[4]; s.Data = f[5]; s.Hora = f[6];
                         s.Urgente = f[7] == "1"; s.Solicitante = f[8]; s.Atendimento = f[9]; s.Paciente = f[10];
                         if (f.Length >= 12) s.TpSol = f[11];   // coluna nova; cache antigo não a tem
+                        if (f.Length >= 13) s.Alta = f[12];    // idem (saída do paciente)
+                        // idem; sem a coluna (ou com a marca) fica null = turno não lido
+                        if (f.Length >= 14 && f[13] != TurnoNaoLido) s.Turno = f[13];
                         snap.Itens.Add(s);
                     }
                     return snap;

@@ -7,7 +7,7 @@ namespace SoulmvKit
     public static class AppConfig
     {
         public const string AppName = "Auxiliar MV Soul";
-        public const string Versao = "0.6.11";   // 0.6.11: Previsão de Consumo — período automático (2 dias; 3 antes do intervalo maior), sem seletor; não padronizados fora da sugestão; histórico por pedido
+        public const string Versao = "0.6.12";   // 0.6.12: Solicitações — selo "Alta" no paciente com alta médica ou que já saiu (o selo abre o prontuário no PEP; "alta" na busca lista só essas); filtro HORÁRIO pelos turnos das prescrições
 
         public const string HostPlaceholder = "http://mv-servidor.local";
 

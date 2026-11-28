@@ -25,6 +25,7 @@ namespace SoulmvKit.UI
         private StyledComboBox cmbEstoque;
         private StyledComboBox cmbSituacao;
         private StyledComboBox cmbOrigem;
+        private StyledComboBox cmbTurno;
         private PrimaryButton btnRecarregar;
         private TextBox txtBusca;
         private StatusBanner banner;
@@ -120,27 +121,30 @@ namespace SoulmvKit.UI
             tl.AutoSize = true;
             tl.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             tl.BackColor = Theme.CardBg;
-            tl.ColumnCount = 5;
-            tl.RowCount = 2;
-            // Orçamento p/ janela mínima (base 96 DPI): padding do cartão 40 + fixos
-            // 166+164+124+136 = 590 + margens 30 + busca nascendo em 40+10 ≤ ~672 úteis —
-            // nada é cortado, "Farmácia Central" cabe sem reticências e a busca ainda fica
-            // usável no pior caso, crescendo até 420 quando a janela dá espaço.
+            tl.ColumnCount = 6;
+            tl.RowCount = 4;
+            // Larguras (base 96 DPI): estoque 166 ("Farmácia Central" sem reticências),
+            // situação 164, origem 124, horário 124 ("Madrugada"), botão 136 — 714 fixos.
             // SITUAÇÃO precisa de 164: em 96 DPI (monitor da farmácia) a fonte rende mais
             // larga e a face fechada com "Em atendimento" saía cortada com 140 (a elipse
             // dispara pela largura MEDIDA do texto, com a folga do GDI, não pelos glifos).
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(166))); // estoque ("Farmácia Central")
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(164))); // situação ("Em atendimento")
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(124))); // origem ("Prescrição")
+            // Com o HORÁRIO a barra não cabe mais numa linha só na janela mínima (~666 úteis):
+            // abaixo de LarguraDeUmaLinha a busca e o botão descem para uma 2ª linha (ver
+            // AjustarBarra); as linhas 2 e 3 ficam vazias, sem altura, no arranjo de uma linha.
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(166))); // estoque
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(164))); // situação
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(124))); // origem
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(124))); // horário
             tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));           // busca (elástica)
-            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(136))); // Recarregar tudo
-            tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));   // micro rótulos
-            tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));   // combos + busca + botão
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(LarguraBotaoBarra))); // Recarregar tudo
+            for (int i = 0; i < 4; i++) tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             tl.Controls.Add(MicroLabel("ESTOQUE"), 0, 0);
             tl.Controls.Add(MicroLabel("SITUAÇÃO"), 1, 0);
             tl.Controls.Add(MicroLabel("ORIGEM"), 2, 0);
-            tl.Controls.Add(MicroLabel("BUSCAR"), 3, 0);
+            tl.Controls.Add(MicroLabel("HORÁRIO"), 3, 0);
+            _rotuloBusca = MicroLabel("BUSCAR");
+            tl.Controls.Add(_rotuloBusca, 4, 0);
 
             // Alterna a view inteira entre Farmácia Central (5) e CAF (2).
             cmbEstoque = NovoCombo(new object[] {
@@ -159,7 +163,18 @@ namespace SoulmvKit.UI
                 new OpcaoItem("Devolução", "DEV") });
             tl.Controls.Add(cmbOrigem, 2, 1);
 
-            tl.Controls.Add(BuildBusca(), 3, 1);
+            // Turno dos pedidos que vêm das prescrições (ver Turnos). Diferente dos dois ao
+            // lado, este filtra o que JÁ está na tela, na hora: nada é perguntado ao MV, e a
+            // foto que as outras abas usam continua inteira.
+            cmbTurno = NovoCombo(new object[] {
+                new OpcaoItem("Todos", ""), new OpcaoItem("Madrugada", Turnos.Madrugada),
+                new OpcaoItem("Manhã", Turnos.Manha), new OpcaoItem("Tarde", Turnos.Tarde),
+                new OpcaoItem("Noite", Turnos.Noite) });
+            cmbTurno.SelectedIndexChanged += new EventHandler(delegate { if (!_busy && grid != null) RenderGrid(); });
+            tl.Controls.Add(cmbTurno, 3, 1);
+
+            _campoBusca = BuildBusca();
+            tl.Controls.Add(_campoBusca, 4, 1);
 
             // Único botão da barra. A lista se atualiza sozinha a cada 30s, então não existe
             // mais "Atualizar": este aqui é o reset de emergência, para quando algum registro
@@ -171,14 +186,71 @@ namespace SoulmvKit.UI
             btnRecarregar.Height = Theme.S(40);
             btnRecarregar.Margin = new Padding(0);
             btnRecarregar.Click += new EventHandler(OnRecarregar);
-            tl.Controls.Add(btnRecarregar, 4, 1);
+            tl.Controls.Add(btnRecarregar, 5, 1);
 
             var dica = new ToolTip();
             dica.SetToolTip(btnRecarregar, "Refaz a consulta completa no MV Soul, do zero (demora mais)");
             this.Disposed += new EventHandler(delegate { dica.Dispose(); });   // ToolTip é Component: não é descartado com a árvore de controles
 
+            _barra = tl;
             card.Controls.Add(tl);
+            card.SizeChanged += new EventHandler(delegate { AjustarBarra(card); });
             return card;
+        }
+
+        // Barra de filtros em uma ou duas linhas, conforme a largura. Numa linha só ela pede os
+        // 714 fixos mais uma busca de uns 130; faltando isso, a busca e o botão descem:
+        //   ESTOQUE | SITUAÇÃO | ORIGEM | HORÁRIO
+        //   BUSCAR (sob as três primeiras) ....... | Recarregar tudo (sob o horário, até a borda)
+        // Na 2ª linha a busca até fica melhor do que era na janela mínima (sobravam 66 px).
+        private const int LarguraBotaoBarra = 136;
+        private const int LarguraDeUmaLinha = 166 + 164 + 124 + 124 + LarguraBotaoBarra + 130;
+        private TableLayoutPanel _barra;
+        private Label _rotuloBusca;
+        private Control _campoBusca;
+        private bool _barraEmDuasLinhas;
+
+        private void AjustarBarra(Control card)
+        {
+            if (_barra == null || _campoBusca == null || btnRecarregar == null) return;
+            int util = card.ClientSize.Width - card.Padding.Horizontal;
+            if (util <= 0) return;
+            bool duas = util < Theme.S(LarguraDeUmaLinha);
+            if (duas == _barraEmDuasLinhas) return;
+            _barraEmDuasLinhas = duas;
+
+            _barra.SuspendLayout();
+            // Volta tudo a ocupar uma célula antes de mudar de lugar (vão maior que o destino
+            // faz o TableLayoutPanel empurrar os vizinhos).
+            _barra.SetColumnSpan(_rotuloBusca, 1); _barra.SetColumnSpan(_campoBusca, 1); _barra.SetColumnSpan(btnRecarregar, 1);
+            if (duas)
+            {
+                _barra.ColumnStyles[5].Width = 0;
+                _barra.SetCellPosition(_rotuloBusca, new TableLayoutPanelCellPosition(0, 2));
+                _barra.SetCellPosition(_campoBusca, new TableLayoutPanelCellPosition(0, 3));
+                _barra.SetCellPosition(btnRecarregar, new TableLayoutPanelCellPosition(3, 3));
+                _barra.SetColumnSpan(_rotuloBusca, 3); _barra.SetColumnSpan(_campoBusca, 3); _barra.SetColumnSpan(btnRecarregar, 3);
+                _rotuloBusca.Margin = new Padding(2, Theme.S(10), 0, Theme.S(5));
+            }
+            else
+            {
+                _barra.ColumnStyles[5].Width = Theme.S(LarguraBotaoBarra);
+                _barra.SetCellPosition(_rotuloBusca, new TableLayoutPanelCellPosition(4, 0));
+                _barra.SetCellPosition(_campoBusca, new TableLayoutPanelCellPosition(4, 1));
+                _barra.SetCellPosition(btnRecarregar, new TableLayoutPanelCellPosition(5, 1));
+                _rotuloBusca.Margin = new Padding(2, 0, 0, Theme.S(5));
+            }
+            _barra.ResumeLayout(true);
+            // Esta troca acontece DENTRO do layout de quem contém o cartão, e pedido de layout
+            // feito aí dentro é descartado: sem refazer depois, a altura do cartão ficava a do
+            // arranjo anterior (2ª linha cortada, ou um vão vazio ao voltar para uma linha).
+            if (IsHandleCreated)
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    if (IsDisposed || Disposing || card.IsDisposed || card.Parent == null) return;
+                    card.PerformLayout();
+                    card.Parent.PerformLayout(card, "PreferredSize");
+                }));
         }
 
         private StyledComboBox NovoCombo(object[] itens)
@@ -329,6 +401,7 @@ namespace SoulmvKit.UI
             var paciente = Col("paciente", "Paciente", 120, true, DataGridViewContentAlignment.MiddleLeft);
             paciente.FillWeight = 60; paciente.MinimumWidth = Theme.S(100);
             g.Columns.Add(paciente);
+            _colPaciente = paciente.Index;
             var setor = Col("setor", "Setor", 100, true, DataGridViewContentAlignment.MiddleLeft);
             setor.FillWeight = 30;
             setor.MinimumWidth = Theme.S(76);   // em tela estreita: rola na horizontal, não colapsa
@@ -360,7 +433,174 @@ namespace SoulmvKit.UI
 
             g.CellFormatting += new DataGridViewCellFormattingEventHandler(Grid_Format);
             g.CellContentClick += new DataGridViewCellEventHandler(Grid_Click);
+            // Selo "Alta" na célula do paciente: desenhado à mão e com clique próprio.
+            g.CellPainting += new DataGridViewCellPaintingEventHandler(Grid_PintarAlta);
+            g.CellMouseMove += new DataGridViewCellMouseEventHandler(Grid_MouseNoSelo);
+            g.CellMouseClick += new DataGridViewCellMouseEventHandler(Grid_CliqueNoSelo);
+            g.CellMouseLeave += new DataGridViewCellEventHandler(delegate
+            {
+                if (g.Cursor != Cursors.Default) g.Cursor = Cursors.Default;
+            });
             return g;
+        }
+
+        // ===== SELO "ALTA" =====
+        // O MV imprime os turnos mesmo de quem já teve alta. A linha desse paciente ganha uma
+        // pílula "Alta" logo depois do nome (quem ganha: ver AltasPacientes.De): cheia quando ele
+        // já saiu, clara quando o médico deu a alta e a saída ainda não foi registrada. A dica
+        // da célula traz as horas, e o selo é o link — abre o prontuário daquele atendimento no
+        // PEP, que é onde a alta se confirma. A palavra "alta" na busca lista só essas linhas.
+        private const string TextoSelo = "Alta";
+        private const TextFormatFlags TextoDoSelo = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+        private int _colPaciente = -1;
+        private static int _larguraTextoSelo;
+
+        // Coluna estreita (janela pequena: o paciente fica no mínimo de 100): o selo se aperta
+        // para sobrar nome — medido em 96 DPI, com o selo folgado só cabiam 2 letras.
+        private static bool SeloApertado(Rectangle celula) { return celula.Width < Theme.S(160); }
+
+        private const TextFormatFlags TextoDoNome = TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+
+        // Onde fica o selo dentro de uma célula: logo depois do nome (encostado no fim da célula
+        // ele parecia pertencer ao setor, que é a coluna seguinte); nome comprido demais, o selo
+        // para no fim da célula e o nome ganha reticências. Serve à pintura e ao clique:
+        // 'celula' pode vir em coordenadas da grade ou da própria célula.
+        private static Rectangle RetanguloDoSelo(Rectangle celula, string nome, int margemEsquerda)
+        {
+            if (_larguraTextoSelo == 0)
+                _larguraTextoSelo = TextRenderer.MeasureText(TextoSelo, Selo.FonteCelula, Size.Empty, TextoDoSelo).Width;
+            bool apertado = SeloApertado(celula);
+            int w = _larguraTextoSelo + Theme.S(apertado ? 14 : 20);
+            int h = Theme.S(20);
+            int noFim = celula.Right - Theme.S(apertado ? 4 : 6) - w;
+            // Sem as reticências na medida: com elas o MeasureText devolve a largura já encolhida.
+            int larguraNome = TextRenderer.MeasureText(nome ?? "", Theme.Body, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+            int depoisDoNome = celula.X + margemEsquerda + larguraNome + Theme.S(4);
+            return new Rectangle(Math.Min(noFim, depoisDoNome), celula.Y + (celula.Height - h) / 2, w, h);
+        }
+
+        // Já saiu = selo cheio; alta médica ainda sem saída registrada = selo claro.
+        private static void DesenharSelo(Graphics g, Rectangle r, bool saiu)
+        {
+            var estado = g.Save();
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var path = Theme.RoundedRect(new Rectangle(r.X, r.Y, r.Width - 1, r.Height - 1), (r.Height - 1) / 2))
+            using (var b = new SolidBrush(saiu ? Theme.Error : Theme.ErrorBg))
+                g.FillPath(b, path);
+            g.Restore(estado);
+            TextRenderer.DrawText(g, TextoSelo, Selo.FonteCelula, r, saiu ? Color.White : Theme.Error, TextoDoSelo);
+        }
+
+        private void Grid_PintarAlta(object sender, DataGridViewCellPaintingEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex != _colPaciente || e.RowIndex >= grid.Rows.Count) return;
+            var alta = AltasPacientes.De(grid.Rows[e.RowIndex].Tag as Solicitacao);
+            if (alta == null) return;
+
+            // Fundo como o da grade (zebra, realces, seleção, hover) — ver GridPro.OnCellPainting.
+            bool sel = (e.State & DataGridViewElementStates.Selected) != 0;
+            if (!sel && e.RowIndex == grid.LinhaHover)
+            {
+                using (var b = new SolidBrush(Theme.HoverBg)) e.Graphics.FillRectangle(b, e.CellBounds);
+                e.Paint(e.ClipBounds, DataGridViewPaintParts.Border);
+            }
+            else e.Paint(e.ClipBounds, DataGridViewPaintParts.Background | DataGridViewPaintParts.Border | DataGridViewPaintParts.SelectionBackground);
+
+            // O nome cede o espaço do selo (reticências); inteiro, ele está na dica.
+            string nome = Convert.ToString(e.FormattedValue);
+            int margem = e.CellStyle.Padding.Left;
+            Rectangle selo = RetanguloDoSelo(e.CellBounds, nome, margem);
+            int x = e.CellBounds.X + margem;
+            int folga = Theme.S(SeloApertado(e.CellBounds) ? 2 : 4);
+            var rNome = new Rectangle(x, e.CellBounds.Y, Math.Max(0, selo.Left - folga - x), e.CellBounds.Height - 1);
+            TextRenderer.DrawText(e.Graphics, nome, Theme.Body, rNome,
+                sel ? e.CellStyle.SelectionForeColor : e.CellStyle.ForeColor, TextoDoNome);
+
+            DesenharSelo(e.Graphics, selo, alta.Saiu);
+            e.Handled = true;
+        }
+
+        // O ponto (x, y), medido a partir do canto da célula, cai no selo dela?
+        private bool SobreOSelo(int linha, int coluna, int x, int y)
+        {
+            if (linha < 0 || coluna != _colPaciente || linha >= grid.Rows.Count) return false;
+            if (AltasPacientes.De(grid.Rows[linha].Tag as Solicitacao) == null) return false;
+            var celula = new Rectangle(0, 0, grid.Columns[coluna].Width, grid.Rows[linha].Height);
+            string nome = Convert.ToString(grid.Rows[linha].Cells[coluna].FormattedValue);
+            return RetanguloDoSelo(celula, nome, grid.DefaultCellStyle.Padding.Left).Contains(x, y);
+        }
+
+        private void Grid_MouseNoSelo(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            Cursor c = SobreOSelo(e.RowIndex, e.ColumnIndex, e.X, e.Y) ? Cursors.Hand : Cursors.Default;
+            if (grid.Cursor != c) grid.Cursor = c;
+        }
+
+        private void Grid_CliqueNoSelo(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || !SobreOSelo(e.RowIndex, e.ColumnIndex, e.X, e.Y)) return;
+            var s = grid.Rows[e.RowIndex].Tag as Solicitacao;
+            if (s != null) AbrirProntuario(s);
+        }
+
+        // Abre no navegador o prontuário do atendimento no PEP. O app só monta o endereço: quem
+        // entra é o navegador, com o login que a pessoa já tem aberto nele.
+        private bool _abrindoPep;
+        private async void AbrirProntuario(Solicitacao s)
+        {
+            if (_abrindoPep) return;
+            string atendimento = (s.Atendimento ?? "").Trim();
+            if (atendimento.Length == 0) return;
+            if (_host.Session == null) { banner.SetState(StatusKind.Warning, "Faça login para abrir o prontuário no PEP."); return; }
+            _abrindoPep = true;
+            try
+            {
+                string url = await PepClient.LinkDoProntuarioAsync(_host.Session, atendimento);
+                if (IsDisposed || Disposing) return;
+                Navegador.Abrir(url);
+                banner.SetState(StatusKind.Success, "Prontuário do atendimento " + atendimento + " aberto no PEP (navegador).");
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed && !Disposing)
+                    banner.SetState(StatusKind.Error, "Não foi possível abrir o PEP: " + ex.Message);
+            }
+            finally { _abrindoPep = false; }
+        }
+
+        // Dica da célula do paciente com selo: o nome inteiro (o selo o encurta) e as horas.
+        private static string DicaDaAlta(Solicitacao s, AltaDaSolicitacao alta)
+        {
+            string nome = string.IsNullOrEmpty(s.Paciente) ? "" : s.Paciente + "\n";
+            return nome + alta.Resumo + "\nClique no selo para conferir no PEP";
+        }
+
+        // O PEP informou alta nova. O selo é decidido na hora da pintura: basta refazer as dicas
+        // e repintar a coluna. Com "alta" na busca a própria lista muda — aí redesenha (com o
+        // mouse em cima da grade fica pendente, pelo mesmo motivo de AbsorverAtualizacao).
+        private void AoMudaremAsAltas()
+        {
+            if (IsDisposed || Disposing || grid == null || _busy) return;
+            if (BuscaSolicitacao.PedeAlta(txtBusca != null ? txtBusca.Text : ""))
+            {
+                if (grid.Visible && MouseSobreAGrade())
+                {
+                    if (!_renderPendente) { _renderPendente = true; _adiadoDesde = DateTime.Now; }
+                }
+                else RenderGrid();
+                return;
+            }
+            foreach (DataGridViewRow r in grid.Rows)
+            {
+                var s = r.Tag as Solicitacao;
+                var alta = AltasPacientes.De(s);
+                string dica = alta != null ? DicaDaAlta(s, alta) : "";
+                if (r.Cells[_colPaciente].ToolTipText != dica) r.Cells[_colPaciente].ToolTipText = dica;
+            }
+            grid.InvalidateColumn(_colPaciente);
         }
 
         // Abreviações de leitura rápida, SÓ na exibição (o dado original segue no Tag,
@@ -499,6 +739,14 @@ namespace SoulmvKit.UI
                 _monitor = new System.Windows.Forms.Timer();
                 _monitor.Interval = IntervaloMonitorMs;
                 _monitor.Tick += new EventHandler(MonitorTick);
+                // Uma inscrição só, para o processo inteiro: quem repinta é a view que estiver na tela.
+                AltasPacientes.Mudou += new Action(delegate
+                {
+                    var v = _viva;
+                    if (v == null || v.IsDisposed || v.Disposing) return;
+                    if (v.InvokeRequired) v.BeginInvoke(new MethodInvoker(v.AoMudaremAsAltas));
+                    else v.AoMudaremAsAltas();
+                });
             }
             if (_monitor.Enabled) return;   // já ligado nesta sessão
             _monitorTicks = 0;
@@ -515,6 +763,7 @@ namespace SoulmvKit.UI
             _monitorHost = null;
             _sessaoId++;
             _memoria.Clear(); _memNovos.Clear(); _memAtendidas.Clear();
+            AltasPacientes.Limpar();
             if (estava) Logger.Log("Solicitações: monitor em segundo plano desligado.");
         }
 
@@ -650,6 +899,9 @@ namespace SoulmvKit.UI
             itens.Sort(delegate(Solicitacao a, Solicitacao b) { return b.Numero.CompareTo(a.Numero); });
             GravarSnapshot(estoque, itens, maxNumero, agora, chave, anterior);
             _diaDaUltimaVarredura = hoje;
+            // Alta médica de quem ainda tem pedido por atender: vem do PEP, sem esperar e fora
+            // do portão do MV (a saída do paciente já veio na própria lista).
+            AltasPacientes.Conferir(host.Session, itens);
             var aviso = FotoAtualizada;
             if (aviso != null)
             {
@@ -819,12 +1071,13 @@ namespace SoulmvKit.UI
         {
             if (a == null || b == null) return false;
             if (a.FiltroKey != b.FiltroKey || a.Itens.Count != b.Itens.Count) return false;
+            // Situação e saída do paciente: é o que muda numa solicitação já listada.
             var sitAnt = new Dictionary<long, string>();
-            foreach (var s in a.Itens) sitAnt[s.Numero] = s.Situacao;
+            foreach (var s in a.Itens) sitAnt[s.Numero] = s.Situacao + "|" + s.Alta;
             foreach (var s in b.Itens)
             {
                 string v;
-                if (!sitAnt.TryGetValue(s.Numero, out v) || v != s.Situacao) return false;
+                if (!sitAnt.TryGetValue(s.Numero, out v) || v != s.Situacao + "|" + s.Alta) return false;
             }
             return true;
         }
@@ -925,6 +1178,10 @@ namespace SoulmvKit.UI
             _itens.Add(Ex(1834496, "S", "PRE", "ALA PEDIATRICA", "CARLOS EXEMPLO LIMA", "Fernanda Exemplo Reis", "5299950", false));
             _itens.Add(Ex(1834490, "S", "DEV", "4º ANDAR - ORTOPEDIA", "PEDRO EXEMPLO ROCHA", "Julia Exemplo Costa", "5299911", false));
             foreach (var s in _itens) _numeros.Add(s.Numero);
+            // Selo "Alta" nas duas formas: a 1ª já saiu (hora vinda da lista do MV); a 2ª tem só
+            // a alta médica (o que o PEP informaria). As atendidas ficam sem selo.
+            _itens[0].Alta = DateTime.Now.AddHours(-5).ToString("dd/MM/yyyy HH:mm:ss");
+            AltasPacientes.Registrar(_itens[1].Atendimento, DateTime.Now.AddHours(-2), null);
             _ultimaAtualizacao = DateTime.Now;
             OrdenarDesc();
             RenderGrid();
@@ -987,6 +1244,8 @@ namespace SoulmvKit.UI
             AbsorverMarcas();
             _ultimaAtualizacao = snap.Quando;
             OrdenarDesc(); RenderGrid();
+            // Lista reaberta da foto: a alta médica (PEP) não espera a próxima varredura.
+            if (_host.Session != null) AltasPacientes.Conferir(_host.Session, snap.Itens);
         }
 
         // Aplica nos combos o filtro gravado no snapshot ("sit|orig|dias"; período fixo em
@@ -1159,15 +1418,22 @@ namespace SoulmvKit.UI
         {
             btnRecarregar.Enabled = false; btnRecarregar.Text = texto;
             cmbEstoque.Enabled = false;
-            cmbSituacao.Enabled = false; cmbOrigem.Enabled = false;
+            cmbSituacao.Enabled = false; cmbOrigem.Enabled = false; cmbTurno.Enabled = false;
             txtBusca.Enabled = false;
         }
         private void DestravarControles()
         {
             btnRecarregar.Enabled = true; btnRecarregar.Text = "Recarregar tudo";
             cmbEstoque.Enabled = true;
-            cmbSituacao.Enabled = true; cmbOrigem.Enabled = true;
+            cmbSituacao.Enabled = true; cmbOrigem.Enabled = true; cmbTurno.Enabled = true;
             txtBusca.Enabled = true;
+        }
+
+        // Turno escolhido no filtro HORÁRIO ("" = todos).
+        private string TurnoEscolhido()
+        {
+            var op = cmbTurno != null ? cmbTurno.SelectedItem as OpcaoItem : null;
+            return op != null ? op.Valor : "";
         }
 
         private void OrdenarDesc()
@@ -1180,12 +1446,18 @@ namespace SoulmvKit.UI
         private void RenderGrid()
         {
             string busca = txtBusca != null ? txtBusca.Text : "";
+            bool temBusca = busca != null && busca.Trim().Length > 0;
+            string turno = TurnoEscolhido();
             var mostrar = _itens;
-            if (busca != null && busca.Trim().Length > 0)
+            if (temBusca || turno.Length > 0)
             {
                 mostrar = new List<Solicitacao>();
                 foreach (var s in _itens)
-                    if (BuscaSolicitacao.Corresponde(s, busca)) mostrar.Add(s);
+                {
+                    if (turno.Length > 0 && Turnos.De(s) != turno) continue;
+                    if (temBusca && !BuscaSolicitacao.Corresponde(s, busca, AltasPacientes.De(s) != null)) continue;
+                    mostrar.Add(s);
+                }
             }
 
             // Guarda onde a pessoa estava, pelo NÚMERO da solicitação e não pelo índice: as
@@ -1231,13 +1503,14 @@ namespace SoulmvKit.UI
                 // enxergando o texto original, que vem do Tag, não da célula).
                 if (SetorCurto(s.Setor) != s.Setor)
                     grid.Rows[r].Cells["setor"].ToolTipText = s.Setor;
+                var alta = AltasPacientes.De(s);
+                if (alta != null) grid.Rows[r].Cells[_colPaciente].ToolTipText = DicaDaAlta(s, alta);
                 if (_novos.Contains(s.Numero)) grid.Rows[r].DefaultCellStyle.BackColor = Theme.InfoBg;          // nova (azul)
                 else if (_atendidas.Contains(s.Numero)) grid.Rows[r].DefaultCellStyle.BackColor = Theme.SuccessBg; // recém-atendida (verde)
             }
 
-            bool filtrando = mostrar != _itens;
             bool tem = mostrar.Count > 0;
-            lblVazio.Text = (filtrando && _itens.Count > 0)
+            lblVazio.Text = (temBusca && _itens.Count > 0)
                 ? "Nada encontrado para essa busca."
                 : "Nenhuma solicitação para os filtros escolhidos.";
             grid.Visible = tem; lblVazio.Visible = !tem;

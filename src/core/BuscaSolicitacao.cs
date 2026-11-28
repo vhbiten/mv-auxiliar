@@ -12,6 +12,20 @@ namespace SoulmvKit.Core
     {
         public static bool Corresponde(Solicitacao s, string busca)
         {
+            return Bate(s, busca, false, false);
+        }
+
+        // Para a lista que mostra o selo "Alta" (comAlta = esta linha está com ele). Ali a palavra
+        // "alta", sozinha, quer dizer o selo: digitar "alta" lista de uma vez as solicitações de
+        // quem teve alta ("alta uti", as da UTI). Nome com essas letras continua achável com
+        // mais uma letra ("altam", "peralta").
+        public static bool Corresponde(Solicitacao s, string busca, bool comAlta)
+        {
+            return Bate(s, busca, true, comAlta);
+        }
+
+        private static bool Bate(Solicitacao s, string busca, bool altaEhSelo, bool comAlta)
+        {
             if (s == null) return false;
             if (busca == null) return true;
             busca = busca.Trim();
@@ -19,8 +33,24 @@ namespace SoulmvKit.Core
 
             string[] termos = busca.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (var t in termos)
+            {
+                if (altaEhSelo && string.Equals(t, "alta", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!comAlta) return false;
+                    continue;
+                }
                 if (!TermoBate(s, t)) return false;
+            }
             return true;
+        }
+
+        // A busca usa a palavra "alta"? (quem mostra o selo refaz o filtro quando chega alta nova)
+        public static bool PedeAlta(string busca)
+        {
+            if (string.IsNullOrEmpty(busca)) return false;
+            foreach (var t in busca.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                if (string.Equals(t, "alta", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
         }
 
         // Busca livre sobre um TEXTO qualquer (ex.: "código + nome do produto" no

@@ -596,6 +596,7 @@ namespace SoulmvKit.Core
         {
             lock (_folhaPorDocumento) { _folhaPorDocumento.Clear(); _falhaPorDocumento.Clear(); }
             _sessao = null;
+            _paginaPep = null;
         }
 
         public static async Task<FolhaPrescricao> LerFolhaPrescricaoAsync(Session s, long documento)
@@ -771,6 +772,67 @@ namespace SoulmvKit.Core
                 res.Add(p);
             }
             return res;
+        }
+
+        // ===== ALTA DE UM ATENDIMENTO (selo "Alta" da aba Solicitações) =====
+        // hospital-admissions/{atendimento} traz dischargedOrdered (alta dada pelo médico — o
+        // paciente pode seguir no leito por horas) e discharged (saída do paciente, a mesma hora
+        // que o MV mostra na solicitação). Os dois só existem depois do fato e vêm em UTC.
+        // Conferido ao vivo em 28/11/2026 (49 atendimentos, nenhuma divergência com o MV).
+        // O objeto carrega os dados pessoais do paciente: daqui só saem as duas datas.
+        // Respostas: atendimento que o PEP não conhece = corpo vazio (devolve sem datas);
+        // sessão do PEP vencida = {"code":null,"message":"Usuário não autenticado"} (devolve
+        // null, e quem chama reabre a sessão UMA vez — as chamadas rodam em paralelo).
+        public static async Task<AltaPep> AltaDoAtendimentoAsync(Session s, string atendimento)
+        {
+            string j = await GetAsync(s, Pep + "/api/hospital-admissions/" + Uri.EscapeDataString(atendimento));
+            if (j == null) return null;
+            var a = new AltaPep();
+            a.LidoEm = DateTime.Now;
+            if (j.Trim().Length == 0) return a;
+            if (!Regex.IsMatch(j, "^\\s*\\{\"id\":\\d+")) return null;
+            a.AltaMedica = SemFracao(DataIso(Regex.Match(j, "\"dischargedOrdered\":\"([^\"]+)\"")));
+            a.Saida = SemFracao(DataIso(Regex.Match(j, "\"discharged\":\"([^\"]+)\"")));
+            return a;
+        }
+
+        // Os milésimos dessas datas não são do fato: mudam a cada consulta (as duas vêm sempre
+        // com o mesmo final, o da hora da resposta). Sem cortá-los, toda releitura pareceria
+        // uma alta diferente.
+        private static DateTime? SemFracao(DateTime? d)
+        {
+            if (!d.HasValue) return null;
+            return new DateTime(d.Value.Ticks - (d.Value.Ticks % TimeSpan.TicksPerSecond), d.Value.Kind);
+        }
+
+        // ===== PRONTUÁRIO NO NAVEGADOR =====
+        // A página inicial do PEP aceita ?hospitalAdmission= e leva direto ao prontuário daquele
+        // atendimento, no último setor que a pessoa escolheu naquele navegador (lido no código
+        // da própria página em 28/11/2026: é o "forwardOptions" da escolha de setor). A rota do
+        // PEP é por "#", então o parâmetro vai DEPOIS do "#/". O endereço real da página
+        // (hoje /mvpep/5/pt-BR/index.html) vem do redirecionamento do servidor: descobre-se uma
+        // vez por sessão, para o trecho depois do "#" não depender de atravessar o
+        // redirecionamento no navegador. Só monta o endereço — quem abre é o navegador da pessoa.
+        private static string _paginaPep;
+
+        public static async Task<string> LinkDoProntuarioAsync(Session s, string atendimento)
+        {
+            string pagina = _paginaPep;
+            if (pagina == null)
+            {
+                try
+                {
+                    var r = await s.Http.GetAsync(s.Host.TrimEnd('/') + Pep + "/");
+                    Uri u = r.RequestMessage != null ? r.RequestMessage.RequestUri : null;
+                    if (r.IsSuccessStatusCode && u != null
+                        && u.AbsolutePath.StartsWith(Pep + "/", StringComparison.OrdinalIgnoreCase)
+                        && u.AbsolutePath.EndsWith(".html", StringComparison.OrdinalIgnoreCase))
+                        pagina = _paginaPep = u.GetLeftPart(UriPartial.Path);
+                }
+                catch (Exception ex) { Logger.Log("PEP: não achei o endereço da página inicial: " + ex.Message); }
+                if (pagina == null) pagina = s.Host.TrimEnd('/') + Pep + "/";   // não guarda: tenta de novo no próximo clique
+            }
+            return pagina + "#/?hospitalAdmission=" + Uri.EscapeDataString(atendimento);
         }
 
         private static DateTime? DataIso(Match m)

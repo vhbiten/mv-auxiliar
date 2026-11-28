@@ -3463,6 +3463,11 @@ namespace SoulmvKit.Core
                     // NM_PACIENTE_INTEGRA volta vazio na listagem (validado ao vivo).
                     sol.Paciente = Val(v, "DSP_NM_PACIENTE").Trim();
                     if (sol.Paciente.Length == 0) sol.Paciente = Val(v, "NM_PACIENTE_INTEGRA").Trim();
+                    // Saída do paciente: a lista traz em cada linha (conferido com o PEP em
+                    // 28/11/2026). DSP_HR_ALTA vem com data e hora; DSP_DT_ALTA, só a data.
+                    sol.Alta = Val(v, "DSP_HR_ALTA").Trim();
+                    if (sol.Alta.Length == 0) sol.Alta = Val(v, "DSP_DT_ALTA").Trim();
+                    sol.Turno = Turnos.DoCarimbo(Val(v, "DS_OBS"));
                     res.Add(sol);
                 }
             }
